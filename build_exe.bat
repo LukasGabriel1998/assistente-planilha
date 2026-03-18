@@ -25,6 +25,10 @@ if not exist "%VENV_DIR%\Scripts\python.exe" (
 set "PYTHON_EXE=%VENV_DIR%\Scripts\python.exe"
 set "PYINSTALLER_EXE=%VENV_DIR%\Scripts\pyinstaller.exe"
 
+echo [INFO] Python usado no build:
+"%PYTHON_EXE%" -c "import sys; print(sys.version)"
+echo.
+
 echo [INFO] Garantindo PyInstaller...
 if not exist "%PYINSTALLER_EXE%" (
   "%PYTHON_EXE%" -m pip install pyinstaller
@@ -69,7 +73,8 @@ if not errorlevel 1 (
   echo [INFO] pywebview encontrado. O build vai incluir janela nativa.
 ) else (
   echo [ERRO] pywebview nao encontrado neste ambiente.
-  echo [ERRO] O executavel agora abre somente em modo nativo.
+  echo [DICA] Para gerar o executavel nativo, instale Python 3.13 (ou 3.12) e rode iniciar_app.bat para recriar a .venv_native.
+  echo [DICA] No Python 3.14 o pywebview/pythonnet pode falhar na instalacao dependendo do ambiente.
   pause
   exit /b 1
 )

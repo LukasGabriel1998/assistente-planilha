@@ -23,7 +23,30 @@ goto CREATE_VENV
 
 :CREATE_VENV
 echo [INFO] Criando ambiente virtual em %PROJECT_DIR%%VENV_DIR% ...
-py -3 -m venv "%VENV_DIR%"
+set "PY_LAUNCHER=py"
+set "PY_VER="
+
+rem Preferir Python 3.13/3.12 (melhor compatibilidade com pywebview/pythonnet).
+%PY_LAUNCHER% -3.13 -c "import sys" >nul 2>&1
+if not errorlevel 1 (
+  set "PY_VER=-3.13"
+) else (
+  %PY_LAUNCHER% -3.12 -c "import sys" >nul 2>&1
+  if not errorlevel 1 (
+    set "PY_VER=-3.12"
+  ) else (
+    %PY_LAUNCHER% -3 -c "import sys" >nul 2>&1
+    if not errorlevel 1 (
+      set "PY_VER=-3"
+    ) else (
+      set "PY_LAUNCHER=python"
+      set "PY_VER="
+    )
+  )
+)
+
+echo [INFO] Usando: %PY_LAUNCHER% %PY_VER%
+%PY_LAUNCHER% %PY_VER% -m venv "%VENV_DIR%"
 if errorlevel 1 goto ERR_CREATE_VENV
 goto INSTALL_DEPS
 

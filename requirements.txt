@@ -1,23 +1,17 @@
-streamlit>=1.31.0
-pywebview>=4.4
-openpyxl>=3.1.2
+streamlit>=1.42.0
+openpyxl>=3.1.5
 dateparser>=1.2.0
-requests>=2.31.0
+requests>=2.32.0
+pywebview>=6.1; python_version < "3.14"
 
 # Áudio / Whisper (transcrição de voz)
-faster-whisper>=1.0.0
+faster-whisper>=1.1.0
 ctranslate2>=4.3.0
 onnxruntime>=1.17.0
 numpy>=1.26.0
 tokenizers>=0.15.0
 av>=11.0.0
+huggingface_hub>=0.20.0
 
-# Dependências opcionais usadas pelos pacotes acima
+# Dependências opcionais (Linux/macOS). No Windows normalmente não é necessário.
 torch>=2.1.0 ; platform_system != "Windows" and platform_machine != "arm64"
-
-streamlit>=1.42.0
-openpyxl>=3.1.5
-dateparser>=1.2.0
-faster-whisper>=1.1.0
-requests>=2.32.0
-pywebview>=6.1; python_version < "3.14"

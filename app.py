@@ -33,7 +33,9 @@ def _load_dotenv() -> None:
                     k, v = k.strip(), v.strip()
                     if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
                         v = v[1:-1]
-                    os.environ.setdefault(k, v)
+                    # Se o arquivo tiver chaves repetidas, queremos que a última
+                    # prevaleça (evita problema de configurações ficarem vazias).
+                    os.environ[k] = v
             break
 
 

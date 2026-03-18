@@ -7,7 +7,9 @@ Configure TELEGRAM_BOT_TOKEN no .env e rode: python telegram_bot.py
 from __future__ import annotations
 
 import atexit
+import argparse
 import os
+import sys
 import tempfile
 import time
 from datetime import date
@@ -37,7 +39,9 @@ def _load_dotenv() -> None:
                     k, v = k.strip(), v.strip()
                     if v.startswith('"') and v.endswith('"') or v.startswith("'") and v.endswith("'"):
                         v = v[1:-1]
-                    os.environ.setdefault(k, v)
+                    # Se o arquivo tiver chaves repetidas, queremos que a última
+                    # prevaleça (evita problema de TELEGRAM_BOT_TOKEN ficar vazio).
+                    os.environ[k] = v
             break
 
 
@@ -528,5 +532,57 @@ def run_polling() -> None:
                 pass
 
 
-if __name__ == "__main__":
+def _run_local_test(args: argparse.Namespace) -> None:
+    """
+    Modo de teste para validar parser + preview + escrita na planilha
+    sem depender de TELEGRAM_BOT_TOKEN nem do Telegram em si.
+    """
+    if args.workbook:
+        os.environ["WORKBOOK_PATH"] = args.workbook
+
+    text = args.test_message or ""
+    if not text.strip():
+        raise SystemExit("Informe --test-message com um texto para testar.")
+
+    # Mantemos a mesma lógica do bot.
+    parse_result = parse_message(text, reference_date=date.today())
+
+    if parse_result.missing_fields:
+        print("Missing fields:", ", ".join(parse_result.missing_fields))
+        return
+
+    if parse_result.intent in ("sale", "mixed_update", "refund", "status_update"):
+        preview_text = build_preview(parse_result)
+        print(preview_text)
+
+    if args.apply:
+        reply = apply_parse_result(
+            parse_result,
+            origin=args.origin,
+            original_text=text,
+            chat_id=args.chat_id,
+        )
+        print("\n--- Apply result ---")
+        print(reply)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Telegram bot (planilha) com modo local de teste.")
+    parser.add_argument("--test-message", dest="test_message", default="", help="Texto para simular uma mensagem do Telegram.")
+    parser.add_argument("--apply", action="store_true", help="Aplica a escrita na planilha durante o modo de teste.")
+    parser.add_argument("--workbook", dest="workbook", default="", help="Sobrescreve WORKBOOK_PATH no modo de teste.")
+    parser.add_argument("--origin", dest="origin", default="local-test", help="Origem usada no log durante o modo de teste.")
+    parser.add_argument("--chat-id", dest="chat_id", default="local-test", help="Chat ID usado para lembretes (modo teste).")
+    args, _unknown = parser.parse_known_args()
+
+    if args.test_message:
+        # Windows console pode estar em cp1252 e falhar ao imprimir emojis (prévia usa emoji).
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[call-arg]
+        return _run_local_test(args)
+
     run_polling()
+
+
+if __name__ == "__main__":
+    main()
