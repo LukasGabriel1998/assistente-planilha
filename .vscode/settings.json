@@ -1,0 +1,10 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}\\.venv_native\\Scripts\\python.exe",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}"
+  ],
+  "python.terminal.activateEnvironment": true,
+  "cursorpyright.analysis.extraPaths": [
+    "${workspaceFolder}"
+  ]
+}

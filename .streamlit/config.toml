@@ -1,0 +1,11 @@
+[browser]
+gatherUsageStats = false
+
+[server]
+showEmailPrompt = false
+headless = false
+fileWatcherType = "none"
+runOnSave = false
+
+[runner]
+fastReruns = false

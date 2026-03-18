@@ -1,0 +1,36 @@
+========================================
+  CONFIGURAR BOT NO TELEGRAM (3 passos)
+========================================
+
+1) CRIAR O BOT
+   - Abra o Telegram (celular ou desktop).
+   - Procure por:  @BotFather
+   - Envie a mensagem:  /newbot
+   - Siga as instruções: dê um nome e um username ao bot.
+   - O BotFather vai enviar um TOKEN (ex.: 7123456789:AAHxxxx...).
+   Copie esse token.
+
+2) COLAR O TOKEN NO .ENV
+   - Abra o arquivo .env (na pasta do projeto).
+   - Na linha que tem TELEGRAM_BOT_TOKEN= , cole o token depois do = :
+   
+     TELEGRAM_BOT_TOKEN=7123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   
+   - Salve o arquivo.
+
+3) RODAR O BOT
+   - No PowerShell, na pasta do projeto:
+     
+     .\.venv\Scripts\Activate.ps1
+     python telegram_bot.py
+     
+   Ou dê dois cliques em:  run_telegram_bot.ps1
+
+   - No Telegram, abra o seu bot (pelo @username que você criou) e envie:
+     "Resumo"  ou  "Vendi placa para João por 2000"
+   - O bot deve responder e a planilha será atualizada.
+
+========================================
+  Link direto para o BotFather no Telegram:
+  https://t.me/BotFather
+========================================
