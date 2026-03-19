@@ -4,7 +4,8 @@
 # - Faz "reset" (encerra instancias antigas + remove lock) para rodar no Cloud.
 
 param(
-  [switch]$NoInstall
+  [switch]$NoInstall,
+  [string]$TelegramToken
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +22,29 @@ if (-not (Test-Path $envPath)) {
   } else {
     Write-Host "[Telegram] Aviso: nem .env nem .env.example foram encontrados. Configure TELEGRAM_BOT_TOKEN e WORKBOOK_PATH." -ForegroundColor DarkYellow
   }
+}
+
+# Se o token nao foi preenchido no .env (ou veio vazio), permite setar via parametro
+# (ou via variavel de ambiente) para rodar em qualquer maquina com 1 comando.
+$tokenToUse = $TelegramToken
+if (-not $tokenToUse) { $tokenToUse = $env:TELEGRAM_BOT_TOKEN }
+
+if ($tokenToUse -and ($tokenToUse.Trim().Length -gt 0) -and (Test-Path $envPath)) {
+  $lines = Get-Content $envPath -Encoding UTF8
+  $found = $false
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match '^\s*TELEGRAM_BOT_TOKEN\s*=') {
+      $lines[$i] = "TELEGRAM_BOT_TOKEN=$tokenToUse"
+      $found = $true
+    }
+  }
+  if (-not $found) {
+    $lines = @($lines) + @("TELEGRAM_BOT_TOKEN=$tokenToUse")
+  }
+  Set-Content $envPath -Value $lines -Encoding UTF8
+  Write-Host "[Telegram] TELEGRAM_BOT_TOKEN configurado no .env (valor fornecido via parametro/ENV)." -ForegroundColor Green
+} elseif (Test-Path $envPath) {
+  Write-Host "[Telegram] TELEGRAM_BOT_TOKEN nao foi fornecido (token vazio). Verifique o arquivo .env." -ForegroundColor DarkYellow
 }
 
 function Write-Info([string]$msg) {
