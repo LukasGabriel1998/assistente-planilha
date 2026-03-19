@@ -12,6 +12,17 @@ $ErrorActionPreference = "Stop"
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectDir
 
+$envPath = Join-Path $ProjectDir ".env"
+$envExamplePath = Join-Path $ProjectDir ".env.example"
+if (-not (Test-Path $envPath)) {
+  if (Test-Path $envExamplePath) {
+    Copy-Item $envExamplePath $envPath -Force
+    Write-Host "[Telegram] .env nao existia. Copiei .env.example -> .env. Preencha TELEGRAM_BOT_TOKEN." -ForegroundColor Yellow
+  } else {
+    Write-Host "[Telegram] Aviso: nem .env nem .env.example foram encontrados. Configure TELEGRAM_BOT_TOKEN e WORKBOOK_PATH." -ForegroundColor DarkYellow
+  }
+}
+
 function Write-Info([string]$msg) {
   Write-Host $msg -ForegroundColor Cyan
 }
