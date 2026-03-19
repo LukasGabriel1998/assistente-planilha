@@ -16,6 +16,13 @@ function Write-Info([string]$msg) {
   Write-Host $msg -ForegroundColor Cyan
 }
 
+function Get-FirstExistingPath([string[]]$candidates) {
+  foreach ($p in $candidates) {
+    if (Test-Path $p) { return $p }
+  }
+  return $null
+}
+
 function Test-PythonExe([string]$exePath) {
   if (-not (Test-Path $exePath)) { return $false }
   $oldPref = $ErrorActionPreference
@@ -84,12 +91,36 @@ function Ensure-Requirements {
   if (-not (Test-PythonExe $pythonExe)) {
     throw "Venv .venv_native nao esta funcional. Rode o script com um Python instalado (ou apague .venv_native)."
   }
-  Write-Info "[Telegram] Instalando requisitos (requirements.txt) ..."
+
+  # requirements.txt pode estar no diretorio do projeto ou uma pasta acima
+  # (dependendo de como o repo foi copiado).
+  $parentDir = Split-Path -Parent $ProjectDir
+  $reqPath = Get-FirstExistingPath @(
+    (Join-Path $ProjectDir "requirements.txt"),
+    (Join-Path $parentDir "requirements.txt")
+  )
+
+  if (-not $reqPath) {
+    throw "Nao encontrei `requirements.txt`. Procurei em: `"$ProjectDir`" e `"$parentDir`""
+  }
+
+  Write-Info "[Telegram] Instalando requisitos (requirements.txt): $reqPath"
   & $pythonExe "-m" "pip" "install" "-U" "pip"
-  & $pythonExe "-m" "pip" "install" "-r" "requirements.txt"
+  if ($LASTEXITCODE -ne 0) { throw "Falha ao atualizar pip." }
+
+  & $pythonExe "-m" "pip" "install" "-r" $reqPath
+  if ($LASTEXITCODE -ne 0) { throw "Falha ao instalar requirements." }
 }
 
 Ensure-Venv
+
+# Ativa o venv na sessao atual (nao e necessario para rodar o bot, pois
+# o script ja usa o python do venv diretamente, mas ajuda a garantir que a
+# ambiente do processo esta consistente com o esperado).
+$activateScript = ".\.venv_native\Scripts\Activate.ps1"
+if (Test-Path $activateScript) {
+  try { . $activateScript } catch { }
+}
 
 if (-not $NoInstall) {
   Ensure-Requirements
