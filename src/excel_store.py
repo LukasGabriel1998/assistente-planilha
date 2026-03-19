@@ -984,27 +984,73 @@ class SpreadsheetService:
         for col in range(1, ws.max_column + 1):
             ws.cell(row=target_row, column=col).fill = fill
 
-    def list_due_reminders(self, wb, today) -> list[dict[str, str]]:
+    def list_due_reminders(self, wb, today) -> list[dict]:
+        """
+        Retorna lembretes do dia, mas agora com consistência:
+        - Ignora lembretes cujos IDs não existam mais na aba de Vendas.
+        - Busca cliente/descrição/valores diretamente da aba de Vendas
+          (evita notificar "cliente apagado" por lembretes antigos).
+        """
         if SHEET_REMINDERS not in wb.sheetnames:
             return []
-        ws = wb[SHEET_REMINDERS]
-        headers = self._reminders_header_map(ws)
+        if SHEET_SALES not in wb.sheetnames:
+            return []
+
+        ws_rem = wb[SHEET_REMINDERS]
+        headers = self._reminders_header_map(ws_rem)
         idx_due = headers.get(self._normalize_name("Data entrega"))
         idx_status = headers.get(self._normalize_name("Status servico"))
         if not idx_due or not idx_status:
             return []
-        result: list[dict[str, str]] = []
+
+        # Aba de vendas (fonte da verdade para dados exibidos no lembrete)
+        sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
+        ws_sales = wb[sales_name]
+        sales_cols = self._sales_columns(ws_sales)
+
+        result: list[dict] = []
         today_txt = self._excel_date_value(today)
-        for row in range(2, ws.max_row + 1):
-            status = str(ws.cell(row=row, column=idx_status).value or "").strip()
+
+        for row in range(2, ws_rem.max_row + 1):
+            status = str(ws_rem.cell(row=row, column=idx_status).value or "").strip()
             if self._normalize_name(status) == "finalizado":
                 continue
-            due_raw = str(ws.cell(row=row, column=idx_due).value or "").strip()
-            if due_raw and due_raw == today_txt:
-                record: dict[str, str] = {}
-                for key, idx in headers.items():
-                    record[key] = str(ws.cell(row=row, column=idx).value or "")
-                result.append(record)
+
+            due_raw = str(ws_rem.cell(row=row, column=idx_due).value or "").strip()
+            if not (due_raw and due_raw == today_txt):
+                continue
+
+            # Lê campos mínimos do lembrete
+            sale_id = str(ws_rem.cell(row=row, column=headers.get(self._normalize_name("ID VENDA"), 1)).value or "").strip()
+            if not sale_id:
+                continue
+
+            # Se a venda foi apagada/limpada na planilha, não notificar.
+            try:
+                sales_row = self._find_sale_row(ws_sales, sales_cols["id venda"], sale_id)
+            except Exception:
+                continue
+
+            customer = str(ws_sales[f"{sales_cols['id cliente']}{sales_row}"].value or "").strip()
+            product_desc = str(ws_sales[f"{sales_cols['id produto']}{sales_row}"].value or "").strip()
+            pending_amount = self._to_float(ws_sales[f"{sales_cols['valor (pendente)']}{sales_row}"].value)
+            paid_amount = self._to_float(ws_sales[f"{sales_cols['total de vendas (pago)']}{sales_row}"].value)
+            total_amount = round(pending_amount + paid_amount, 2)
+
+            # Retorna também os campos originais do lembrete (Chat ID), mas
+            # injeta cliente/descrição/valores atuais.
+            record: dict = {}
+            for key, idx in headers.items():
+                record[key] = str(ws_rem.cell(row=row, column=idx).value or "")
+
+            record["id venda"] = sale_id
+            record["cliente"] = customer
+            record["descricao"] = product_desc
+            record["pending_amount_num"] = pending_amount
+            record["total_amount_num"] = total_amount
+
+            result.append(record)
+
         return result
 
     def finalize_reminder(self, wb, sale_id: str) -> bool:
@@ -1128,7 +1174,8 @@ class SpreadsheetService:
         ws[f"{sales_cols['data de venda']}{row}"] = self._excel_date_value(cmd.sale_date)
         if cmd.service_due_date:
             ws[f"{sales_cols['data de entrega']}{row}"] = self._excel_date_value(cmd.service_due_date)
-            ws[f"{sales_cols['data de entrega']}{row}"].fill = FILL_PENDING
+            # Data de entrega definida: pintar como concluído (verde claro).
+            ws[f"{sales_cols['data de entrega']}{row}"].fill = FILL_DONE
         else:
             # Se não houver prazo, limpa cor para manter o estilo original da planilha.
             ws[f"{sales_cols['data de entrega']}{row}"].fill = copy(ws[f"{sales_cols['data de entrega']}{TEMPLATE_ROW}"].fill)
@@ -1582,6 +1629,8 @@ class SpreadsheetService:
             if target_row is None:
                 return
             ws_sales[f"{col_delivery}{target_row}"] = self._excel_date_value(delivery_date)
+            # Mantém consistência com a nova regra visual: data de entrega em verde claro.
+            ws_sales[f"{col_delivery}{target_row}"].fill = FILL_DONE
             # Mantém formato de data se a célula estiver como General.
             self._ensure_number_format_if_general(ws_sales, col_delivery, target_row, "DD/MM/YYYY")
             self._save_workbook(wb)
@@ -1796,6 +1845,12 @@ class SpreadsheetService:
         """Resumo amigável de vendas, matéria-prima, gastos fixos e lucro para o bot."""
         wb = self._open_workbook(data_only=True)
         try:
+            def _format_currency_pt(value: float) -> str:
+                txt = f"{float(value):,.2f}"
+                # pt-BR: separador decimal vírgula e milhares ponto
+                txt = txt.replace(",", "X").replace(".", ",").replace("X", ".")
+                return f"R$ {txt}"
+
             # Totais de vendas (pago/pendente)
             sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
             ws_sales = wb[sales_name]
@@ -1835,17 +1890,23 @@ class SpreadsheetService:
             for row in range(DATA_START_ROW, min(ws_fixed.max_row + 1, DATA_START_ROW + max_rows_scan)):
                 total_fixos += self._to_float(ws_fixed[f"D{row}"].value)
 
-            lucro = total_pago - total_mat - total_fixos
+            # Fallback (se o modelo mudar e a aba não existir/estragar leitura).
+            # Lucro deve usar vendas totais (pago + pendente), para bater com a aba.
+            lucro = (total_pago + total_pendente) - total_mat - total_fixos
 
-            lines: list[str] = []
-            lines.append("📈 *Status – Lucro Mensal e Anual*")
-            lines.append("")
-            lines.append(f"• Total de vendas: R$ {total_pago + total_pendente:,.2f}")
-            lines.append(f"• Pago: R$ {total_pago:,.2f} | Pendente: R$ {total_pendente:,.2f}")
-            lines.append(f"• Matéria-prima: R$ {total_mat:,.2f}")
-            lines.append(f"• Gastos fixos: R$ {total_fixos:,.2f}")
-            lines.append(f"• Lucro do período: R$ {lucro:,.2f}")
-            return "\n".join(lines)
+            # Formato (padrão da aba "Lucro Mensal e Anual"):
+            # Total Vendas | total de vendas (pago) | Valor (pendente) | Total Compras Matéria Prima | Gastos Fixos | Lucro
+            total_vendas = total_pago + total_pendente
+            return "\n".join(
+                [
+                    f"• Total Vendas: {_format_currency_pt(total_vendas)}",
+                    f"• Total de vendas (pago): {_format_currency_pt(total_pago)}",
+                    f"• Valor (pendente): {_format_currency_pt(total_pendente)}",
+                    f"• Total Compras Materia Prima: {_format_currency_pt(total_mat)}",
+                    f"• Gastos Fixos: {_format_currency_pt(total_fixos)}",
+                    f"• Lucro: {_format_currency_pt(lucro)}",
+                ]
+            )
         except Exception as e:
             return f"Erro ao ler planilha: {e}"
         finally:
@@ -1909,7 +1970,176 @@ class SpreadsheetService:
                     f"  Venda: {item['data'] or '-'} | Pendente: {pend_txt} ({item['status'] or '-'}) | Entrega: {entrega}"
                 )
             lines.append("")
-            lines.append("Dica: `FINALIZAR ID VENDA 001` para marcar como finalizado.")
+            # Dica baseada em um exemplo real de pendência da prévia.
+            example_customer = None
+            for item in rows:
+                if item.get("cliente") and self._to_float(item.get("pendente", 0.0)) > 0.01:
+                    example_customer = item.get("cliente")
+                    break
+            if not example_customer and rows:
+                example_customer = rows[0].get("cliente")
+
+            if example_customer:
+                lines.append(
+                    f"Dica: se o cliente {example_customer} tem pendência, envie `Cliente ID {example_customer} pagou` "
+                    f"para marcar a venda como paga."
+                )
+            else:
+                lines.append("Dica: envie `ID VENDA 001 pagou` para atualizar o status.")
             return "\n".join(lines)
+        finally:
+            wb.close()
+
+    def get_pending_sales_by_customer(
+        self,
+        customer_id: str,
+        max_rows_scan: int = 500,
+        *,
+        include_paid: bool = False,
+    ) -> list[dict[str, str]]:
+        """
+        Retorna vendas pendentes (ou com status pendente) para um ID de cliente.
+        Usado no Telegram para interpretar "Cliente ID XXX pagou".
+        """
+        wb = self._open_workbook(data_only=True)
+        try:
+            import re
+
+            def _norm_id(v: object) -> str:
+                """
+                Normaliza IDs salvos no Excel.
+                - Se for só dígitos e tiver <= 3, força zfill(3) (ex.: 3 -> 003)
+                - Caso contrário, devolve em string como está (trim/upper).
+                """
+                raw = str(v or "").strip()
+                digits = re.sub(r"\D", "", raw)
+                if digits:
+                    if len(digits) <= 3:
+                        return digits.zfill(3)
+                    return digits
+                return raw.upper()
+
+            sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
+            ws = wb[sales_name]
+            sales_cols = self._sales_columns(ws)
+
+            col_id = sales_cols.get("id venda")
+            col_customer = sales_cols.get("id cliente")
+            col_desc = sales_cols.get("id produto")
+            col_pending = sales_cols.get("valor (pendente)")
+            col_status = sales_cols.get("status de valor")
+            col_delivery = sales_cols.get("data de entrega")
+            col_sale_date = sales_cols.get("data de venda")
+
+            if not col_id or not col_customer:
+                return []
+
+            normalized_customer = _norm_id(customer_id)
+            rows: list[dict[str, str]] = []
+            start_row = min(ws.max_row, self.MAX_DATA_ROW, DATA_START_ROW + max_rows_scan)
+            for row in range(start_row, DATA_START_ROW - 1, -1):
+                cust_val_raw = ws[f"{col_customer}{row}"].value
+                cust_val = _norm_id(cust_val_raw)
+                if cust_val != normalized_customer:
+                    continue
+
+                pending = self._to_float(ws[f"{col_pending}{row}"].value) if col_pending else 0.0
+                status_txt = str(ws[f"{col_status}{row}"].value or "").strip().lower() if col_status else ""
+                if not include_paid:
+                    if pending <= 0.01 and status_txt != "pendente":
+                        continue
+
+                delivery = str(ws[f"{col_delivery}{row}"].value or "").strip() if col_delivery else ""
+                sale_date = str(ws[f"{col_sale_date}{row}"].value or "").strip() if col_sale_date else ""
+                desc = str(ws[f"{col_desc}{row}"].value or "").strip() if col_desc else ""
+
+                rows.append(
+                    {
+                        "sale_id": str(ws[f"{col_id}{row}"].value or "").strip(),
+                        "cliente": cust_val,
+                        "desc": desc,
+                        "pendente": f"{pending:.2f}",
+                        "status": status_txt or ("pendente" if pending > 0.01 else "pago"),
+                        "delivery": delivery,
+                        "sale_date": sale_date,
+                    }
+                )
+                if len(rows) >= 5:
+                    break
+            return rows
+        finally:
+            wb.close()
+
+    def get_pending_sale_by_sale_id(
+        self,
+        sale_id: str,
+        max_rows_scan: int = 500,
+        *,
+        include_paid: bool = False,
+    ) -> list[dict[str, str]]:
+        """
+        Retorna uma venda pendente (status pendente/pagamento pendente) por ID VENDA.
+        Usado como fallback quando o usuário manda "Cliente ID X pagou" e X na prática é o ID VENDA.
+        """
+        wb = self._open_workbook(data_only=True)
+        try:
+            import re
+
+            def _norm_sale_id(v: object) -> str:
+                raw = str(v or "").strip()
+                digits = re.sub(r"\D", "", raw)
+                if digits and len(digits) <= 3:
+                    return digits.zfill(3)
+                return digits or raw.strip().upper()
+
+            sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
+            ws = wb[sales_name]
+            sales_cols = self._sales_columns(ws)
+
+            col_id = sales_cols.get("id venda")
+            col_customer = sales_cols.get("id cliente")
+            col_desc = sales_cols.get("id produto")
+            col_pending = sales_cols.get("valor (pendente)")
+            col_status = sales_cols.get("status de valor")
+            col_delivery = sales_cols.get("data de entrega")
+            col_sale_date = sales_cols.get("data de venda")
+
+            if not col_id:
+                return []
+
+            normalized_sale_id = _norm_sale_id(sale_id)
+            rows: list[dict[str, str]] = []
+            start_row = min(ws.max_row, self.MAX_DATA_ROW, DATA_START_ROW + max_rows_scan)
+            for row in range(start_row, DATA_START_ROW - 1, -1):
+                sale_val_raw = ws[f"{col_id}{row}"].value
+                sale_val = _norm_sale_id(sale_val_raw)
+                if sale_val != normalized_sale_id:
+                    continue
+
+                pending = self._to_float(ws[f"{col_pending}{row}"].value) if col_pending else 0.0
+                status_txt = str(ws[f"{col_status}{row}"].value or "").strip().lower() if col_status else ""
+                if not include_paid:
+                    if pending <= 0.01 and status_txt != "pendente":
+                        # Já está pago/sem pendência
+                        return []
+
+                delivery = str(ws[f"{col_delivery}{row}"].value or "").strip() if col_delivery else ""
+                sale_date = str(ws[f"{col_sale_date}{row}"].value or "").strip() if col_sale_date else ""
+                desc = str(ws[f"{col_desc}{row}"].value or "").strip() if col_desc else ""
+                cliente = str(ws[f"{col_customer}{row}"].value or "").strip() if col_customer else ""
+
+                rows.append(
+                    {
+                        "sale_id": sale_val,
+                        "cliente": cliente,
+                        "desc": desc,
+                        "pendente": f"{pending:.2f}",
+                        "status": status_txt or ("pendente" if pending > 0.01 else "pago"),
+                        "delivery": delivery,
+                        "sale_date": sale_date,
+                    }
+                )
+                break
+            return rows
         finally:
             wb.close()

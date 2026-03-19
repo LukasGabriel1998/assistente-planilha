@@ -139,10 +139,27 @@ def build_preview(parse_result: ParseResult) -> str:
     lines = ["📋 *Prévia – confira antes de salvar:*", ""]
     lines.append(f"• Cliente: {cmd.customer or '-'}")
     lines.append(f"• Produto: {cmd.product_id or '-'}")
+    if getattr(cmd, "sale_id", None):
+        lines.append(f"• ID VENDA: {cmd.sale_id}")
+    elif cmd.material_cost:
+        lines.append("• ID VENDA: -")
+    if getattr(cmd, "sale_date", None):
+        lines.append(f"• Data da venda: {cmd.sale_date.strftime('%d/%m/%Y')}")
+    else:
+        lines.append("• Data da venda: -")
     lines.append(f"• Valor total: R$ {cmd.total_value:,.2f}" if cmd.total_value else "• Valor total: -")
     if cmd.payments:
         for p in cmd.payments:
-            lines.append(f"  → {p.label}: R$ {p.value:,.2f} ({p.status})")
+            due_txt = p.due_date.strftime("%d/%m/%Y") if getattr(p, "due_date", None) else "-"
+            lines.append(f"  → {p.label}: R$ {p.value:,.2f} ({p.status}) - vence em {due_txt}")
+
+    # Data de entrega: prefere campo explícito; caso não exista, usa a data do "Saldo"/restante.
+    delivery_date = getattr(cmd, "service_due_date", None)
+    if delivery_date is None and cmd.payments:
+        saldo_due = next((p.due_date for p in cmd.payments if str(p.label).strip().lower() == "saldo" and getattr(p, "due_date", None)), None)
+        delivery_date = saldo_due
+    if delivery_date is not None:
+        lines.append(f"• Data de Entrega: {delivery_date.strftime('%d/%m/%Y')}")
     # Mostrar custos de material e fixo quando presentes (igual ao app)
     if cmd.material_cost:
         lines.append(f"• Material estimado: R$ {cmd.material_cost:,.2f}.")
@@ -255,8 +272,9 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
         if not actions:
             return "Nao consegui encontrar esses IDs na planilha para atualizar como pagos."
         return format_reply("status_update", actions, error=None)
+    cmd_strip = cmd_lower.strip()
     # Resumo (visão geral)
-    if any(kw in cmd_lower for kw in SUMMARY_KEYWORDS) and len(cmd_lower) < 50:
+    if any(cmd_strip.startswith(kw) for kw in SUMMARY_KEYWORDS):
         workbook_path = get_default_workbook()
         if not workbook_path or not Path(workbook_path).exists():
             return "Planilha nao encontrada. Configure WORKBOOK_PATH no .env ou coloque a planilha na pasta do app."
@@ -267,7 +285,7 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
             return f"Erro ao gerar resumo: {e}"
 
     # Status: resumo da aba "Lucro Mensal e Anual" (usa get_planilha_summary)
-    if any(kw in cmd_lower for kw in STATUS_KEYWORDS) and len(cmd_lower) < 50:
+    if any(cmd_strip.startswith(kw) for kw in STATUS_KEYWORDS):
         workbook_path = get_default_workbook()
         if not workbook_path or not Path(workbook_path).exists():
             return "Planilha nao encontrada. Configure WORKBOOK_PATH no .env."
@@ -278,7 +296,7 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
             return f"Erro ao ler status: {e}"
 
     # Prévia (pendências e entregas)
-    if any(kw in cmd_lower for kw in PREVIEW_KEYWORDS) and len(cmd_lower) < 50:
+    if any(cmd_strip.startswith(kw) for kw in PREVIEW_KEYWORDS):
         workbook_path = get_default_workbook()
         if not workbook_path or not Path(workbook_path).exists():
             return "Planilha nao encontrada. Configure WORKBOOK_PATH no .env."
