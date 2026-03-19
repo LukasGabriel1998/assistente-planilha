@@ -16,50 +16,74 @@ function Write-Info([string]$msg) {
   Write-Host $msg -ForegroundColor Cyan
 }
 
+function Test-PythonExe([string]$exePath) {
+  if (-not (Test-Path $exePath)) { return $false }
+  $oldPref = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = "SilentlyContinue"
+    # Testa se o "python.exe" do venv realmente funciona (e nao esta apontando
+    # para um Python antigo que foi removido).
+    & $exePath "-c" "import sys; sys.exit(0)" *> $null
+    return ($LASTEXITCODE -eq 0)
+  } finally {
+    $ErrorActionPreference = $oldPref
+  }
+}
+
 function Find-PythonExe {
-  if (Test-Path ".\.venv_native\Scripts\python.exe") { return ".\.venv_native\Scripts\python.exe" }
-  if (Test-Path ".\.venv\Scripts\python.exe") { return ".\.venv\Scripts\python.exe" }
+  if (Test-PythonExe ".\.venv_native\Scripts\python.exe") { return ".\.venv_native\Scripts\python.exe" }
+  if (Test-PythonExe ".\.venv\Scripts\python.exe") { return ".\.venv\Scripts\python.exe" }
   # fallback: python do sistema
   return "python"
 }
 
 function Ensure-Venv {
-  if (Test-Path ".\.venv_native\Scripts\python.exe") { return }
-
   $venvDir = ".venv_native"
+  $venvPython = ".\$venvDir\Scripts\python.exe"
+
+  # Se o venv existir e funcionar, nao precisa recriar.
+  if (Test-PythonExe $venvPython) { return }
+
+  # Se existir mas estiver quebrado, removemos para recriar do zero.
+  try { Remove-Item ".\$venvDir" -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+
   Write-Info "[Telegram] Criando venv em $venvDir ..."
 
-  $launcher = "py"
   $found = $false
-  foreach ($ver in @("3.13","3.12","3.14","3")) {
+
+  # Preferir o launcher "py" com a versão padrão (3.x) para evitar tentar versões inexistentes.
+  if (Get-Command "py" -ErrorAction SilentlyContinue) {
     try {
-      # testa se py -<ver> existe
-      & $launcher "-$ver" "-c" "import sys; print(sys.version)" *> $null
+      & py "-3" "-c" "import sys; print(sys.version)" *> $null
       if ($LASTEXITCODE -eq 0) {
-        & $launcher "-$ver" "-m" "venv" $venvDir
-        if (Test-Path ".\$venvDir\Scripts\python.exe") { $found = $true; break }
+        & py "-3" "-m" "venv" $venvDir *> $null
+        $found = Test-PythonExe ".\$venvDir\Scripts\python.exe"
       }
     } catch {
-      # tenta próxima versão
+      # ignora e tenta fallback
+    }
+  }
+
+  # Fallback: usar python direto se existir no PATH.
+  if (-not $found) {
+    if (Get-Command "python" -ErrorAction SilentlyContinue) {
+      & python "-m" "venv" $venvDir *> $null
+      $found = Test-PythonExe ".\$venvDir\Scripts\python.exe"
     }
   }
 
   if (-not $found) {
-    # fallback sem py launcher
-    if (Test-Path "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe") {
-      & "python" "-m" "venv" $venvDir
-    } else {
-      & "python" "-m" "venv" $venvDir
-    }
-  }
-
-  if (-not (Test-Path ".\.venv_native\Scripts\python.exe")) {
-    throw "Falha ao criar .venv_native. Instale Python e/ou use o modo manual."
+    # Garante que o usuário não fica preso num venv "meio criado".
+    try { Remove-Item ".\$venvDir" -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    throw "Falha ao criar/validar .venv_native. Instale Python e/ou use o modo manual."
   }
 }
 
 function Ensure-Requirements {
-  $pythonExe = Find-PythonExe
+  $pythonExe = ".\.venv_native\Scripts\python.exe"
+  if (-not (Test-PythonExe $pythonExe)) {
+    throw "Venv .venv_native nao esta funcional. Rode o script com um Python instalado (ou apague .venv_native)."
+  }
   Write-Info "[Telegram] Instalando requisitos (requirements.txt) ..."
   & $pythonExe "-m" "pip" "install" "-U" "pip"
   & $pythonExe "-m" "pip" "install" "-r" "requirements.txt"
@@ -71,7 +95,10 @@ if (-not $NoInstall) {
   Ensure-Requirements
 }
 
-$pythonExe = Find-PythonExe
+$pythonExe = ".\.venv_native\Scripts\python.exe"
+if (-not (Test-PythonExe $pythonExe)) {
+  throw "Venv .venv_native nao esta funcional. Apague a pasta .venv_native e rode novamente, ou instale o Python correto."
+}
 
 # reset (encerrar processos antigos)
 Write-Info "[Telegram] Reset/Start: limpando instancias antigas..."
