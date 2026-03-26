@@ -36,6 +36,9 @@ if (Test-Path ".\.venv_native\Scripts\python.exe") {
   $pythonExe = ".\.venv_native\Scripts\python.exe"
 } elseif (Test-Path ".\.venv\Scripts\python.exe") {
   $pythonExe = ".\.venv\Scripts\python.exe"
+} elseif (Test-Path "..\.venv\Scripts\python.exe") {
+  # Compatibilidade: em algumas entregas a venv fica na pasta pai do projeto.
+  $pythonExe = "..\.venv\Scripts\python.exe"
 } else {
   $pythonExe = "python"
 }

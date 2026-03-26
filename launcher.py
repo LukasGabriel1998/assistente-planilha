@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import os
@@ -187,7 +187,7 @@ class LauncherUI:
         self.root.minsize(720, 480)
         self.root.configure(bg=WINDOW_BG)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        icon_path = resource_path("assets/app_icon.ico")
+        icon_path = resource_path("assets/p26.ico")
         if icon_path.exists():
             try:
                 self.root.iconbitmap(str(icon_path))

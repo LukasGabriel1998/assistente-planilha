@@ -34,6 +34,8 @@ if (Test-Path ".\.venv_native\Scripts\python.exe") {
   .\.venv_native\Scripts\python.exe telegram_bot.py
 } elseif (Test-Path ".\.venv\Scripts\python.exe") {
   .\.venv\Scripts\python.exe telegram_bot.py
+} elseif (Test-Path "..\.venv\Scripts\python.exe") {
+  ..\.venv\Scripts\python.exe telegram_bot.py
 } else {
   python telegram_bot.py
 }

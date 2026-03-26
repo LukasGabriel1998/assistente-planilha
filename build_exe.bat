@@ -18,6 +18,14 @@ if not exist "%VENV_DIR%\Scripts\python.exe" (
 )
 
 if not exist "%VENV_DIR%\Scripts\python.exe" (
+  set "VENV_DIR=..\.venv_native"
+)
+
+if not exist "%VENV_DIR%\Scripts\python.exe" (
+  set "VENV_DIR=..\.venv"
+)
+
+if not exist "%VENV_DIR%\Scripts\python.exe" (
   echo [ERRO] Ambiente virtual nao encontrado. Execute iniciar_app.bat primeiro.
   pause
   exit /b 1
@@ -40,19 +48,34 @@ if not exist "%PYINSTALLER_EXE%" (
 )
 
 echo [INFO] Limpando builds anteriores...
-for %%F in ("%DIST_DIR%\*.xlsx") do (
-  copy /Y "%%~fF" "%WORKBOOK_STAGE%" >nul
-  set "WORKBOOK_SOURCE=%WORKBOOK_STAGE%"
-  set "WORKBOOK_OUTPUT_NAME=%%~nxF"
-  goto :workbook_stage_done
+if exist "%DIST_DIR%" (
+  rem A planilha fica ao lado do exe: dist_novo\AssistentePlanilha\*.xlsx
+  for %%F in ("%APP_DIR%\*.xlsx") do (
+    if not defined WORKBOOK_SOURCE (
+      copy /Y "%%~fF" "%WORKBOOK_STAGE%" >nul
+      set "WORKBOOK_SOURCE=%WORKBOOK_STAGE%"
+      set "WORKBOOK_OUTPUT_NAME=Planilha.xlsx"
+    )
+  )
+  for %%F in ("%APP_DIR%\*.xlsm") do (
+    if not defined WORKBOOK_SOURCE (
+      copy /Y "%%~fF" "%WORKBOOK_STAGE%" >nul
+      set "WORKBOOK_SOURCE=%WORKBOOK_STAGE%"
+      set "WORKBOOK_OUTPUT_NAME=Planilha.xlsm"
+    )
+  )
 )
-for %%F in (*.xlsx) do (
-  copy /Y "%%~fF" "%WORKBOOK_STAGE%" >nul
-  set "WORKBOOK_SOURCE=%WORKBOOK_STAGE%"
-  set "WORKBOOK_OUTPUT_NAME=%%~nxF"
-  goto :workbook_stage_done
+if not defined WORKBOOK_SOURCE (
+  for %%F in (*.xlsx) do (
+    if not defined WORKBOOK_SOURCE (
+      copy /Y "%%~fF" "%WORKBOOK_STAGE%" >nul
+      set "WORKBOOK_SOURCE=%WORKBOOK_STAGE%"
+      set "WORKBOOK_OUTPUT_NAME=Planilha.xlsx"
+    )
+  )
 )
-:workbook_stage_done
+rem workbook_stage_done (nao usado mais)
+rem workbook_stage_done (nao usado mais)
 
 if exist "%WORK_DIR%" rmdir /s /q "%WORK_DIR%"
 if exist "%DIST_DIR%" rmdir /s /q "%DIST_DIR%"
@@ -73,7 +96,7 @@ if not errorlevel 1 (
   echo [INFO] pywebview encontrado. O build vai incluir janela nativa.
 ) else (
   echo [ERRO] pywebview nao encontrado neste ambiente.
-  echo [DICA] Para gerar o executavel nativo, instale Python 3.13 (ou 3.12) e rode iniciar_app.bat para recriar a .venv_native.
+  echo [DICA] Para gerar o executavel nativo, instale Python 3.13 ou 3.12 e rode iniciar_app.bat para recriar a .venv_native.
   echo [DICA] No Python 3.14 o pywebview/pythonnet pode falhar na instalacao dependendo do ambiente.
   pause
   exit /b 1
@@ -88,7 +111,7 @@ echo [INFO] Gerando executavel...
   --name "%APP_NAME%" ^
   --distpath "%DIST_DIR%" ^
   --workpath "%WORK_DIR%" ^
-  --icon "assets\\app_icon.ico" ^
+  --icon "assets\\p26.ico" ^
   --add-data "app.py;." ^
   --add-data "src;src" ^
   --add-data "assets;assets" ^
@@ -120,7 +143,7 @@ if exist "%WORK_DIR%" rmdir /s /q "%WORK_DIR%"
 set "COPIED_WORKBOOK="
 if defined WORKBOOK_SOURCE if exist "%WORKBOOK_SOURCE%" (
   if not defined WORKBOOK_OUTPUT_NAME for %%F in ("%WORKBOOK_SOURCE%") do set "WORKBOOK_OUTPUT_NAME=%%~nxF"
-  copy /Y "%WORKBOOK_SOURCE%" "%DIST_DIR%\%WORKBOOK_OUTPUT_NAME%" >nul
+  copy /Y "%WORKBOOK_SOURCE%" "%APP_DIR%\%WORKBOOK_OUTPUT_NAME%" >nul
   set "COPIED_WORKBOOK=%WORKBOOK_OUTPUT_NAME%"
 )
 if exist "%WORKBOOK_STAGE%" del /q "%WORKBOOK_STAGE%"
@@ -137,7 +160,7 @@ echo [OK] Build concluido.
 echo [OK] Executavel: %OUT_EXE%
 echo [OK] Atalho de inicializacao: %DIST_DIR%\INICIAR_ASSISTENTE.bat
 if defined COPIED_WORKBOOK (
-  echo [OK] Planilha copiada para o build: %DIST_DIR%\!COPIED_WORKBOOK!
+  echo [OK] Planilha copiada para o build: %APP_DIR%\!COPIED_WORKBOOK!
 ) else (
   echo [AVISO] Nenhuma planilha .xlsx foi copiada para %DIST_DIR%.
 )

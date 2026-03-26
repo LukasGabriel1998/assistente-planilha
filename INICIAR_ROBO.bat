@@ -7,6 +7,9 @@ if exist ".venv_native\Scripts\python.exe" (
     set "PYTHON_EXE=.venv_native\Scripts\python.exe"
 ) else if exist ".venv\Scripts\python.exe" (
     set "PYTHON_EXE=.venv\Scripts\python.exe"
+) else if exist "..\.venv\Scripts\python.exe" (
+    rem Compatibilidade: venv pode estar na pasta pai do projeto.
+    set "PYTHON_EXE=..\.venv\Scripts\python.exe"
 )
 
 if "%PYTHON_EXE%"=="" (
