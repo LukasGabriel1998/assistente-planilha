@@ -67,6 +67,7 @@ def _init_state() -> None:
         "description": "",
         "sale_id": "",
         "sale_date": date.today(),
+        "service_due_date": date.today(),
         "total_value": 0.0,
         "entry_value": 0.0,
         "entry_date": date.today(),
@@ -168,6 +169,14 @@ def _fill_state_from_command(
     st.session_state.balance_value = float(balance.value if balance else 0.0)
     st.session_state.balance_date = balance.due_date if balance else cmd.sale_date
     st.session_state.balance_status = balance.status if balance else "pago"
+    # Data de entrega segue o mesmo padrão do Telegram:
+    # 1) campo explícito do parser; 2) fallback para vencimento do saldo.
+    if cmd.service_due_date is not None:
+        st.session_state.service_due_date = cmd.service_due_date
+    elif balance is not None and getattr(balance, "due_date", None):
+        st.session_state.service_due_date = balance.due_date
+    else:
+        st.session_state.service_due_date = cmd.sale_date
 
     st.session_state.material_cost = float(cmd.material_cost or 0.0)
     st.session_state.material_date = cmd.material_date or cmd.sale_date
@@ -239,6 +248,10 @@ def _build_command_from_ui() -> FinancialCommand:
             )
         )
 
+    service_due_date = st.session_state.get("service_due_date")
+    if service_due_date is None and balance_value > 0:
+        service_due_date = st.session_state.balance_date
+
     return FinancialCommand(
         customer=st.session_state.customer.strip(),
         description=st.session_state.description.strip()
@@ -265,6 +278,7 @@ def _build_command_from_ui() -> FinancialCommand:
         fixed_cost=float(st.session_state.fixed_cost or 0.0) or None,
         fixed_cost_label=st.session_state.fixed_cost_label.strip() or None,
         fixed_cost_date=st.session_state.fixed_cost_date if st.session_state.fixed_cost > 0 else None,
+        service_due_date=service_due_date,
     )
 
 
@@ -873,6 +887,7 @@ def main() -> None:
             c7.date_input("Data entrada", key="entry_date", format="DD/MM/YYYY")
             c8.date_input("Data saldo", key="balance_date", format="DD/MM/YYYY")
             c9.number_input("Custo material (R$)", min_value=0.0, step=50.0, key="material_cost")
+            st.date_input("Data de entrega", key="service_due_date", format="DD/MM/YYYY")
     
             st.caption(
                 "ID VENDA sera gerado automaticamente ao salvar. Use esse codigo depois para atualizar o status."

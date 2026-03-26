@@ -421,6 +421,10 @@ def _extract_customer(text: str) -> Optional[str]:
 
 def _extract_product(text: str) -> Optional[str]:
     patterns = [
+        # "vendi uma placa para o cliente X ..."
+        rf"\b(?:acabei\s+de\s+)?vend(?:i|er)\s+((?:um|uma|o|a)\s+)?({LETTER_RX}[\w .'/+-]{{1,50}}?)\s+(?:para|pro|pra)\s+(?:(?:o|a)\s+)?cliente\b",
+        # "fiz uma fachada para o cliente X ..."
+        rf"\b(?:acabei\s+de\s+)?fiz\s+((?:um|uma|o|a)\s+)?({LETTER_RX}[\w .'/+-]{{1,50}}?)\s+(?:para|pro|pra)\s+(?:(?:o|a)\s+)?cliente\b",
         rf"\b(?:acabei\s+de\s+)?vend(?:i|emos|er)\s+(?:para|pro|pra)\s+(?:(?:o|a)\s+)?[^,.;\n]+?\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s+(?:por|no\s+valor|valor|pagou|vai\s+pagar|e\b|,|\.|;))",
         rf"\bfechei\s+com\s+[^,.;\n]+?\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s+(?:por|no\s+valor|valor|pagou|vai\s+pagar|e\b|,|\.|;))",
         rf"\bfechamos\s+com\s+[^,.;\n]+?\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s+(?:por|no\s+valor|valor|pagou|vai\s+pagar|e\b|,|\.|;))",
@@ -755,6 +759,78 @@ def _extract_total_value(text: str, numbers: list[float]) -> Optional[float]:
     return big[0] if big else numbers[0]
 
 
+def _extract_itemized_products_and_total(text: str) -> tuple[list[str], Optional[float]]:
+    """
+    Captura casos como:
+    "o painel eu vendi por 3 mil e o banner eu vendi por 5 mil"
+    Retorna (produtos, total_somado) quando detectar itens claros.
+    """
+    products: list[str] = []
+    values: list[float] = []
+    product_chunk = r"((?:[A-Za-zÀ-ÖØ-öø-ÿ0-9/-]+\s*){1,4}?)"
+    patterns = [
+        re.compile(
+            rf"\b(?:o|a)\s+{product_chunk}\s+(?:eu\s+)?vendi\s+(?:no\s+valor\s+de|por)\s*({MONEY_TOKEN})",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            rf"\bvendi\s+(?:um|uma|o|a)\s+{product_chunk}\s+(?:por|no\s+valor\s+de)\s*({MONEY_TOKEN})",
+            flags=re.IGNORECASE,
+        ),
+    ]
+    seen_pairs: set[tuple[str, float]] = set()
+    for pattern in patterns:
+        for m in pattern.finditer(text):
+            prod = _clean_extracted_phrase(m.group(1) or "")
+            prod = _strip_leading_article(prod)
+            prod = re.sub(r"\b(eu|aqui|pra|para)\b\s*$", "", prod, flags=re.IGNORECASE).strip(" ,.-")
+            if not prod:
+                continue
+            norm_words = [_normalize(w) for w in prod.split() if w]
+            if any(w in BAD_PRODUCT_WORDS for w in norm_words):
+                continue
+            val = _parse_money_from_fragment(m.group(2) or "")
+            if val is None or val <= 0:
+                continue
+            human_prod = _humanize_label(prod)
+            pair = (_normalize(human_prod), float(val))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            products.append(human_prod)
+            values.append(float(val))
+    # Dedup preservando ordem
+    uniq_products: list[str] = []
+    for p in products:
+        if p not in uniq_products:
+            uniq_products.append(p)
+    if len(values) >= 2:
+        return uniq_products, round(sum(values), 2)
+    return uniq_products, None
+
+
+def _extract_material_cost(text: str) -> Optional[float]:
+    """
+    Extrai custo de material priorizando o trecho próximo a palavras-chave
+    para evitar capturar "metade" da venda por engano.
+    """
+    norm = _normalize(text)
+    keyword_positions: list[int] = []
+    for kw in ("material", "materia prima", "fornecedor", "gastar", "gasto", "comprar", "comprei"):
+        idx = norm.find(kw)
+        if idx >= 0:
+            keyword_positions.append(idx)
+    candidates: list[float] = []
+    for idx in keyword_positions:
+        snippet = text[max(0, idx - 20) : idx + 110]
+        for v in _currency_candidates(snippet):
+            if v > 0:
+                candidates.append(float(v))
+    if candidates:
+        return max(candidates)
+    return None
+
+
 def _extract_payment_value(text: str, label: str, total: Optional[float], fallback_numbers: list[float]) -> Optional[float]:
     norm = _normalize(text)
     if "metade" in norm and total:
@@ -923,6 +999,10 @@ def _contains_explicit_date_hint(text: str) -> bool:
 def _contains_future_balance_hint(text: str) -> bool:
     norm = _normalize(text)
     future_tokens = (
+        "amanha",
+        "amanha me paga",
+        "amanha paga",
+        "amanha eu recebo",
         "depois",
         "depois que",
         "mais pra frente",
@@ -984,6 +1064,12 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
     customer = _extract_customer(raw_text) or ""
     product_id = _extract_product(raw_text) or ""
     total_value = _extract_total_value(raw_text, numbers)
+    itemized_products, itemized_total = _extract_itemized_products_and_total(raw_text)
+    if itemized_total is not None:
+        total_value = itemized_total
+    if itemized_products:
+        joined_products = " + ".join(itemized_products)
+        product_id = joined_products
     # Se a mensagem for claramente "gasto de material" (ex.: "gastei 1000 de material"),
     # nao tratamos como venda/total no caixa: suprimimos total_value e montamos apenas
     # a atualizacao de Compras Matéria-Prima.
@@ -1054,6 +1140,10 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
         )
         or entry_date
     )
+    # Heurística: "amanha" + contexto de saldo/restante => saldo vence amanhã.
+    if ("amanha" in norm_text) and any(tok in norm_text for tok in ("restante", "saldo", "receber", "recebo", "vai me pagar")):
+        balance_date = max(balance_date, reference_date + timedelta(days=1))
+
     balance_future_hint = _contains_future_balance_hint(balance_segment or "") or _contains_future_balance_hint(raw_text)
     if balance_segment and not _contains_explicit_date_hint(balance_segment) and balance_future_hint:
         balance_date = max(balance_date, sale_date + timedelta(days=1))
@@ -1082,15 +1172,23 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
         )
         or None
     )
+    # Heurística: quando o cliente fala "amanha" e também menciona entrega,
+    # consideramos amanhã como Data de Entrega.
+    if service_due_date is None and ("amanha" in norm_text) and any(
+        tok in norm_text for tok in ("entrega", "entregar", "servico", "serviço", "fazer o servico", "fazer o serviço")
+    ):
+        service_due_date = reference_date + timedelta(days=1)
 
     entry_value = _extract_payment_value(raw_text, "entrada", total_value, numbers)
     balance_value = _extract_payment_value(raw_text, "saldo", total_value, numbers)
 
-    material_cost = _extract_amount_after_prefix(
-        raw_text,
-        prefixes=[r"material", r"materia prima", r"mat[eé]ria prima"],
-        max_gap_words=5,
-    )
+    material_cost = _extract_material_cost(raw_text)
+    if material_cost is None:
+        material_cost = _extract_amount_after_prefix(
+            raw_text,
+            prefixes=[r"material", r"materia prima", r"mat[eé]ria prima"],
+            max_gap_words=5,
+        )
     if material_cost is None:
         material_cost = _extract_amount_after_prefix(raw_text, prefixes=[r"gastar", r"gasto", r"pagar"], max_gap_words=8)
     if material_cost is None:
@@ -1141,7 +1239,8 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
             missing.append("Valor total da venda")
     if _has_placeholder_date(raw_text):
         warnings.append("Foi detectada data indefinida (ex.: 'dia tal'). Confirme as datas antes de salvar.")
-    if balance_segment and not _contains_explicit_date_hint(balance_segment):
+    has_global_explicit_date = _contains_explicit_date_hint(raw_text)
+    if balance_segment and not _contains_explicit_date_hint(balance_segment) and not has_global_explicit_date:
         if balance_future_hint:
             warnings.append("Saldo marcado como pendente ate voce informar a data final do recebimento.")
         else:
