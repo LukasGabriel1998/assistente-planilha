@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import socket
 import subprocess
@@ -36,6 +37,10 @@ MINT = "#14B8A6"
 ORANGE = "#FB923C"
 RED = "#F43F5E"
 APP_WINDOW_TITLE = "Assistente de Planilha por Audio"
+WINDOWS_APP_ID = "com.p26.assistenteplanilha"
+
+# Mantem referência viva para o handle de ícone carregado no Win32.
+_WINDOWS_ICON_HANDLE = None
 
 
 def resource_path(relative: str) -> Path:
@@ -66,6 +71,59 @@ def find_available_port(start: int = 8501, max_tries: int = 40) -> int:
     raise RuntimeError("Nao foi possivel encontrar porta livre para iniciar o app.")
 
 
+def _set_windows_app_id() -> None:
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_ID)
+    except Exception:
+        pass
+
+
+def _apply_windows_icon_by_title(window_title: str, icon_path: Path) -> bool:
+    """Aplica ícone .ico em janela Win32 pelo título (canto superior e barra de tarefas)."""
+    if os.name != "nt" or not icon_path.exists():
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        WM_SETICON = 0x0080
+        ICON_SMALL = 0
+        ICON_BIG = 1
+        IMAGE_ICON = 1
+        LR_LOADFROMFILE = 0x0010
+        LR_DEFAULTSIZE = 0x0040
+
+        hwnd = user32.FindWindowW(None, window_title)
+        if not hwnd:
+            return False
+
+        global _WINDOWS_ICON_HANDLE
+        _WINDOWS_ICON_HANDLE = user32.LoadImageW(
+            None,
+            str(icon_path),
+            IMAGE_ICON,
+            0,
+            0,
+            LR_LOADFROMFILE | LR_DEFAULTSIZE,
+        )
+        if not _WINDOWS_ICON_HANDLE:
+            return False
+
+        user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, _WINDOWS_ICON_HANDLE)
+        user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, _WINDOWS_ICON_HANDLE)
+        return True
+    except Exception:
+        return False
+
+
+def _wait_and_apply_windows_icon(window_title: str, icon_path: Path, timeout_sec: int = 20) -> None:
+    deadline = time.time() + max(1, int(timeout_sec))
+    while time.time() < deadline:
+        if _apply_windows_icon_by_title(window_title, icon_path):
+            return
+        time.sleep(0.25)
+
+
 def wait_http_ready(port: int, timeout_sec: int = 90) -> bool:
     deadline = time.time() + timeout_sec
     health_urls = [
@@ -91,6 +149,15 @@ def desktop_window_supported() -> bool:
 def run_desktop_window(port: int) -> None:
     if webview is None:
         raise RuntimeError("pywebview nao esta instalado.")
+
+    _set_windows_app_id()
+    icon_path = resource_path("assets/p26.ico")
+    if os.name == "nt" and icon_path.exists():
+        threading.Thread(
+            target=_wait_and_apply_windows_icon,
+            args=(APP_WINDOW_TITLE, icon_path, 20),
+            daemon=True,
+        ).start()
 
     url = f"http://127.0.0.1:{port}"
     webview.create_window(
@@ -181,6 +248,7 @@ def build_desktop_command(port: int) -> list[str]:
 
 class LauncherUI:
     def __init__(self, *, auto_start: bool = True, workbook_override: str = "") -> None:
+        _set_windows_app_id()
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
         self.root.geometry("760x520")

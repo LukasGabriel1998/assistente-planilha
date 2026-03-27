@@ -400,8 +400,29 @@ class SpreadsheetService:
 
     @classmethod
     def _sales_style_cols(cls, ws) -> tuple[str, ...]:
-        """Colunas de estilo da aba de vendas: linha inteira com bordas padronizadas."""
-        return cls._sheet_style_cols(ws)
+        """
+        Colunas de estilo/dados da tabela de vendas.
+
+        Importante: não usar a linha inteira para evitar sobrescrever colunas
+        auxiliares de layout/resumo (ex.: coluna J com totais/fórmulas).
+        """
+        sales_cols = cls._sales_columns(ws)
+        cols = [
+            sales_cols["data de venda"],
+            sales_cols["data de entrega"],
+            sales_cols["id cliente"],
+            sales_cols["id produto"],
+            sales_cols["total de vendas (pago)"],
+            sales_cols["valor (pendente)"],
+            sales_cols["id venda"],
+            sales_cols["status de valor"],
+        ]
+        # Algumas planilhas têm também a coluna "Status" (serviço) ao lado.
+        status_col = sales_cols.get("status")
+        if status_col:
+            cols.append(status_col)
+        # Remove duplicadas preservando ordem.
+        return tuple(dict.fromkeys(cols))
 
     @staticmethod
     def _row_is_empty(ws, row: int, cols: tuple[str, ...]) -> bool:

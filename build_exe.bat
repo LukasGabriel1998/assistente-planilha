@@ -54,7 +54,7 @@ if exist "%DIST_DIR%" (
     if not defined WORKBOOK_SOURCE (
       copy /Y "%%~fF" "%WORKBOOK_STAGE%" >nul
       set "WORKBOOK_SOURCE=%WORKBOOK_STAGE%"
-      set "WORKBOOK_OUTPUT_NAME=Planilha.xlsx"
+      set "WORKBOOK_OUTPUT_NAME=%%~nxF"
     )
   )
   for %%F in ("%APP_DIR%\*.xlsm") do (
@@ -70,7 +70,7 @@ if not defined WORKBOOK_SOURCE (
     if not defined WORKBOOK_SOURCE (
       copy /Y "%%~fF" "%WORKBOOK_STAGE%" >nul
       set "WORKBOOK_SOURCE=%WORKBOOK_STAGE%"
-      set "WORKBOOK_OUTPUT_NAME=Planilha.xlsx"
+      set "WORKBOOK_OUTPUT_NAME=%%~nxF"
     )
   )
 )
@@ -145,6 +145,10 @@ if defined WORKBOOK_SOURCE if exist "%WORKBOOK_SOURCE%" (
   if not defined WORKBOOK_OUTPUT_NAME for %%F in ("%WORKBOOK_SOURCE%") do set "WORKBOOK_OUTPUT_NAME=%%~nxF"
   copy /Y "%WORKBOOK_SOURCE%" "%APP_DIR%\%WORKBOOK_OUTPUT_NAME%" >nul
   set "COPIED_WORKBOOK=%WORKBOOK_OUTPUT_NAME%"
+  rem Mantem compatibilidade com clientes que usam o nome antigo da planilha.
+  if /I "%WORKBOOK_OUTPUT_NAME%"=="Planilha.xlsx" (
+    copy /Y "%APP_DIR%\%WORKBOOK_OUTPUT_NAME%" "%APP_DIR%\Planilha_Comunicacao_Visual - EDIT.xlsx" >nul
+  )
 )
 if exist "%WORKBOOK_STAGE%" del /q "%WORKBOOK_STAGE%"
 
