@@ -379,9 +379,10 @@ class SpreadsheetService:
     def _layout_cols_for_sheet(cls, ws, logical_sheet_name: str) -> tuple[str, ...]:
         logical_norm = cls._normalize_name(logical_sheet_name)
         if logical_norm == cls._normalize_name(SHEET_SALES):
-            # Vendas: preservar o layout completo da linha (inclui colunas extras
-            # que o usuário possa manter no padrão visual, como colunas auxiliares).
-            return cls._sheet_style_cols(ws)
+            # Vendas: aplicar layout APENAS nas colunas da tabela de vendas.
+            # Não usar a linha inteira porque isso pode sobrescrever blocos de layout/resumo
+            # fora da tabela (ex.: coluna J com totais/fórmulas/caixas).
+            return cls._sales_style_cols(ws)
         if logical_norm == cls._normalize_name(SHEET_MATERIAL):
             material_cols = cls._material_columns(ws)
             cols = (

@@ -244,51 +244,405 @@ def _maybe_build_status_table_image(workbook_path: str) -> str | None:
         txt = f"{float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
         return f"R$ {txt}"
 
-    labels = [
-        "Total Vendas",
-        "total de vendas (pago)",
-        "Valor (pendente)",
-        "Total Compras Materia Prima",
-        "Gastos Fixos",
-        "Lucro",
+    def _load_font(size: int, bold: bool = False):
+        candidates = (
+            [
+                r"C:\Windows\Fonts\segoeuib.ttf",
+                r"C:\Windows\Fonts\arialbd.ttf",
+                r"C:\Windows\Fonts\calibrib.ttf",
+            ]
+            if bold
+            else [
+                r"C:\Windows\Fonts\segoeui.ttf",
+                r"C:\Windows\Fonts\arial.ttf",
+                r"C:\Windows\Fonts\calibri.ttf",
+            ]
+        )
+        for fp in candidates:
+            try:
+                return ImageFont.truetype(fp, size=size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
+    font_title = _load_font(26, bold=True)
+    font_meta = _load_font(17, bold=False)
+    font_label = _load_font(17, bold=False)
+    font_value = _load_font(24, bold=True)
+
+    # Grade 2x3: mais legível no Telegram do que 6 colunas em uma única faixa
+    kpi = [
+        ("Total de vendas (geral)", _brl(total_sales), False),
+        ("Vendas pagas", _brl(total_paid), False),
+        ("Valor pendente", _brl(total_pending), False),
+        ("Compras matéria-prima", _brl(total_mat), False),
+        ("Gastos fixos", _brl(total_fix), False),
+        ("Lucro estimado", _brl(lucro), True),
     ]
-    values = [_brl(total_sales), _brl(total_paid), _brl(total_pending), _brl(total_mat), _brl(total_fix), _brl(lucro)]
 
-    # Layout parecido com a área da planilha mostrada pelo usuário
-    col_widths = [190, 230, 210, 290, 170, 160]
+    outer_bg = (241, 245, 249)
+    card_bg = (255, 255, 255)
+    title_bar = (12, 74, 110)
+    border_soft = (207, 221, 232)
+    label_muted = (75, 85, 99)
+    ink = (17, 24, 39)
+    green_profit = (5, 122, 85)
+    red_loss = (185, 28, 28)
+    cell_zebra = (249, 252, 255)
+    cell_lucro_bg = (236, 253, 245)
+
+    pad = 22
+    card_w = 900
     title_h = 54
-    head_h = 44
-    val_h = 48
-    pad = 12
-    width = sum(col_widths) + (pad * 2)
-    height = title_h + head_h + val_h + (pad * 2)
+    meta_h = 30
+    gap = 14
+    cols = 2
+    rows = 3
+    inner_w = card_w - pad * 2
+    cell_w = (inner_w - gap) // 2
+    cell_h = 96
 
-    img = Image.new("RGB", (width, height), (246, 249, 252))
+    card_h = pad + title_h + 8 + meta_h + 12 + rows * cell_h + (rows - 1) * gap + pad
+    img_w = card_w + pad * 2
+    img_h = card_h + pad * 2
+
+    img = Image.new("RGB", (img_w, img_h), outer_bg)
     draw = ImageDraw.Draw(img)
-    font = ImageFont.load_default()
 
-    navy = (9, 47, 99)
-    header_bg = (210, 228, 237)
-    border = (65, 88, 112)
-    black = (26, 26, 26)
-    green = (0, 153, 76)
+    cx0 = pad
+    cy0 = pad
+    cx1 = cx0 + card_w
+    cy1 = cy0 + card_h
+    draw.rounded_rectangle((cx0, cy0, cx1, cy1), radius=18, fill=card_bg, outline=border_soft, width=1)
 
-    # Título
-    draw.rectangle((pad, pad, width - pad, pad + title_h), fill=navy, outline=border, width=1)
+    bar_y1 = cy0 + title_h + 6
+    draw.rounded_rectangle((cx0, cy0, cx1, bar_y1), radius=18, fill=title_bar)
+    draw.rectangle((cx0, cy0 + 16, cx1, bar_y1), fill=title_bar)
+
     title = "TOTAL DOS LUCROS MENSAIS E ANUAIS"
-    tw = draw.textlength(title, font=font)
-    draw.text((int((width - tw) / 2), pad + 18), title, fill=(255, 255, 255), font=font)
+    tw = draw.textlength(title, font=font_title)
+    draw.text((cx0 + (card_w - tw) / 2, cy0 + 14), title, fill=(255, 255, 255), font=font_title)
+    draw.text(
+        (cx0 + pad, bar_y1 + 6),
+        "Resumo calculado a partir da planilha • atualizado ao vivo",
+        fill=label_muted,
+        font=font_meta,
+    )
 
-    y_head = pad + title_h
-    y_val = y_head + head_h
-    x = pad
-    for idx, w in enumerate(col_widths):
-        draw.rectangle((x, y_head, x + w, y_head + head_h), fill=header_bg, outline=border, width=1)
-        draw.rectangle((x, y_val, x + w, y_val + val_h), fill=(255, 255, 255), outline=border, width=1)
-        draw.text((x + 8, y_head + 13), labels[idx], fill=black, font=font)
-        val_color = green if idx == len(col_widths) - 1 else black
-        draw.text((x + 8, y_val + 15), values[idx], fill=val_color, font=font)
+    y0 = bar_y1 + meta_h + 12
+    x0 = cx0 + pad
+
+    measure = ImageDraw.Draw(Image.new("RGB", (20, 20)))
+
+    def _vlen(s: str, fnt) -> int:
+        try:
+            return int(measure.textlength(s, font=fnt))
+        except Exception:
+            return len(s) * 10
+
+    for i, (lbl, val, is_lucro) in enumerate(kpi):
+        r, c = divmod(i, cols)
+        x = x0 + c * (cell_w + gap)
+        y = y0 + r * (cell_h + gap)
+        fill = cell_lucro_bg if is_lucro else (cell_zebra if (r + c) % 2 == 0 else (255, 255, 255))
+        draw.rounded_rectangle((x, y, x + cell_w, y + cell_h), radius=12, fill=fill, outline=border_soft, width=1)
+        if is_lucro:
+            border_lucro = green_profit if lucro >= 0 else red_loss
+            draw.rounded_rectangle((x, y, x + cell_w, y + cell_h), radius=12, outline=border_lucro, width=2)
+
+        draw.text((x + 16, y + 14), lbl, fill=label_muted, font=font_label)
+        val_color = green_profit if is_lucro and lucro >= 0 else (red_loss if is_lucro and lucro < 0 else ink)
+        vw = _vlen(val, font_value)
+        draw.text((x + cell_w - 16 - vw, y + 44), val, fill=val_color, font=font_value)
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    tmp.close()
+    img.save(tmp.name, format="PNG", optimize=True)
+    return tmp.name
+
+
+def _maybe_build_sales_snippet_image(
+    workbook_path: str,
+    *,
+    sale_id: str | None = None,
+    limit: int = 7,
+    title_main: str = "TOTAL DE VENDAS - Visão atual",
+    meta_line: str | None = None,
+) -> str | None:
+    """
+    Gera um "mini-dashboard" da aba de Vendas (clientes, pagos/pendentes, datas).
+    Visual alinhado ao card do Status (faixa azul + card branco + tipografia).
+    Usado no botão Prévia — não confundir com o resumo financeiro (lucro) do Status.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # type: ignore
+        from src.excel_store import SpreadsheetService, SHEET_SALES, DATA_START_ROW
+    except Exception:
+        return None
+
+    try:
+        svc = SpreadsheetService(workbook_path)
+        wb = svc._open_workbook(data_only=True)
+        try:
+            ws = wb[svc._resolve_sheet_name(wb, SHEET_SALES)]
+            cols = svc._sales_columns(ws)
+            # Ordem e labels fixos para ficar consistente/legível.
+            display_cols = [
+                ("data de venda", "Data da venda"),
+                ("data de entrega", "Data entrega"),
+                ("id cliente", "ID Cliente"),
+                ("id produto", "Produto"),
+                ("total de vendas (pago)", "Pago"),
+                ("valor (pendente)", "Pendente"),
+                ("id venda", "ID VENDA"),
+                ("status de valor", "Status"),
+            ]
+            col_pairs = [(cols.get(key), label, key) for key, label in display_cols if cols.get(key)]
+            col_letters = [c for c, _label, _key in col_pairs]
+            if not col_letters:
+                return None
+
+            # Determina linhas de dados existentes (baseado em ID VENDA).
+            id_col = cols.get("id venda")
+            data_rows: list[int] = []
+            if id_col:
+                for r in range(DATA_START_ROW, min(ws.max_row + 1, svc.MAX_DATA_ROW)):
+                    if ws[f"{id_col}{r}"].value not in (None, ""):
+                        data_rows.append(r)
+            if not data_rows:
+                return None
+
+            # Linha para destacar (se informar sale_id); senão destaca a última.
+            highlight_row = data_rows[-1]
+            if sale_id and id_col:
+                for r in reversed(data_rows[-250:]):
+                    if str(ws[f"{id_col}{r}"].value or "").strip() == str(sale_id).strip():
+                        highlight_row = r
+                        break
+
+            # Pega as últimas N linhas e garante que a destacada esteja incluída.
+            last_rows = data_rows[-max(limit, 3):]
+            if highlight_row not in last_rows:
+                last_rows = (last_rows + [highlight_row])[-max(limit, 3):]
+
+            # Cabeçalho: normalmente fica na linha anterior ao início dos dados.
+            headers = [label for _c, label, _key in col_pairs]
+
+            def _cell_txt(c: str, key: str, r: int) -> str:
+                v = ws[f"{c}{r}"].value
+                if v in (None, ""):
+                    return ""
+                if key in ("total de vendas (pago)", "valor (pendente)"):
+                    num = svc._to_float(v)
+                    txt = f"{float(num):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                    return f"R$ {txt}"
+                if hasattr(v, "strftime"):
+                    try:
+                        return v.strftime("%d/%m/%Y")
+                    except Exception:
+                        pass
+                return str(v)
+
+            rows_txt = [[_cell_txt(c, key, r) for c, _label, key in col_pairs] for r in last_rows]
+        finally:
+            wb.close()
+    except Exception:
+        return None
+
+    # Renderização visual premium
+    def _load_font(size: int, bold: bool = False):
+        candidates = []
+        if bold:
+            candidates = [
+                "C:\\Windows\\Fonts\\segoeuib.ttf",
+                "C:\\Windows\\Fonts\\arialbd.ttf",
+                "C:\\Windows\\Fonts\\calibrib.ttf",
+            ]
+        else:
+            candidates = [
+                "C:\\Windows\\Fonts\\segoeui.ttf",
+                "C:\\Windows\\Fonts\\arial.ttf",
+                "C:\\Windows\\Fonts\\calibri.ttf",
+            ]
+        for fp in candidates:
+            try:
+                return ImageFont.truetype(fp, size=size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
+    font_body = _load_font(24, bold=False)
+    font_header = _load_font(22, bold=True)
+    font_title = _load_font(30, bold=True)
+    font_meta = _load_font(20, bold=False)
+
+    pad = 22
+    card_pad = 18
+    cell_pad_x = 12
+    cell_pad_y = 10
+    outer_bg = (241, 245, 249)
+    card_bg = (255, 255, 255)
+    title_bar = (12, 74, 110)
+    header_bg = (230, 243, 251)
+    header_ink = (10, 45, 70)
+    grid = (207, 221, 232)
+    ink = (20, 23, 28)
+    muted = (75, 85, 99)
+    red_pending = (185, 28, 28)
+    zebra = (249, 252, 255)
+    highlight_bg = (255, 246, 214)
+    status_pago_bg = (220, 252, 231)
+    status_pend_bg = (254, 249, 195)
+
+    # Medição de texto
+    measure_draw = ImageDraw.Draw(Image.new("RGB", (20, 20)))
+
+    def tlen(s: str, font_obj) -> int:
+        try:
+            return int(measure_draw.textlength(s, font=font_obj))
+        except Exception:
+            return max(1, len(s)) * 8
+
+    def _truncate(text: str, max_width: int, font_obj) -> str:
+        text = str(text or "")
+        if tlen(text, font_obj) <= max_width:
+            return text
+        suffix = "..."
+        while text and tlen(text + suffix, font_obj) > max_width:
+            text = text[:-1]
+        return (text + suffix) if text else suffix
+
+    col_widths: list[int] = []
+    for ci in range(len(headers)):
+        maxw = tlen(headers[ci], font_header)
+        for rr in rows_txt:
+            maxw = max(maxw, tlen(rr[ci], font_body))
+        cap = 360 if ci == 3 else 230
+        floor = 115 if ci in (0, 1, 6, 7) else 140
+        col_widths.append(max(floor, min(cap, maxw + cell_pad_x * 2)))
+
+    row_h = (font_body.getbbox("Ag")[3] - font_body.getbbox("Ag")[1]) + (cell_pad_y * 2) + 2
+    title_h = 58
+    meta_h = 36
+    table_w = sum(col_widths)
+    table_h = row_h * (1 + len(rows_txt))
+    card_w = table_w + card_pad * 2
+    card_h = title_h + meta_h + table_h + card_pad * 2 + 12
+    img_w = card_w + pad * 2
+    img_h = card_h + pad * 2
+
+    img = Image.new("RGB", (img_w, img_h), outer_bg)
+    draw = ImageDraw.Draw(img)
+
+    # Card principal
+    card_x0 = pad
+    card_y0 = pad
+    card_x1 = img_w - pad
+    card_y1 = img_h - pad
+    draw.rounded_rectangle((card_x0, card_y0, card_x1, card_y1), radius=18, fill=card_bg, outline=grid, width=1)
+
+    # Barra de título
+    bar_y1 = card_y0 + title_h + 8
+    draw.rounded_rectangle((card_x0, card_y0, card_x1, bar_y1), radius=18, fill=title_bar)
+    # Corrige cantos inferiores da barra para ficar reta
+    draw.rectangle((card_x0, card_y0 + 18, card_x1, bar_y1), fill=title_bar)
+
+    tw_title = draw.textlength(title_main, font=font_title)
+    draw.text(
+        (card_x0 + (card_w - tw_title) / 2, card_y0 + 14),
+        title_main,
+        fill=(255, 255, 255),
+        font=font_title,
+    )
+
+    # Meta (Prévia: foco em pendências/entregas; fallback: últimas linhas)
+    meta_text = meta_line or (
+        f"Mostrando {len(rows_txt)} linha(s) mais recentes • Atualizado ao vivo"
+    )
+    tw_meta = draw.textlength(meta_text, font=font_meta)
+    draw.text(
+        (card_x0 + (card_w - tw_meta) / 2, bar_y1 + 8),
+        meta_text,
+        fill=muted,
+        font=font_meta,
+    )
+
+    x0 = card_x0 + card_pad
+    y0 = bar_y1 + meta_h + 8
+
+    def _row_has_pending(rvals: list[str]) -> bool:
+        """Amarelo na linha inteira só quando há pendência real (valor ou status)."""
+        try:
+            pi = headers.index("Pendente")
+            pt = rvals[pi]
+            if pt.startswith("R$"):
+                raw = pt.replace("R$", "").strip().replace(".", "").replace(",", ".")
+                if float(raw) > 0.01:
+                    return True
+        except Exception:
+            pass
+        try:
+            si = headers.index("Status")
+            if "pendente" in (rvals[si] or "").strip().lower():
+                return True
+        except Exception:
+            pass
+        return False
+
+    # Header
+    x = x0
+    for ci, h in enumerate(headers):
+        w = col_widths[ci]
+        draw.rectangle((x, y0, x + w, y0 + row_h), fill=header_bg, outline=grid, width=1)
+        draw.text((x + cell_pad_x, y0 + cell_pad_y), _truncate(h, w - 2 * cell_pad_x, font_header), fill=header_ink, font=font_header)
         x += w
+
+    # Rows (fundo amarelo só com pendência; pago + R$ 0 pendente = zebra branco como as demais)
+    for ri, rvals in enumerate(rows_txt, start=1):
+        y = y0 + (row_h * ri)
+        x = x0
+        pending_row = _row_has_pending(rvals)
+        for ci, txt in enumerate(rvals):
+            w = col_widths[ci]
+            is_money_col = headers[ci] in ("Pago", "Pendente")
+            base_fill = highlight_bg if pending_row else (zebra if (ri % 2 == 0) else (255, 255, 255))
+            if headers[ci] == "Status":
+                sl = (txt or "").strip().lower()
+                if sl == "pago" or (sl.startswith("pago") and "pendente" not in sl):
+                    cell_fill = status_pago_bg
+                elif "pendente" in sl:
+                    cell_fill = status_pend_bg
+                else:
+                    cell_fill = base_fill
+            else:
+                cell_fill = base_fill
+            draw.rectangle(
+                (x, y, x + w, y + row_h),
+                fill=cell_fill,
+                outline=grid,
+                width=1,
+            )
+            text_value = _truncate(txt, w - 2 * cell_pad_x, font_body)
+            cell_ink = ink
+            if headers[ci] == "Pendente" and text_value.startswith("R$"):
+                try:
+                    raw = (
+                        text_value.replace("R$", "")
+                        .strip()
+                        .replace(".", "")
+                        .replace(",", ".")
+                    )
+                    if float(raw) > 0.01:
+                        cell_ink = red_pending
+                except Exception:
+                    pass
+            if is_money_col:
+                tw = tlen(text_value, font_body)
+                tx = x + w - cell_pad_x - tw
+            else:
+                tx = x + cell_pad_x
+            draw.text((tx, y + cell_pad_y), text_value, fill=cell_ink, font=font_body)
+            x += w
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     tmp.close()
@@ -583,6 +937,26 @@ def run_polling() -> None:
                         chat_id=str(chat_id),
                     )
                     send_message(chat_id, reply)
+                    # Enviar imagem atualizada da aba de vendas para facilitar visualização.
+                    workbook_path = os.getenv("WORKBOOK_PATH", "").strip()
+                    if not workbook_path:
+                        from src.workbook_paths import default_workbook_path
+                        workbook_path = default_workbook_path([Path.cwd(), Path.cwd().parent])
+                    if workbook_path:
+                        img_path = _maybe_build_sales_snippet_image(
+                            workbook_path,
+                            sale_id=getattr(parse_result.status_update_command, "sale_id", None)
+                            if getattr(parse_result, "intent", "") == "status_update"
+                            else getattr(parse_result.command, "sale_id", None),
+                        )
+                        if img_path:
+                            try:
+                                send_photo(chat_id, img_path)
+                            finally:
+                                try:
+                                    Path(img_path).unlink(missing_ok=True)
+                                except Exception:
+                                    pass
                     print(f"[Telegram] Planilha atualizada para {chat_id}")
                     continue
 
@@ -842,13 +1216,23 @@ def run_polling() -> None:
                     pending_preview.pop(chat_id, None)
                     reply = process_command(text, origin="telegram")
                     send_message(chat_id, reply)
-                    # Para Status/Resumo/Planilha, também envia uma imagem do resumo (facilita visualização).
-                    if cmd_strip.startswith(("status", "resumo", "planilha")):
+                    # Para Status/Resumo/Planilha/Prévia, também envia uma imagem (facilita visualização).
+                    if cmd_strip.startswith(("status", "resumo", "planilha", "prévia", "previa")):
                         workbook_path = os.getenv("WORKBOOK_PATH", "").strip()
                         if not workbook_path:
                             from src.workbook_paths import default_workbook_path
                             workbook_path = default_workbook_path([Path.cwd(), Path.cwd().parent])
-                        img_path = _maybe_build_status_table_image(workbook_path) if workbook_path else None
+                        img_path = None
+                        if workbook_path:
+                            # Status/Resumo/Planilha: card financeiro (lucros). Prévia: tabela de vendas (clientes/pendências).
+                            if cmd_strip.startswith(("prévia", "previa")):
+                                img_path = _maybe_build_sales_snippet_image(
+                                    workbook_path,
+                                    title_main="TOTAL DE VENDAS - Visão atual",
+                                    meta_line="Pendências e entregas • Atualizado ao vivo com base na planilha",
+                                )
+                            else:
+                                img_path = _maybe_build_status_table_image(workbook_path)
                         if not img_path:
                             img_path = _maybe_build_text_image_png(reply)
                         if img_path:
