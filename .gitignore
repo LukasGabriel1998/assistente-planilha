@@ -15,3 +15,5 @@ models_cache/
 *.xltx
 *.xltm
 .telegram_bot.lock
+# Cópia local / pasta paralela (não versionar)
+assistente-planilha/
