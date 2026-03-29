@@ -324,8 +324,17 @@ class SpreadsheetService:
             return None
 
     @staticmethod
-    def _copy_row_style(ws, source_row: int, target_row: int, cols: tuple[str, ...]) -> None:
-        SpreadsheetService._copy_row_style_between(ws, source_row, ws, target_row, cols)
+    def _copy_row_style(
+        ws,
+        source_row: int,
+        target_row: int,
+        cols: tuple[str, ...],
+        *,
+        apply_row_dimensions: bool = True,
+    ) -> None:
+        SpreadsheetService._copy_row_style_between(
+            ws, source_row, ws, target_row, cols, apply_row_dimensions=apply_row_dimensions
+        )
 
     @staticmethod
     def _copy_cell_style(source_cell, target_cell) -> None:
@@ -357,12 +366,33 @@ class SpreadsheetService:
         except Exception:
             pass
 
+    @classmethod
+    def _should_copy_row_dimensions_for_target(cls, target_ws, logical_sheet_name: str) -> bool:
+        """
+        Na aba de vendas visível, não copiar row_dimensions do template: isso afeta a linha inteira
+        e desalinha/oculta blocos de resumo ao lado da tabela (ex.: coluna J).
+        """
+        if cls._normalize_name(logical_sheet_name) != cls._normalize_name(SHEET_SALES):
+            return True
+        tmpl_title = cls._template_sheet_name_for(SHEET_SALES)
+        return cls._normalize_name(getattr(target_ws, "title", "")) == cls._normalize_name(tmpl_title)
+
     @staticmethod
-    def _copy_row_style_between(source_ws, source_row: int, target_ws, target_row: int, cols: tuple[str, ...]) -> None:
+    def _copy_row_style_between(
+        source_ws,
+        source_row: int,
+        target_ws,
+        target_row: int,
+        cols: tuple[str, ...],
+        *,
+        apply_row_dimensions: bool = True,
+    ) -> None:
         for col in cols:
             source = source_ws[f"{col}{source_row}"]
             target = target_ws[f"{col}{target_row}"]
             SpreadsheetService._copy_cell_style(source, target)
+        if not apply_row_dimensions:
+            return
         source_dim = source_ws.row_dimensions[source_row]
         target_dim = target_ws.row_dimensions[target_row]
         if source_dim.height is not None:
@@ -705,7 +735,9 @@ class SpreadsheetService:
     def _copy_sales_row_style_from_template(cls, wb, ws_sales, row: int) -> None:
         cols = cls._sales_style_cols(ws_sales)
         template_ws, template_row = cls._template_source(wb, ws_sales, SHEET_SALES, cols)
-        cls._copy_row_style_between(template_ws, template_row, ws_sales, row, cols)
+        cls._copy_row_style_between(
+            template_ws, template_row, ws_sales, row, cols, apply_row_dimensions=False
+        )
 
     @classmethod
     def _prepare_row_from_template(
@@ -726,7 +758,14 @@ class SpreadsheetService:
         if template_ws is ws and template_row != ANCHOR_TEMPLATE_ROW:
             template_row = cls._append_template_row(ws, row, cols, start_row=start_row, search_limit=search_limit)
         if not (template_ws is ws and template_row == row):
-            cls._copy_row_style_between(template_ws, template_row, ws, row, cols)
+            cls._copy_row_style_between(
+                template_ws,
+                template_row,
+                ws,
+                row,
+                cols,
+                apply_row_dimensions=cls._should_copy_row_dimensions_for_target(ws, logical_sheet_name),
+            )
         return template_ws, template_row
 
     @classmethod
@@ -749,7 +788,14 @@ class SpreadsheetService:
             # Nunca sobrescrever formatação existente: só aplicar template em linhas sem estilo
             if cls._row_has_any_style(ws, row, style_cols):
                 continue
-            cls._copy_row_style_between(template_ws, template_row, ws, row, style_cols)
+            cls._copy_row_style_between(
+                template_ws,
+                template_row,
+                ws,
+                row,
+                style_cols,
+                apply_row_dimensions=cls._should_copy_row_dimensions_for_target(ws, logical_sheet_name),
+            )
 
     @classmethod
     def _effective_layout_row_limit(
@@ -1643,7 +1689,14 @@ class SpreadsheetService:
                 SHEET_SALES,
                 self._sales_style_cols(ws_sales),
             )
-            self._copy_row_style_between(template_ws, template_row, ws_sales, row, (paid_col, pending_col, value_status_col))
+            self._copy_row_style_between(
+                template_ws,
+                template_row,
+                ws_sales,
+                row,
+                (paid_col, pending_col, value_status_col),
+                apply_row_dimensions=False,
+            )
             ws_sales[f"{paid_col}{row}"] = current_paid
             ws_sales[f"{pending_col}{row}"] = current_pending
             ws_sales[f"{value_status_col}{row}"] = status_display
@@ -1659,7 +1712,9 @@ class SpreadsheetService:
                     SHEET_SALES,
                     self._sales_style_cols(ws_sales),
                 )
-                self._copy_row_style_between(template_ws, template_row, ws_sales, row, (delivery_col,))
+                self._copy_row_style_between(
+                    template_ws, template_row, ws_sales, row, (delivery_col,), apply_row_dimensions=False
+                )
                 ws_sales[f"{delivery_col}{row}"] = current_delivery_value
                 delivery_cell = ws_sales[f"{delivery_col}{row}"]
                 ref_date = status_update.ref_date
@@ -1834,6 +1889,7 @@ class SpreadsheetService:
                             sales_cols["valor (pendente)"],
                             sales_cols["status de valor"],
                         ),
+                        apply_row_dimensions=False,
                     )
                     ws[f"{sales_cols['total de vendas (pago)']}{row}"] = float(amount)
                     if ws[f"{sales_cols['valor (pendente)']}{row}"].value in (None, ""):
