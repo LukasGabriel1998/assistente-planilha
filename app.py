@@ -16,6 +16,7 @@ import streamlit as st
 from src.excel_store import SHEET_FIXED, SHEET_MATERIAL, SHEET_SALES, SpreadsheetService
 from src.models import FinancialCommand, MaterialAllocation, Payment, RefundCommand, StatusUpdateCommand
 from src.parser import parse_message
+from src.bot_processor import apply_parse_result, build_preview
 from src.transcription import TranscriptionError, transcribe_audio
 from src.workbook_paths import default_workbook_path, resolve_workbook_path as _resolve_workbook_path
 
@@ -88,6 +89,7 @@ def _init_state() -> None:
         "last_recording_signature": "",
         "transcribed_text_draft": "",
         "audio_transcription_error": "",
+        "parse_result_obj": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -642,6 +644,8 @@ def main() -> None:
             with st.spinner("Interpretando comando..."):
                 workbook_path = str(_resolve_workbook_path(workbook_path))
                 st.session_state.workbook_path = workbook_path
+                # Garantir que o fluxo compartilhado (Telegram/app) aponte para a mesma planilha.
+                os.environ["WORKBOOK_PATH"] = workbook_path
     
                 if source_kind == "audio":
                     raw_text = (st.session_state.transcribed_text_draft or "").strip()
@@ -655,6 +659,7 @@ def main() -> None:
                     raw_text = raw_text.strip()
     
                 result = parse_message(raw_text, reference_date=date.today())
+                st.session_state.parse_result_obj = result
                 _fill_state_from_command(
                     result.command,
                     result.missing_fields,
@@ -675,6 +680,29 @@ def main() -> None:
     
     
     if st.session_state.parsed_ready:
+        # Mostrar a mesma prévia do Telegram (e usar a mesma escrita na planilha).
+        pr = st.session_state.get("parse_result_obj")
+        if pr is not None:
+            st.markdown("### Prévia")
+            st.markdown(build_preview(pr))
+            if st.button("Confirmar e salvar (mesma lógica do Telegram)", type="primary", use_container_width=True):
+                try:
+                    workbook_path = str(_resolve_workbook_path(workbook_path))
+                    st.session_state.workbook_path = workbook_path
+                    os.environ["WORKBOOK_PATH"] = workbook_path
+                    with st.spinner("Aplicando na planilha..."):
+                        _hold_spinner()
+                        reply = apply_parse_result(
+                            pr,
+                            origin=f"app-{st.session_state.source_kind}",
+                            original_text=st.session_state.raw_text,
+                            chat_id="app",
+                        )
+                    st.success(reply)
+                    st.session_state.parsed_ready = False
+                except Exception as exc:
+                    st.error(f"Falha ao salvar: {exc}")
+
         is_status_update = getattr(st.session_state, "intent", "sale") == "status_update"
         is_mixed_update = getattr(st.session_state, "intent", "sale") == "mixed_update"
         status_update_cmd = getattr(st.session_state, "status_update_command", None)
