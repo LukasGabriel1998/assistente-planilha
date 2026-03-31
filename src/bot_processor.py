@@ -46,6 +46,12 @@ def format_reply(intent: str, actions: list, error: str | None = None) -> str:
     """Monta mensagem curta de resposta."""
     if error:
         return f"Erro: {error}"
+    if intent == "delivery_update" and actions:
+        a = actions[0]
+        return f"Data de entrega atualizada. ID VENDA {a.get('sale_id', '')} na planilha."
+    if intent == "payment_update" and actions:
+        a = actions[0]
+        return f"Pagamento registrado. ID VENDA {a.get('sale_id', '')} na planilha."
     if intent == "refund" and actions:
         a = actions[0]
         return f"Estorno registrado. Planilha: {a.get('sheet', '')} linha {a.get('row', '')}."
@@ -69,6 +75,27 @@ def format_reply(intent: str, actions: list, error: str | None = None) -> str:
 
 def build_preview(parse_result: ParseResult) -> str:
     """Monta texto de prévia do que será salvo na planilha (para o usuário confirmar ou editar)."""
+    if parse_result.intent == "delivery_update":
+        cmd = parse_result.command
+        sale_id = getattr(cmd, "sale_id", None) or "-"
+        due = getattr(cmd, "service_due_date", None)
+        due_txt = due.strftime("%d/%m/%Y") if due is not None else "-"
+        lines = ["📋 *Prévia – atualizar data de entrega:*", ""]
+        lines.append(f"• ID VENDA: {sale_id}")
+        lines.append(f"• Nova Data de Entrega: {due_txt}")
+        lines.append("\nResponda *SIM* para salvar na planilha ou *NÃO* para cancelar.\n")
+        return "\n".join(lines)
+    if parse_result.intent == "payment_update":
+        sale_id = parse_result.detected_values.get("id_venda", "-")
+        valor = parse_result.detected_values.get("valor_pago", "-")
+        data = parse_result.detected_values.get("data", "-")
+        lines = ["📋 *Prévia – registrar pagamento parcial:*", ""]
+        lines.append(f"• ID VENDA: {sale_id}")
+        lines.append(f"• Valor pago: R$ {valor}")
+        lines.append(f"• Data: {data}")
+        lines.append("\nResponda *SIM* para salvar na planilha ou *NÃO* para cancelar.\n")
+        return "\n".join(lines)
+
     # Prévia específica para atualização de status (ex.: "ID VENDA 004 pagou")
     if parse_result.intent == "status_update" and getattr(parse_result, "status_update_command", None) is not None:
         su = parse_result.status_update_command
@@ -191,6 +218,36 @@ def apply_parse_result(
     service = SpreadsheetService(workbook_path)
     actions: list = []
     cmd = parse_result.command
+    if parse_result.intent == "delivery_update":
+        if not getattr(cmd, "sale_id", None):
+            return "Faltou o *ID VENDA* para atualizar a entrega. Ex.: `id venda 003 entrega 10/04`."
+        if getattr(cmd, "service_due_date", None) is None:
+            return "Faltou a *Data de Entrega*. Ex.: `entrega 10/04`."
+        service.update_sale_delivery_date(str(cmd.sale_id).strip(), cmd.service_due_date)
+        return format_reply("delivery_update", [{"sale_id": str(cmd.sale_id).strip(), "sheet": "vendas"}], error=None)
+    if parse_result.intent == "payment_update":
+        sale_id = (parse_result.detected_values.get("id_venda") or "").strip()
+        val_txt = (parse_result.detected_values.get("valor_pago") or "").strip()
+        if not sale_id or sale_id == "-":
+            return "Faltou o *ID VENDA* para registrar pagamento. Ex.: `id venda 005 recebeu 2500 hoje`."
+        try:
+            amount = float(val_txt.replace(",", "."))
+        except Exception:
+            amount = 0.0
+        if amount <= 0:
+            return "Faltou o *valor pago*. Ex.: `id venda 005 recebeu 2500 hoje`."
+        # A data foi formatada em DD/MM/YYYY em detected_values; usamos hoje se falhar.
+        pay_date = date.today()
+        action = service.apply_partial_payment(
+            sale_id,
+            amount=amount,
+            ref_date=pay_date,
+            original_text=original_text,
+            origin=origin,
+        )
+        if not action:
+            return "Não consegui registrar esse pagamento (verifique se o ID VENDA existe e se há pendência)."
+        return format_reply("payment_update", [asdict(action)], error=None)
     if parse_result.intent == "mixed_update" and parse_result.status_update_command is not None:
         status_action = service.update_sale_status(
             parse_result.status_update_command, original_text=original_text, origin=origin
@@ -242,36 +299,40 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
         and ("marca" in cmd_lower or "atualiza" in cmd_lower)
         and ("id" in cmd_lower or "cliente" in cmd_lower)
     ):
-        workbook_path = get_default_workbook()
-        if not workbook_path or not Path(workbook_path).exists():
-            return "Planilha nao encontrada. Configure WORKBOOK_PATH no .env."
-        service = SpreadsheetService(workbook_path)
         import re
+        # Se houver um valor junto de "pagou" (ex.: "pagou 2500"),
+        # isso é pagamento parcial e deve seguir o parser normal (payment_update),
+        # não o atalho de "marcar como pago" total.
+        if not re.search(r"\bpagou\b\s*(?:r\$\s*)?\d{2,}", cmd_lower):
+            workbook_path = get_default_workbook()
+            if not workbook_path or not Path(workbook_path).exists():
+                return "Planilha nao encontrada. Configure WORKBOOK_PATH no .env."
+            service = SpreadsheetService(workbook_path)
 
-        ids: list[str] = []
-        for m in re.findall(r"\d{1,6}", text):
-            sid = m.zfill(3) if len(m) <= 3 else m
-            if sid not in ids:
-                ids.append(sid)
-        if not ids:
-            return "Nao entendi quais IDs devem ser marcados como pagos. Diga, por exemplo: ID VENDA 001 pagou tudo."
+            ids: list[str] = []
+            for m in re.findall(r"\d{1,6}", text):
+                sid = m.zfill(3) if len(m) <= 3 else m
+                if sid not in ids:
+                    ids.append(sid)
+            if not ids:
+                return "Nao entendi quais IDs devem ser marcados como pagos. Diga, por exemplo: ID VENDA 001 pagou tudo."
 
-        actions = []
-        today = date.today()
-        for sid in ids:
-            su = StatusUpdateCommand(sale_id=sid, status="pago", ref_date=today)
-            try:
-                action = service.update_sale_status(
-                    su,
-                    original_text=text,
-                    origin=origin,
-                )
-                actions.append(asdict(action))
-            except Exception:
-                continue
-        if not actions:
-            return "Nao consegui encontrar esses IDs na planilha para atualizar como pagos."
-        return format_reply("status_update", actions, error=None)
+            actions = []
+            today = date.today()
+            for sid in ids:
+                su = StatusUpdateCommand(sale_id=sid, status="pago", ref_date=today)
+                try:
+                    action = service.update_sale_status(
+                        su,
+                        original_text=text,
+                        origin=origin,
+                    )
+                    actions.append(asdict(action))
+                except Exception:
+                    continue
+            if not actions:
+                return "Nao consegui encontrar esses IDs na planilha para atualizar como pagos."
+            return format_reply("status_update", actions, error=None)
     cmd_strip = cmd_lower.strip()
     # Resumo (visão geral)
     if any(cmd_strip.startswith(kw) for kw in SUMMARY_KEYWORDS):

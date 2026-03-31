@@ -379,6 +379,14 @@ def _extract_customer(text: str) -> Optional[str]:
         if not match:
             continue
         candidate = _clean_extracted_phrase(match.group(1))
+        # Ex.: "fiz uma venda para P26 de uma fachada ..." -> queremos "P26" (não "P26 de")
+        candidate = re.sub(r"\s+\bde\b\s*$", "", candidate, flags=re.IGNORECASE).strip()
+        candidate = re.sub(
+            r"\s+\bde\b\s+(?=(?:um|uma|o|a)\s+)",
+            " ",
+            candidate,
+            flags=re.IGNORECASE,
+        ).strip()
         candidate = re.split(
             r"[,.;]|(?:\b(?:esse cliente|ele comprou|eles fecharam|fecharam com a gente|comprou|onde|valor|um valor|pagou|paguei|entrada|saldo|restante|vou|no dia|dia|data|mes|gastar|material|porque|por)\b)",
             candidate,
@@ -421,6 +429,10 @@ def _extract_customer(text: str) -> Optional[str]:
 
 def _extract_product(text: str) -> Optional[str]:
     patterns = [
+        # "fiz uma venda para P26 de uma fachada ..." -> produto = "fachada"
+        rf"\b(?:acabei\s+de\s+fazer\s+)?fiz\s+(?:uma\s+)?venda\s+(?:para|pro|pra)\s+[^,.;\n]+?\s+de\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s+(?:por|no\s+valor|valor|pagou|vai\s+pagar|e\b|,|\.|;)|\s*$)",
+        # "fiz uma venda de uma fachada para P26 ..." -> produto = "fachada"
+        rf"\b(?:acabei\s+de\s+fazer\s+)?fiz\s+(?:uma\s+)?venda\s+de\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)\s+(?:para|pro|pra)\b",
         # "vendi uma placa para o cliente X ..."
         rf"\b(?:acabei\s+de\s+)?vend(?:i|er)\s+((?:um|uma|o|a)\s+)?({LETTER_RX}[\w .'/+-]{{1,50}}?)\s+(?:para|pro|pra)\s+(?:(?:o|a)\s+)?cliente\b",
         # "fiz uma fachada para o cliente X ..."
@@ -499,6 +511,46 @@ def _extract_sale_id_from_text(text: str) -> Optional[str]:
     return None
 
 
+def _extract_target_sale_id_for_updates(text: str) -> Optional[str]:
+    """
+    Extrai um ID de VENDA para mensagens de atualização (ex.: ajustar entrega/material)
+    aceitando também variações comuns como "cliente id 003" (muitos usuários usam isso como ID VENDA).
+    """
+    raw = text or ""
+    sale_id = _extract_sale_id_from_text(raw)
+    if sale_id:
+        return sale_id
+    norm = _normalize(raw)
+    update_context = any(
+        tok in norm
+        for tok in (
+            "data de entrega",
+            "data entrega",
+            "entrega",
+            "entregar",
+            "material",
+            "materia prima",
+            "matéria prima",
+            "gastar",
+            "gasto",
+            "adiciona",
+            "adicionar",
+            "ajusta",
+            "corrige",
+            "atualiza",
+        )
+    )
+    if not update_context:
+        return None
+    m = re.search(r"\bcliente\s*id\s*[:\-]?\s*(\d{1,6})\b", raw, flags=re.IGNORECASE)
+    if not m:
+        m = re.search(r"\bid\s*cliente\s*[:\-]?\s*(\d{1,6})\b", raw, flags=re.IGNORECASE)
+    if not m:
+        return None
+    digits = m.group(1)
+    return digits.zfill(3) if len(digits) <= 3 else digits
+
+
 def _extract_material_allocations(text: str, reference_date: date) -> list[MaterialAllocation]:
     allocations: list[MaterialAllocation] = []
     norm_text = _normalize(text)
@@ -512,7 +564,7 @@ def _extract_material_allocations(text: str, reference_date: date) -> list[Mater
 
     # Para material, queremos vincular ao ID da venda (linha especifica),
     # nao ao ID do cliente.
-    id_pattern = r"(?:id\s*(?:de\s*)?venda|codigo\s*(?:da\s*)?venda)\s*([a-zA-Z0-9_-]{1,30})"
+    id_pattern = r"(?:id\s*(?:de\s*)?venda|codigo\s*(?:da\s*)?venda|cliente\s*id|id\s*cliente)\s*([a-zA-Z0-9_-]{1,30})"
     loose_id_pattern = r"\b([a-zA-Z]*\d[a-zA-Z0-9_-]{0,29})\b"
     money_pattern = r"(r\$\s*\d[\d\.,]*|\d{2,}(?:[\.,]\d{1,2})?|\bmil\b|\b(?:um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez)\s+mil\b)"
     # Padroes: aqui so consideramos o ID da venda se vier com algum marcador ("id venda ...").
@@ -655,6 +707,12 @@ def _extract_material_allocations(text: str, reference_date: date) -> list[Mater
 
 def _extract_status_value(text: str) -> Optional[str]:
     norm = _normalize(text)
+    # "pagou" sozinho (sem valor) significa quitar tudo.
+    # Se tiver valor ("pagou 2500"), isso é pagamento parcial e deve ser tratado em outro fluxo.
+    if re.search(r"\bpagou\b", norm):
+        has_amount_after_pagou = _extract_amount_after_prefix(text, prefixes=[r"pagou"], max_gap_words=0)
+        if not has_amount_after_pagou:
+            return "pago"
     if (
         ("ja pagou" in norm)
         or ("ja foi pago" in norm)
@@ -680,9 +738,10 @@ def _extract_status_value(text: str) -> Optional[str]:
         or ("atualiza para pago" in norm)
     ):
         return "pago"
-    if "pago" in norm:
+    # Não usar substring ("pagou" contém "pago"). Exigimos palavra inteira.
+    if re.search(r"\bpago\b", norm):
         return "pago"
-    if "pendente" in norm:
+    if re.search(r"\bpendente\b", norm):
         return "pendente"
     return None
 
@@ -726,6 +785,7 @@ def _extract_amount_before_prefix(text: str, prefixes: list[str], max_gap_words:
 
 
 def _extract_total_value(text: str, numbers: list[float]) -> Optional[float]:
+    norm = _normalize(text)
     value = _extract_amount_after_prefix(
         text,
         prefixes=[
@@ -756,6 +816,10 @@ def _extract_total_value(text: str, numbers: list[float]) -> Optional[float]:
     if not numbers:
         return None
     big = [number for number in numbers if number >= 100]
+    # Se houver múltiplos valores grandes na mesma frase, preferimos o MAIOR como total,
+    # principalmente quando o texto menciona pagamento/entrada (ex.: "pagou 15000, entrada 8000").
+    if len(big) >= 2 and any(tok in norm for tok in ("pagou", "entrada", "restante", "saldo", "vai me pagar")):
+        return max(big)
     return big[0] if big else numbers[0]
 
 
@@ -862,12 +926,14 @@ def _extract_payment_value(text: str, label: str, total: Optional[float], fallba
             return round(total / 2, 2)
 
     if label == "entrada":
+        # Importante: priorizar "entrada ..." antes de "pagou ...".
+        # Ex.: "pagou 15000, entrada 8 mil" => entrada deve ser 8000 (não 15000).
         prefixes = [
-            r"pagou",
             r"entrada\s*(?:de|foi)?",
             r"deu\s+(?:uma\s+)?entrada\s*(?:de|foi)?",
             r"me\s+deu",
             r"recebi",
+            r"pagou",
         ]
     else:
         prefixes = [
@@ -1039,7 +1105,7 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
     raw_text = message.strip()
     norm_text = _normalize(raw_text)
     numbers = _currency_candidates(raw_text)
-    sale_id = _extract_sale_id_from_text(raw_text)
+    sale_id = _extract_target_sale_id_for_updates(raw_text)
     material_allocations = _extract_material_allocations(raw_text, reference_date)
     if not sale_id and material_allocations:
         sale_id = material_allocations[0].sale_id
@@ -1106,6 +1172,10 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
         )
         or sale_date
     )
+    # Se o usuário disse explicitamente que pagou hoje (ex.: "metade hoje"),
+    # a entrada deve ser considerada paga na data da venda.
+    if "hoje" in norm_text and any(tok in norm_text for tok in ("pagou", "entrada", "metade")):
+        entry_date = sale_date
     balance_segment = (
         _segment_near(raw_text, "restante")
         or _segment_near(raw_text, "saldo")
@@ -1172,6 +1242,10 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
         )
         or None
     )
+    # Se o usuário informou quando vai pagar o restante ("restante dia 13/04"),
+    # usamos isso também como Data de Entrega (padrão do fluxo do usuário).
+    if service_due_date is None and balance_future_hint and balance_date:
+        service_due_date = balance_date
     # Heurística: quando o cliente fala "amanha" e também menciona entrega,
     # consideramos amanhã como Data de Entrega.
     if service_due_date is None and ("amanha" in norm_text) and any(
@@ -1181,6 +1255,22 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
 
     entry_value = _extract_payment_value(raw_text, "entrada", total_value, numbers)
     balance_value = _extract_payment_value(raw_text, "saldo", total_value, numbers)
+    # Heurística: quando o texto traz "pagou X" e também "entrada Y",
+    # mas o total capturado ficou menor que um pagamento (ex.: total=8000 e entrada=15000),
+    # assumir que o maior valor é o TOTAL e o menor é a ENTRADA.
+    # Isso evita o aviso e calcula corretamente o restante.
+    if total_value and entry_value and entry_value > (total_value + 0.01):
+        # Só aplicar quando a mensagem mencionar explicitamente "entrada"
+        # (para não confundir outros fluxos).
+        if "entrada" in norm_text:
+            bigger = float(entry_value)
+            smaller = float(total_value)
+            total_value = bigger
+            entry_value = smaller
+            balance_value = None
+            warnings.append(
+                "Ajuste automático: valor maior interpretado como total e o menor como entrada."
+            )
 
     material_cost = _extract_material_cost(raw_text)
     if material_cost is None:
@@ -1225,12 +1315,12 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
     missing: list[str] = []
     material_expense_only = bool((material_allocations or material_cost) and (not sale_creation_context) and not total_value)
     if material_expense_only:
-        # Para "gasto de material", precisamos do ID do cliente (campo ID Cliente na planilha)
-        # e do ID VENDA para vincular a linha correta em "Compras Matéria-Prima".
-        if not customer:
-            missing.append("ID Cliente")
+        # Para "gasto de material", precisamos do ID VENDA para vincular a linha correta em "Compras Matéria-Prima".
+        # O ID Cliente é opcional quando a mensagem já traz o ID VENDA (ex.: "material para o cliente id 003").
         if not sale_id and not material_allocations:
             missing.append("ID VENDA")
+        if (not sale_id) and (not material_allocations) and (not customer):
+            missing.append("ID Cliente")
     else:
         # Fluxo de venda normal: exige cliente e valor (produto é opcional).
         if not customer:
@@ -1409,7 +1499,7 @@ def detect_intent(message: str) -> str:
             "comprou",
         )
     )
-    sale_id = _extract_sale_id_from_text(message)
+    sale_id = _extract_target_sale_id_for_updates(message)
     status = _extract_status_value(message)
     material_cost = _extract_amount_after_prefix(
         message,
@@ -1425,9 +1515,23 @@ def detect_intent(message: str) -> str:
         max_gap_words=8,
     )
     material_allocations = _extract_material_allocations(message, date.today())
+    delivery_date = _extract_first_date_by_keywords(
+        message,
+        date.today(),
+        keywords=("data de entrega", "data entrega", "entrega", "entregar"),
+    )
+    payment_amount = _extract_amount_after_prefix(
+        message,
+        prefixes=[r"pagou", r"paguei", r"recebi", r"recebeu", r"entrada"],
+        max_gap_words=0,
+    )
     # Refund sempre ganha, mesmo que a mensagem tenha outros tokens.
-    if sale_id and (material_allocations or material_cost) and not status:
-        return "sale"
+    if (not sale_creation_context) and sale_id and delivery_date and not status and not (material_allocations or material_cost):
+        return "delivery_update"
+    if (not sale_creation_context) and sale_id and (material_allocations or material_cost) and not status:
+        return "material_update"
+    if (not sale_creation_context) and sale_id and payment_amount and not status and not (material_allocations or material_cost) and not delivery_date:
+        return "payment_update"
     if any(keyword in norm for keyword in REFUND_KEYWORDS):
         return "refund"
     if sale_creation_context:
@@ -1476,6 +1580,73 @@ def parse_refund_message(message: str, reference_date: Optional[date] = None) ->
 def parse_message(message: str, reference_date: Optional[date] = None) -> ParseResult:
     financial_result = parse_financial_message(message, reference_date)
     intent = detect_intent(message)
+    if intent == "delivery_update":
+        if reference_date is None:
+            reference_date = date.today()
+        target_sale_id = _extract_target_sale_id_for_updates(message) or ""
+        delivery_date = _extract_first_date_by_keywords(
+            message,
+            reference_date,
+            keywords=("data de entrega", "data entrega", "entrega", "entregar", "dia"),
+        ) or _parse_pt_date(message, reference_date)
+        missing: list[str] = []
+        if not target_sale_id:
+            missing.append("ID VENDA")
+        if delivery_date is None:
+            missing.append("Data de Entrega")
+        return ParseResult(
+            command=FinancialCommand(
+                customer=_extract_customer(message) or "",
+                description=f"Atualizar data de entrega da venda {target_sale_id or '-'}",
+                sale_date=reference_date,
+                total_value=0.0,
+                payments=[],
+                sale_id=target_sale_id or None,
+                service_due_date=delivery_date,
+            ),
+            missing_fields=missing,
+            detected_values={
+                "id_venda": target_sale_id or "-",
+                "data_entrega": delivery_date.strftime("%d/%m/%Y") if delivery_date else "-",
+            },
+            intent="delivery_update",
+        )
+    if intent == "material_update":
+        # Reaproveita parse_financial_message; apenas sinaliza intent para não exigir ID Cliente em updates por ID VENDA.
+        financial_result.intent = "material_update"
+        return financial_result
+    if intent == "payment_update":
+        if reference_date is None:
+            reference_date = date.today()
+        target_sale_id = _extract_target_sale_id_for_updates(message) or ""
+        amount = _extract_amount_after_prefix(
+            message,
+            prefixes=[r"pagou", r"paguei", r"recebi", r"recebeu", r"entrada"],
+            max_gap_words=0,
+        )
+        pay_date = _parse_pt_date(message, reference_date) or reference_date
+        missing: list[str] = []
+        if not target_sale_id:
+            missing.append("ID VENDA")
+        if amount is None:
+            missing.append("Valor pago")
+        return ParseResult(
+            command=FinancialCommand(
+                customer=_extract_customer(message) or "",
+                description=f"Atualizar pagamento da venda {target_sale_id or '-'}",
+                sale_date=reference_date,
+                total_value=0.0,
+                payments=[],
+                sale_id=target_sale_id or None,
+            ),
+            missing_fields=missing,
+            detected_values={
+                "id_venda": target_sale_id or "-",
+                "valor_pago": f"{float(amount):.2f}" if amount else "-",
+                "data": pay_date.strftime("%d/%m/%Y"),
+            },
+            intent="payment_update",
+        )
     if intent == "status_update":
         status_update = parse_status_update_message(message, reference_date)
         has_material_updates = bool(financial_result.command.material_allocations)

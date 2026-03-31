@@ -468,6 +468,22 @@ class SpreadsheetService:
         return any((getattr(ws[f"{col}{row}"], "style_id", 0) or 0) > 0 for col in cols)
 
     @staticmethod
+    def _row_has_any_border(ws, row: int, cols: tuple[str, ...]) -> bool:
+        """
+        Detecta se a linha já tem bordas aplicadas nas colunas alvo.
+        Isso é importante porque alguns layouts no Excel podem ter bordas sem "style_id" não-zero.
+        """
+        for col in cols:
+            cell = ws[f"{col}{row}"]
+            border = getattr(cell, "border", None)
+            if border is None:
+                continue
+            for side in (border.left, border.right, border.top, border.bottom):
+                if getattr(side, "style", None):
+                    return True
+        return False
+
+    @staticmethod
     def _clear_row_values(ws, row: int, cols: tuple[str, ...]) -> None:
         for col in cols:
             ws[f"{col}{row}"] = None
@@ -691,6 +707,9 @@ class SpreadsheetService:
     def _template_source(cls, wb, ws, logical_sheet_name: str, cols: tuple[str, ...]):
         template_ws = cls._ensure_template_sheet(wb, logical_sheet_name)
         anchored_sheet = cls._anchor_template_row_for(logical_sheet_name) is not None
+        # Importante: em abas "ancoradas", o padrão é a linha 1048576.
+        # O robô nunca deve tentar "atualizar" esse padrão automaticamente a partir da linha 3,
+        # para não alterar bordas/layout que o usuário considera como referência fixa.
         # Padrão único: linha 1048576. Replicar esse estilo em todas as linhas que o robô preencher.
         # TOTAL DE VENDAS DE 2026 e Compras Matéria-Prima: mesma regra — usar só a linha 1048576 quando tiver conteúdo ou formatação.
         result = cls._load_padrao_from_anchor_row(wb, ws, logical_sheet_name, cols)
@@ -752,6 +771,10 @@ class SpreadsheetService:
     ):
         if cls._row_has_values(ws, row, cols):
             return ws, row
+        # Se a linha já está formatada (ex.: bordas já desenhadas pelo usuário),
+        # não copiar estilo do template para não sobrescrever o layout.
+        if cls._row_has_any_border(ws, row, cols):
+            return ws, row
 
         # Sempre usar o padrão salvo no template (linha 3) quando existir; não usar outras linhas visíveis que podem ter formato errado
         template_ws, template_row = cls._template_source(wb, ws, logical_sheet_name, cols)
@@ -786,7 +809,7 @@ class SpreadsheetService:
             if cls._row_has_values(ws, row, style_cols):
                 continue
             # Nunca sobrescrever formatação existente: só aplicar template em linhas sem estilo
-            if cls._row_has_any_style(ws, row, style_cols):
+            if cls._row_has_any_style(ws, row, style_cols) or cls._row_has_any_border(ws, row, style_cols):
                 continue
             cls._copy_row_style_between(
                 template_ws,
@@ -1259,9 +1282,10 @@ class SpreadsheetService:
             style_cols,
             start_row=TEMPLATE_ROW,
         )
-        # Garante que a linha realmente receba o layout padrão da âncora (1048576),
-        # mesmo se o usuário tiver apagado/bagunçado estilo na linha.
-        self._copy_sales_row_style_from_template(wb, ws, row)
+        # Não sobrescrever bordas/estilo que já existam na linha (muitos usuários formatam a tabela inteira).
+        # Só aplica o template quando a linha estiver realmente sem estilo.
+        if not self._row_has_any_style(ws, row, style_cols):
+            self._copy_sales_row_style_from_template(wb, ws, row)
 
         paid_amount = round(sum(p.value for p in cmd.payments if p.status == "pago"), 2)
         pending_amount = round(sum(p.value for p in cmd.payments if p.status != "pago"), 2)
@@ -1276,11 +1300,21 @@ class SpreadsheetService:
 
         # Datas seguindo o padrão da planilha (Data de venda / Data de Entrega)
         ws[f"{sales_cols['data de venda']}{row}"] = self._excel_date_value(cmd.sale_date)
-        if cmd.service_due_date:
-            ws[f"{sales_cols['data de entrega']}{row}"] = self._excel_date_value(cmd.service_due_date)
+        # Data de Entrega:
+        # - Preferência: campo explícito (cmd.service_due_date).
+        # - Fallback: vence do "Saldo" (quando o usuário só fala "restante dia 10/04").
+        delivery_date = cmd.service_due_date
+        if delivery_date is None and cmd.payments:
+            for p in cmd.payments:
+                if str(getattr(p, "label", "") or "").strip().lower() == "saldo" and getattr(p, "due_date", None):
+                    delivery_date = p.due_date
+                    break
+
+        if delivery_date:
+            ws[f"{sales_cols['data de entrega']}{row}"] = self._excel_date_value(delivery_date)
             delivery_cell = ws[f"{sales_cols['data de entrega']}{row}"]
             ref_date = datetime.now().date()
-            due_date = cmd.service_due_date
+            due_date = delivery_date
             # Cor segue regra:
             # - Se pagou (sem pendente), verde.
             # - Se ainda há pendente e a entrega é futura, amarelo.
@@ -1760,7 +1794,11 @@ class SpreadsheetService:
             wb.close()
 
     def update_sale_delivery_date(self, sale_id: str, delivery_date) -> None:
-        """Atualiza apenas a coluna 'Data de Entrega' para um ID VENDA existente."""
+        """Atualiza apenas a coluna 'Data de Entrega' para um ID VENDA existente.
+
+        Observação: alguns usuários enviam "cliente id 003" querendo dizer o ID VENDA.
+        Por isso, se não achar por ID VENDA, tentamos também casar pelo ID Cliente.
+        """
         wb = self._open_workbook()
         try:
             sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
@@ -1768,29 +1806,100 @@ class SpreadsheetService:
             sales_cols = self._sales_columns(ws_sales)
             col_sale_id = sales_cols["id venda"]
             col_delivery = sales_cols["data de entrega"]
+            col_customer = sales_cols.get("id cliente")
             target_row = None
+            needle = str(sale_id).strip()
+            # 1) Primeiro tenta por ID VENDA
             for row in range(DATA_START_ROW, min(ws_sales.max_row + 1, self.MAX_DATA_ROW)):
-                if str(ws_sales[f"{col_sale_id}{row}"].value or "").strip() == str(sale_id).strip():
+                if str(ws_sales[f"{col_sale_id}{row}"].value or "").strip() == needle:
                     target_row = row
                     break
+            # 2) Fallback: tenta por ID Cliente (quando o usuário fala "cliente id 003")
+            if target_row is None and col_customer:
+                for row in range(DATA_START_ROW, min(ws_sales.max_row + 1, self.MAX_DATA_ROW)):
+                    if str(ws_sales[f"{col_customer}{row}"].value or "").strip() == needle:
+                        target_row = row
+                        break
             if target_row is None:
                 return
-            # Reaplica a linha inteira para manter padrão de bordas em todas as colunas.
-            self._copy_sales_row_style_from_template(wb, ws_sales, target_row)
+            # Não reaplicar estilo da linha inteira em updates: preserva bordas já existentes.
             ws_sales[f"{col_delivery}{target_row}"] = self._excel_date_value(delivery_date)
             # Cor da Data de Entrega acompanha status financeiro atual da linha.
             pending_col = sales_cols["valor (pendente)"]
             current_pending = self._to_float(ws_sales[f"{pending_col}{target_row}"].value)
             delivery_cell = ws_sales[f"{col_delivery}{target_row}"]
-            ref_date = datetime.now().date()
-            due_date = self._parse_date_cell(delivery_date)
             if abs(float(current_pending or 0.0)) < 0.01:
                 delivery_cell.fill = FILL_DONE
-            elif due_date and due_date > ref_date:
+            else:
+                # Pendente => amarelo (mesmo se a data for hoje ou passada).
                 delivery_cell.fill = FILL_PENDING
             # Mantém formato de data se a célula estiver como General.
             self._ensure_number_format_if_general(ws_sales, col_delivery, target_row, "DD/MM/YYYY")
             self._save_workbook(wb)
+        finally:
+            wb.close()
+
+    def apply_partial_payment(self, sale_id: str, amount: float, ref_date: date, original_text: str = "", origin: str = "payment_update") -> WriteAction | None:
+        """Move parte do valor pendente -> pago para um ID VENDA (correção de entrada parcial)."""
+        if amount is None or float(amount) <= 0:
+            return None
+        wb = self._open_workbook()
+        try:
+            sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
+            ws_sales = wb[sales_name]
+            ws_log = self._ensure_log_sheet(wb)
+            sales_cols = self._sales_columns(ws_sales)
+            row = self._find_sale_row(ws_sales, sales_cols["id venda"], str(sale_id).strip())
+            paid_col = sales_cols["total de vendas (pago)"]
+            pending_col = sales_cols["valor (pendente)"]
+            status_col = sales_cols["status de valor"]
+            delivery_col = sales_cols.get("data de entrega")
+
+            current_paid = self._to_float(ws_sales[f"{paid_col}{row}"].value)
+            current_pending = self._to_float(ws_sales[f"{pending_col}{row}"].value)
+            move = min(float(amount), float(current_pending))
+            current_paid = round(current_paid + move, 2)
+            current_pending = round(max(current_pending - move, 0.0), 2)
+            ws_sales[f"{paid_col}{row}"] = current_paid
+            ws_sales[f"{pending_col}{row}"] = current_pending
+            ws_sales[f"{status_col}{row}"] = self._match_text_case(
+                ws_sales[f"{status_col}{row}"].value,
+                self._status_text(current_pending),
+            )
+
+            # Atualizar cor da entrega conforme pendência (sem mexer em bordas)
+            if delivery_col:
+                cell = ws_sales[f"{delivery_col}{row}"]
+                if abs(float(current_pending or 0.0)) < 0.01:
+                    cell.fill = FILL_DONE
+                else:
+                    cell.fill = FILL_PENDING
+
+            customer = str(ws_sales[f"{sales_cols['id cliente']}{row}"].value or "")
+            product = str(ws_sales[f"{sales_cols['id produto']}{row}"].value or "")
+            self._append_log(
+                ws=ws_log,
+                log_id=f"{datetime.now().strftime('%Y%m%d%H%M%S')}-P-1",
+                origin=origin,
+                cmd=FinancialCommand(
+                    customer=customer,
+                    description=product or f"Pagamento parcial {sale_id}",
+                    sale_date=ref_date,
+                    total_value=current_paid + current_pending,
+                    payments=[],
+                    product_id=product or None,
+                    sale_id=str(sale_id).strip(),
+                ),
+                amount=move,
+                ref_date=ref_date,
+                sheet=sales_name,
+                row=row,
+                original_text=original_text,
+            )
+            self._save_workbook(wb)
+            return WriteAction(sheet=sales_name, row=row, amount=move, label="Pagamento parcial", sale_id=str(sale_id).strip())
+        except Exception:
+            return None
         finally:
             wb.close()
 

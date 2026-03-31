@@ -895,8 +895,8 @@ def run_polling() -> None:
                     origin = pending.get("origin", "telegram")
                     cmd = parse_result.command
                     # Se ainda faltar ID Cliente, não salva: pede o ID e recoloca a prévia pendente.
-                    # Para atualização de status, nao exigimos cmd.customer (o ID Cliente nao vem no texto sintetizado).
-                    if parse_result.intent != "status_update":
+                    # Para atualização de status e atualização de entrega, nao exigimos cmd.customer.
+                    if parse_result.intent not in ("status_update", "delivery_update", "payment_update"):
                         if "ID Cliente" in parse_result.missing_fields or not (cmd.customer or "").strip():
                             pending_preview[chat_id] = pending
                             send_message(
@@ -1097,10 +1097,15 @@ def run_polling() -> None:
                     lower = text.strip().lower()
                     # Ignora se for criação de venda (para não confundir "cliente ... pagou" dentro de venda).
                     sale_tokens = ("vendi", "fechei", "fechamos", "acabei de fazer uma venda", "fiz uma venda", "fiz um", "comprou")
+                    # Se tiver valor (ex.: "cliente id 005 pagou 2500"), é pagamento parcial:
+                    # deixa seguir para o parser normal (payment_update) em vez de marcar como pago total.
+                    nums = [int(n) for n in re.findall(r"\b\d{1,6}\b", lower)]
+                    has_amount = any(n >= 100 for n in nums)
                     if (
                         "cliente" in lower
                         and ("pagou" in lower or "pago" in lower)
                         and not any(tok in lower for tok in sale_tokens)
+                        and not has_amount
                     ):
                         # Suporta variações como:
                         # "Cliente ID 002, 003 e 004 pagou"
@@ -1318,7 +1323,14 @@ def run_polling() -> None:
                     missing_set = set(parse_result.missing_fields)
 
                     # Mostra prévia mesmo sem ID Cliente, para o usuário validar os demais campos.
-                    if missing_set == {"ID Cliente"} and parse_result.intent in ("sale", "mixed_update", "refund", "status_update"):
+                    if missing_set == {"ID Cliente"} and parse_result.intent in (
+                        "sale",
+                        "mixed_update",
+                        "refund",
+                        "status_update",
+                        "delivery_update",
+                        "material_update",
+                    ):
                         preview_text = build_preview(parse_result)
                         send_message(
                             chat_id,
@@ -1334,7 +1346,14 @@ def run_polling() -> None:
                         }
                         continue
 
-                    if missing_set == {"ID VENDA"} and parse_result.intent in ("sale", "mixed_update", "refund", "status_update"):
+                    if missing_set == {"ID VENDA"} and parse_result.intent in (
+                        "sale",
+                        "mixed_update",
+                        "refund",
+                        "status_update",
+                        "delivery_update",
+                        "material_update",
+                    ):
                         preview_text = build_preview(parse_result)
                         send_message(
                             chat_id,
@@ -1365,7 +1384,14 @@ def run_polling() -> None:
                     continue
 
                 # Dados completos: mostrar prévia e guardar até o usuário confirmar
-                if parse_result.intent in ("sale", "mixed_update", "refund", "status_update"):
+                if parse_result.intent in (
+                    "sale",
+                    "mixed_update",
+                    "refund",
+                    "status_update",
+                    "delivery_update",
+                    "material_update",
+                ):
                     preview_text = build_preview(parse_result)
                     send_message(chat_id, preview_text, parse_mode="Markdown")
                     pending_preview[chat_id] = {
@@ -1462,7 +1488,14 @@ def _run_local_test(args: argparse.Namespace) -> None:
         print("Missing fields:", ", ".join(parse_result.missing_fields))
         return
 
-    if parse_result.intent in ("sale", "mixed_update", "refund", "status_update"):
+    if parse_result.intent in (
+        "sale",
+        "mixed_update",
+        "refund",
+        "status_update",
+        "delivery_update",
+        "material_update",
+    ):
         preview_text = build_preview(parse_result)
         print(preview_text)
 
