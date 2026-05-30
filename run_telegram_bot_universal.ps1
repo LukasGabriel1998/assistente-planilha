@@ -28,6 +28,15 @@ if (-not (Test-Path $envPath)) {
 # (ou via variavel de ambiente) para rodar em qualquer maquina com 1 comando.
 $tokenToUse = $TelegramToken
 if (-not $tokenToUse) { $tokenToUse = $env:TELEGRAM_BOT_TOKEN }
+$tokenFromFile = ""
+if ((-not $tokenToUse) -and (Test-Path $envPath)) {
+  $existingTokenLine = Get-Content $envPath -Encoding UTF8 |
+    Where-Object { $_ -match '^\s*TELEGRAM_BOT_TOKEN\s*=' } |
+    Select-Object -First 1
+  if ($existingTokenLine) {
+    $tokenFromFile = (($existingTokenLine -split "=", 2)[1]).Trim()
+  }
+}
 
 if ($tokenToUse -and ($tokenToUse.Trim().Length -gt 0) -and (Test-Path $envPath)) {
   $lines = Get-Content $envPath -Encoding UTF8
@@ -43,7 +52,7 @@ if ($tokenToUse -and ($tokenToUse.Trim().Length -gt 0) -and (Test-Path $envPath)
   }
   Set-Content $envPath -Value $lines -Encoding UTF8
   Write-Host "[Telegram] TELEGRAM_BOT_TOKEN configurado no .env (valor fornecido via parametro/ENV)." -ForegroundColor Green
-} elseif (Test-Path $envPath) {
+} elseif ((Test-Path $envPath) -and (-not $tokenFromFile)) {
   Write-Host "[Telegram] TELEGRAM_BOT_TOKEN nao foi fornecido (token vazio). Verifique o arquivo .env." -ForegroundColor DarkYellow
 }
 
@@ -69,6 +78,35 @@ function Test-PythonExe([string]$exePath) {
     return ($LASTEXITCODE -eq 0)
   } finally {
     $ErrorActionPreference = $oldPref
+  }
+}
+
+function Get-EnvValue([string]$name) {
+  if (-not (Test-Path $envPath)) { return "" }
+  $line = Get-Content $envPath -Encoding UTF8 |
+    Where-Object { $_ -match "^\s*$([regex]::Escape($name))\s*=" } |
+    Select-Object -First 1
+  if (-not $line) { return "" }
+  return (($line -split "=", 2)[1]).Trim()
+}
+
+function Test-TelegramToken([string]$token) {
+  $clean = ""
+  if ($null -ne $token) { $clean = $token.Trim() }
+  if (-not $clean -or $clean -eq "COLOQUE_SEU_TOKEN_AQUI") {
+    throw "TELEGRAM_BOT_TOKEN vazio. Cole o token do @BotFather usando: .\run_telegram_bot_universal.ps1 -TelegramToken `"SEU_TOKEN`""
+  }
+  if ($clean -notmatch '^\d+:[A-Za-z0-9_-]{30,}$') {
+    throw "TELEGRAM_BOT_TOKEN invalido no .env. Ele deve ter formato parecido com 123456789:ABC... Pegue o token correto no @BotFather."
+  }
+  try {
+    $resp = Invoke-RestMethod -Uri "https://api.telegram.org/bot$clean/getMe" -TimeoutSec 15
+    if (-not $resp.ok) {
+      throw "Resposta da API nao veio como ok=true."
+    }
+    Write-Host ("[Telegram] Token validado: @{0}" -f $resp.result.username) -ForegroundColor Green
+  } catch {
+    throw "Token do Telegram recusado pela API. Pegue o token correto no @BotFather e rode novamente com -TelegramToken. Detalhe: $($_.Exception.Message)"
   }
 }
 
@@ -166,6 +204,9 @@ if (-not (Test-PythonExe $pythonExe)) {
   throw "Venv .venv_native nao esta funcional. Apague a pasta .venv_native e rode novamente, ou instale o Python correto."
 }
 
+$tokenFromEnv = Get-EnvValue "TELEGRAM_BOT_TOKEN"
+Test-TelegramToken $tokenFromEnv
+
 # reset (encerrar processos antigos)
 Write-Info "[Telegram] Reset/Start: limpando instancias antigas..."
 try {
@@ -174,8 +215,8 @@ try {
     Select-Object -ExpandProperty ProcessId
 
   if ($pids) {
-    foreach ($pid in $pids) {
-      try { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue } catch { }
+    foreach ($oldPid in $pids) {
+      try { Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue } catch { }
     }
     Write-Host "[Telegram] Processos antigos encerrados." -ForegroundColor Green
   } else {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -100,9 +101,8 @@ BAD_PRODUCT_WORDS = {
     "data",
 }
 
-MONEY_TOKEN = r"(?:(?:r\$\s*)?\d+(?:[.\s]\d{3})*(?:[.,]\d{1,2})?(?:\s*mil)?|mil)"
-
 WORD_UNITS = {
+    "zero": 0,
     "um": 1,
     "uma": 1,
     "dois": 2,
@@ -116,6 +116,50 @@ WORD_UNITS = {
     "nove": 9,
     "dez": 10,
 }
+
+WORD_NUMBERS = {
+    **WORD_UNITS,
+    "onze": 11,
+    "doze": 12,
+    "treze": 13,
+    "quatorze": 14,
+    "catorze": 14,
+    "quinze": 15,
+    "dezesseis": 16,
+    "dezessete": 17,
+    "dezoito": 18,
+    "dezenove": 19,
+    "vinte": 20,
+    "trinta": 30,
+    "quarenta": 40,
+    "cinquenta": 50,
+    "sessenta": 60,
+    "setenta": 70,
+    "oitenta": 80,
+    "noventa": 90,
+    "cem": 100,
+    "cento": 100,
+    "duzentos": 200,
+    "duzentas": 200,
+    "trezentos": 300,
+    "trezentas": 300,
+    "quatrocentos": 400,
+    "quatrocentas": 400,
+    "quinhentos": 500,
+    "quinhentas": 500,
+    "seiscentos": 600,
+    "seiscentas": 600,
+    "setecentos": 700,
+    "setecentas": 700,
+    "oitocentos": 800,
+    "oitocentas": 800,
+    "novecentos": 900,
+    "novecentas": 900,
+}
+NUMBER_WORD_PATTERN = "|".join(
+    re.escape(word) for word in sorted({*WORD_NUMBERS.keys(), "mil"}, key=len, reverse=True)
+)
+MONEY_TOKEN = r"(?:(?:r\$\s*)?\d+(?:[.\s]\d{3})*(?:[.,]\d{1,2})?(?:\s*mil)?|mil)"
 
 LETTER_RX = r"[^\W\d_]"
 TEXT_RX = r"[\w .&'/-]"
@@ -188,6 +232,7 @@ def _segment_near(text: str, keyword: str, before: int = 12, after: int = 90) ->
 def _to_float(value_text: str) -> Optional[float]:
     txt = _normalize(value_text)
     txt = txt.replace("r$", "").replace("reais", "").replace("real", "")
+    txt = txt.replace("centavos", "").replace("centavo", "")
     txt = txt.replace(" ", "")
     if not txt:
         return None
@@ -211,18 +256,174 @@ def _to_float(value_text: str) -> Optional[float]:
         return None
 
 
+def _parse_number_words_pt(fragment: str) -> Optional[int]:
+    norm = _normalize(fragment)
+    tokens = re.findall(r"[a-z]+", norm)
+    total = 0
+    current = 0
+    used = False
+    for token in tokens:
+        if token in {"e", "de", "da", "do", "das", "dos", "reais", "real", "centavos", "centavo"}:
+            continue
+        if token == "mil":
+            total += (current or 1) * 1000
+            current = 0
+            used = True
+            continue
+        value = WORD_NUMBERS.get(token)
+        if value is None:
+            continue
+        current += value
+        used = True
+    if not used:
+        return None
+    return total + current
+
+
+def _parse_amount_token(token: str) -> Optional[float]:
+    if re.search(r"\d", token):
+        matches = re.findall(r"(?:r\$\s*)?\d+(?:[.\s]\d{3})*(?:[.,]\d{1,2})?(?:\s*mil)?", token)
+        if matches:
+            return _parse_money_from_fragment(matches[-1])
+        return _to_float(token)
+    value = _parse_number_words_pt(token)
+    return float(value) if value is not None else None
+
+
+def _trim_money_context(fragment: str) -> str:
+    text = _normalize(fragment).strip()
+    markers = (
+        " no valor de ",
+        " valor de ",
+        " valor ",
+        " ficou ",
+        " foi ",
+        " por ",
+        " de ",
+    )
+    last_pos = -1
+    last_marker = ""
+    padded = f" {text} "
+    for marker in markers:
+        pos = padded.rfind(marker)
+        if pos > last_pos:
+            last_pos = pos
+            last_marker = marker
+    if last_pos >= 0:
+        text = padded[last_pos + len(last_marker) :].strip()
+    return text
+
+
+def _parse_reais_e_centavos(fragment: str) -> Optional[float]:
+    """Ex.: '5877 e 80 centavos', '5.877 e 80 centavos' -> 5877.80"""
+    norm = _normalize(fragment)
+    match = re.search(
+        r"(\d[\d.,\s]*)\s+e\s+(\d{1,2})\s*centavos?\b",
+        norm,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    reais = _to_float(match.group(1).replace(" ", ""))
+    if reais is None:
+        return None
+    try:
+        cents = int(match.group(2))
+    except ValueError:
+        return None
+    if cents >= 100:
+        return None
+    return round(float(reais) + (cents / 100.0), 2)
+
+
+def _parse_money_phrase(fragment: str) -> Optional[float]:
+    norm = _normalize(fragment)
+    combined = _parse_reais_e_centavos(norm)
+    if combined is not None:
+        return combined
+
+    if "real" in norm or "reais" in norm:
+        before, _, after = norm.partition("reais")
+        if not after and "real" in norm:
+            before, _, after = norm.partition("real")
+        reais = _parse_amount_token(_trim_money_context(before))
+        cents = 0.0
+        if "centavo" in after:
+            cents_text = after.split("centavo", 1)[0]
+            cents_text = re.sub(r"^\s*e\s+", "", cents_text).strip()
+            parsed_cents = _parse_amount_token(cents_text)
+            if parsed_cents is not None:
+                cents = parsed_cents
+        if reais is not None:
+            return round(float(reais) + (float(cents) / 100.0), 2)
+
+    if "centavo" in norm:
+        if re.search(r"\d[\d.,\s]*\s+e\s+\d{1,2}\s*centavos?\b", norm, flags=re.IGNORECASE):
+            return None
+        cents_text = norm.split("centavo", 1)[0]
+        cents_text = re.sub(r"^.*?\be\s+", "", cents_text).strip() or cents_text.strip()
+        cents = _parse_amount_token(cents_text)
+        if cents is not None:
+            return round(float(cents) / 100.0, 2)
+
+    return None
+
+
+def _word_window_after_prefix(text: str, prefix: str, max_words: int = 16) -> str:
+    norm_text = _normalize(text)
+    match = re.search(prefix, norm_text, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    fragment = norm_text[match.end() :]
+    fragment = re.split(
+        r"[,.;]|\b(?:para|pra|cliente|id venda|id cliente|produto|data|dia)\b",
+        fragment,
+        maxsplit=1,
+    )[0]
+    words = fragment.strip().split()
+    return " ".join(words[:max_words])
+
+
+def _word_window_before_prefix(text: str, prefix: str, max_words: int = 16) -> str:
+    norm_text = _normalize(text)
+    match = re.search(prefix, norm_text, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    fragment = norm_text[: match.start()]
+    fragment = re.split(r"[,.;]", fragment)[-1]
+    words = fragment.strip().split()
+    return " ".join(words[-max_words:])
+
+
 def _is_money_like(raw_value: str) -> bool:
     norm = _normalize(raw_value)
     digits = re.sub(r"\D", "", norm)
     if digits and len(digits) > 1 and digits.startswith("0"):
         return False
-    return ("r$" in norm) or ("mil" in norm) or ("," in norm) or ("." in norm) or len(digits) >= 3
+    if any(token in norm for token in ("r$", "real", "reais", "centavo", "centavos", "mil")):
+        return True
+    if ("," in norm) or ("." in norm) or len(digits) >= 3:
+        return True
+    word_value = _parse_number_words_pt(norm)
+    return bool(word_value is not None and word_value >= 100)
+
+
+def parse_money_value(fragment: str) -> Optional[float]:
+    return _parse_money_from_fragment(fragment)
 
 
 def _parse_money_from_fragment(fragment: str) -> Optional[float]:
     norm = _normalize(fragment)
-    if re.search(r"\bmil\b", norm, flags=re.IGNORECASE) and not re.search(r"\d", norm):
-        return 1000.0
+    phrase_value = _parse_money_phrase(norm)
+    if phrase_value is not None:
+        return phrase_value
+
+    mil_match = re.search(r"(\d+(?:[.,]\d+)?)\s*mil\b", norm, flags=re.IGNORECASE)
+    if mil_match:
+        base = _to_float(mil_match.group(1))
+        if base is not None:
+            return round(base * 1000.0, 2)
+
     word_thousand = re.search(
         r"\b(" + "|".join(re.escape(word) for word in WORD_UNITS.keys()) + r")\s+mil\b",
         norm,
@@ -234,11 +435,25 @@ def _parse_money_from_fragment(fragment: str) -> Optional[float]:
         if base:
             return float(base * 1000)
 
-    mil_match = re.search(r"(\d+(?:[.,]\d+)?)\s*mil\b", norm, flags=re.IGNORECASE)
-    if mil_match:
-        base = _to_float(mil_match.group(1))
-        if base is not None:
-            return round(base * 1000.0, 2)
+    numeric_values: list[float] = []
+    for match in re.finditer(MONEY_TOKEN, norm, flags=re.IGNORECASE):
+        value = _to_float(match.group(0))
+        if value is not None and value > 0:
+            numeric_values.append(round(value, 2))
+    if numeric_values:
+        if len(numeric_values) == 1:
+            return numeric_values[0]
+        if any(tok in norm for tok in ("valor", "total", "por", "foi", "venda", "pagou", "entrada")):
+            return max(numeric_values)
+        if len(norm.split()) <= 8:
+            return max(numeric_values)
+
+    word_value = _parse_number_words_pt(norm)
+    if word_value is not None and _is_money_like(norm):
+        if len(norm.split()) <= 12 and not numeric_values and "mil" not in norm:
+            return round(float(word_value), 2)
+    if re.search(r"\bmil\b", norm, flags=re.IGNORECASE) and not re.search(r"\d", norm):
+        return 1000.0
 
     number_match = re.search(MONEY_TOKEN, norm, flags=re.IGNORECASE)
     if not number_match:
@@ -249,9 +464,125 @@ def _parse_money_from_fragment(fragment: str) -> Optional[float]:
     return round(value, 2)
 
 
+def _mask_id_number_spans(text: str) -> str:
+    """Oculta números que são IDs (cliente id 002, id venda 005) para não virarem valor monetário."""
+    masked = text
+    id_patterns = (
+        r"\bcliente\s*id\s*[:\-]?\s*\d{1,6}\b",
+        r"\bid\s*cliente\s*[:\-]?\s*\d{1,6}\b",
+        r"\bid\s*(?:de\s*)?venda\s*[:\-]?\s*\d{1,6}\b",
+        r"\bid\s*[:\-]?\s*\d{1,6}\b",
+    )
+    for pattern in id_patterns:
+        masked = re.sub(
+            pattern,
+            lambda m: " " * len(m.group(0)),
+            masked,
+            flags=re.IGNORECASE,
+        )
+    return masked
+
+
+def _is_service_delivery_finalized(text: str) -> bool:
+    norm = _normalize(text)
+    if re.search(r"\bentreg(?:ue|a)\s+hoje\b", norm):
+        return True
+    if re.search(r"\b(?:foi\s+)?entreg(?:ue|a)\b", norm) and (
+        "hoje" in norm or "agora" in norm or re.search(r"\bfoi\s+entreg", norm)
+    ):
+        return True
+    if re.search(r"\bja\s+entreg", norm):
+        return True
+    return any(
+        token in norm
+        for token in (
+            "finalizado",
+            "finalizada",
+            "finalizou",
+            "foi finalizado",
+            "foi entregue",
+            "entregue",
+            "entregamos",
+            "concluido",
+            "concluído",
+            "servico pronto",
+            "serviço pronto",
+            "trabalho pronto",
+        )
+    )
+
+
+def enrich_with_last_sale_context(text: str, last_sale_id: str | None) -> str:
+    """
+    Quando o usuário fala 'para ele', 'a entrega foi hoje' etc. logo após outra ação,
+    injeta o último ID VENDA conhecido para o parser associar corretamente.
+    """
+    raw = (text or "").strip()
+    if not raw or not last_sale_id:
+        return raw
+    if _extract_target_sale_id_for_updates(raw) or _extract_sale_id_from_text(raw):
+        return raw
+    norm = _normalize(raw)
+    sale_creation = any(
+        tok in norm
+        for tok in (
+            "vendi",
+            "vender",
+            "acabei de fazer uma venda",
+            "fiz uma venda",
+            "fechei",
+            "comprou",
+        )
+    )
+    if sale_creation:
+        return raw
+    followup_markers = (
+        "data de entrega",
+        "data entrega",
+        "entrega",
+        "entregue",
+        "entreg",
+        "finaliz",
+        "pagou",
+        "pago",
+        "material",
+        "para ele",
+        "para ela",
+        "dele",
+        "dela",
+        "desse",
+        "dessa",
+        "nesse",
+        "nesta",
+        "mudar",
+        "altera",
+        "alterar",
+    )
+    if not any(tok in norm for tok in followup_markers):
+        return raw
+    sid = str(last_sale_id).strip().zfill(3) if str(last_sale_id).strip().isdigit() and len(str(last_sale_id).strip()) <= 3 else str(last_sale_id).strip()
+    return f"cliente id {sid} {raw}"
+
+
 def _currency_candidates(text: str) -> list[float]:
     values: list[float] = []
-    norm = _normalize(text)
+    norm = _normalize(_mask_id_number_spans(text))
+
+    for match in re.finditer(r"\breais?\b", norm, flags=re.IGNORECASE):
+        start = max(0, match.start() - 90)
+        end = min(len(norm), match.end() + 60)
+        value = _parse_money_phrase(norm[start:end])
+        if value is not None and value > 0:
+            values.append(value)
+
+    for match in re.finditer(
+        r"(\d[\d.,\s]*)\s+e\s+(\d{1,2})\s*centavos?\b",
+        norm,
+        flags=re.IGNORECASE,
+    ):
+        combined = _parse_reais_e_centavos(match.group(0))
+        if combined is not None and combined > 0:
+            values.append(combined)
 
     for match in re.finditer(
         r"\b(" + "|".join(re.escape(word) for word in WORD_UNITS.keys()) + r")\s+mil\b",
@@ -281,8 +612,65 @@ def _currency_candidates(text: str) -> list[float]:
     return values
 
 
-def _parse_pt_date(fragment: str, reference_date: date) -> Optional[date]:
+def _extract_month_from_text(text: str) -> Optional[int]:
+    """Retorna o número do mês se houver nome de mês no texto (ex.: 'junho')."""
+    norm = _normalize(text)
+    for name, num in MONTH_MAP.items():
+        if re.search(rf"\b{re.escape(name)}\b", norm):
+            return num
+    return None
+
+
+def _resolve_year_for_month(month: int, day: int, reference_date: date) -> int:
+    """Escolhe o ano mais plausível para mês/dia com base na data de referência (hoje)."""
+    year = reference_date.year
+    try:
+        candidate = date(year, month, day)
+    except ValueError:
+        last_day = calendar.monthrange(year, month)[1]
+        candidate = date(year, month, min(day, last_day))
+    if candidate < reference_date - timedelta(days=15):
+        year += 1
+    return year
+
+
+def _build_date(day: int, month: int, reference_date: date) -> date:
+    year = _resolve_year_for_month(month, day, reference_date)
+    try:
+        return date(year, month, day)
+    except ValueError:
+        last_day = calendar.monthrange(year, month)[1]
+        return date(year, month, min(day, last_day))
+
+
+def _date_from_month_mention(
+    text: str,
+    reference_date: date,
+    *,
+    preferred_day: Optional[int] = None,
+) -> Optional[date]:
+    """Interpreta 'em junho', 'a data será em junho', etc."""
+    month = _extract_month_from_text(text)
+    if month is None:
+        return None
+    norm = _normalize(text)
+    day = preferred_day
+    match = re.search(r"\bdia\s+(\d{1,2})\b", norm)
+    if match:
+        day = int(match.group(1))
+    match = re.search(r"\b(\d{1,2})\s+de\s+[a-z]+\b", norm)
+    if match:
+        day = int(match.group(1))
+    if day is None:
+        day = reference_date.day
+    return _build_date(day, month, reference_date)
+
+
+def _parse_pt_date(fragment: str, reference_date: date, *, full_text: str = "") -> Optional[date]:
+    context = full_text or fragment
     norm = _normalize(fragment)
+    context_norm = _normalize(context)
+
     match = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", norm)
     if match:
         day = int(match.group(1))
@@ -303,31 +691,26 @@ def _parse_pt_date(fragment: str, reference_date: date) -> Optional[date]:
     if "ontem" in norm:
         return reference_date - timedelta(days=1)
 
-    match = re.search(r"\bdia\s+(\d{1,2})(?:\s+de\s+([a-z]+))?", norm)
+    match = re.search(r"\b(?:no\s+)?dia\s+(\d{1,2})(?:\s+de\s+([a-z]+))?\b", norm)
     if match:
         day = int(match.group(1))
         month_txt = match.group(2)
-        year = reference_date.year
-        if month_txt:
-            month_num = MONTH_MAP.get(month_txt)
-            if month_num:
-                try:
-                    parsed = date(year, month_num, day)
-                except ValueError:
-                    parsed = None
-                if parsed and parsed < reference_date - timedelta(days=15):
-                    parsed = date(year + 1, month_num, day)
-                return parsed
-        else:
-            try:
-                parsed = date(year, reference_date.month, day)
-            except ValueError:
-                return None
-            if parsed < reference_date - timedelta(days=15):
-                if reference_date.month == 12:
-                    return date(year + 1, 1, day)
-                return date(year, reference_date.month + 1, day)
-            return parsed
+        if month_txt and month_txt in MONTH_MAP:
+            return _build_date(day, MONTH_MAP[month_txt], reference_date)
+        inferred = _extract_month_from_text(context)
+        if inferred:
+            return _build_date(day, inferred, reference_date)
+        return _build_date(day, reference_date.month, reference_date)
+
+    match = re.search(r"\b(\d{1,2})\s+de\s+([a-z]+)\b", norm)
+    if match:
+        month_txt = match.group(2)
+        if month_txt in MONTH_MAP:
+            return _build_date(int(match.group(1)), MONTH_MAP[month_txt], reference_date)
+
+    month_only = _date_from_month_mention(fragment, reference_date)
+    if month_only:
+        return month_only
 
     if dateparser is not None:
         parsed = dateparser.parse(
@@ -345,6 +728,11 @@ def _parse_pt_date(fragment: str, reference_date: date) -> Optional[date]:
 
 def _extract_customer(text: str) -> Optional[str]:
     patterns = [
+        # "fiz outra venda aqui para a Aline" / "fiz venda para João"
+        r"\bfiz\s+(?:outra\s+)?venda\s+(?:aqui\s+)?(?:para|pro|pra)\s+(?:(?:o|a)\s+)?([^,.;\n]+?)(?=\s*[,.]|\s+(?:ela|ele)\b|\s+(?:comprou|valor|no\s+valor)\b)",
+        # "acabei de fazer uma venda para a Aline" / "fiz venda para João"
+        r"\bacabei\s+de\s+fazer\s+(?:uma\s+)?venda\s+(?:para|pro|pra)\s+(?:(?:o|a)\s+)?([^,.;\n]+?)(?=\s*[,.]|\s+(?:ela|ele)\b|\s+no\s+valor|\s+valor\b)",
+        r"\bfiz\s+(?:uma\s+)?venda\s+(?:para|pro|pra)\s+(?:(?:o|a)\s+)?([^,.;\n]+?)(?=\s*[,.]|\s+(?:ela|ele)\b|\s+no\s+valor|\s+valor\b)",
         # IDs numéricos de cliente (ex.: "cliente id 004", "id cliente 004")
         r"\b(?:id\s*cliente|cliente\s*id)\s*[:\-]?\s*([a-zA-Z0-9_-]{1,30})\b",
         # "cliente é 004" / "cliente: 004"
@@ -538,6 +926,17 @@ def _extract_target_sale_id_for_updates(text: str) -> Optional[str]:
             "ajusta",
             "corrige",
             "atualiza",
+            "altera",
+            "alterar",
+            "mudar",
+            "vai mudar",
+            "data do cliente",
+            "pagou",
+            "pago",
+            "quitou",
+            "finalizado",
+            "finalizada",
+            "entregue",
         )
     )
     if not update_context:
@@ -549,6 +948,33 @@ def _extract_target_sale_id_for_updates(text: str) -> Optional[str]:
         return None
     digits = m.group(1)
     return digits.zfill(3) if len(digits) <= 3 else digits
+
+
+def _extract_delivery_update_date(message: str, reference_date: date) -> Optional[date]:
+    """Extrai nova data de entrega em mensagens de atualização (ex.: 'data do cliente id 002 muda para 5 de junho')."""
+    norm = _normalize(message)
+    context_tokens = (
+        "data de entrega",
+        "data entrega",
+        "data do cliente",
+        "entrega",
+        "entregar",
+        "prazo",
+        "mudar",
+        "alterar",
+        "altera",
+        "vai mudar",
+    )
+    if not any(tok in norm for tok in context_tokens):
+        return None
+    parsed = _extract_first_date_by_keywords(
+        message,
+        reference_date,
+        keywords=("data de entrega", "data entrega", "data do cliente", "entrega", "entregar", "prazo", "dia", "data"),
+    )
+    if parsed:
+        return parsed
+    return _parse_pt_date(message, reference_date, full_text=message) or _date_from_month_mention(message, reference_date)
 
 
 def _extract_material_allocations(text: str, reference_date: date) -> list[MaterialAllocation]:
@@ -752,14 +1178,17 @@ def _extract_amount_after_prefix(text: str, prefixes: list[str], max_gap_words: 
         gap = rf"(?:\s+\S+){{0,{max_gap_words}}}?" if max_gap_words > 0 else ""
         pattern = rf"(?:{prefix}){gap}\s*({MONEY_TOKEN})"
         match = re.search(pattern, norm_text, flags=re.IGNORECASE)
-        if not match:
-            continue
-        token = match.group(1)
-        if not _is_money_like(token):
-            continue
-        value = _parse_money_from_fragment(token)
-        if value is not None and value > 0:
-            return value
+        if match:
+            token = match.group(1)
+            if _is_money_like(token):
+                value = _parse_money_from_fragment(token)
+                if value is not None and value > 0:
+                    return value
+        if re.search(prefix, norm_text, flags=re.IGNORECASE):
+            word_fragment = _word_window_after_prefix(text, prefix)
+            word_value = _parse_money_from_fragment(word_fragment)
+            if word_value is not None and word_value > 0:
+                return word_value
     return None
 
 
@@ -773,14 +1202,17 @@ def _extract_amount_before_prefix(text: str, prefixes: list[str], max_gap_words:
         gap = rf"(?:\s+\S+){{0,{max_gap_words}}}?" if max_gap_words > 0 else ""
         pattern = rf"({MONEY_TOKEN}){gap}\s*(?:{prefix})"
         match = re.search(pattern, norm_text, flags=re.IGNORECASE)
-        if not match:
-            continue
-        token = match.group(1)
-        if not _is_money_like(token):
-            continue
-        value = _parse_money_from_fragment(token)
-        if value is not None and value > 0:
-            return value
+        if match:
+            token = match.group(1)
+            if _is_money_like(token):
+                value = _parse_money_from_fragment(token)
+                if value is not None and value > 0:
+                    return value
+        if re.search(prefix, norm_text, flags=re.IGNORECASE):
+            word_fragment = _word_window_before_prefix(text, prefix)
+            word_value = _parse_money_from_fragment(word_fragment)
+            if word_value is not None and word_value > 0:
+                return word_value
     return None
 
 
@@ -818,7 +1250,7 @@ def _extract_total_value(text: str, numbers: list[float]) -> Optional[float]:
     big = [number for number in numbers if number >= 100]
     # Se houver múltiplos valores grandes na mesma frase, preferimos o MAIOR como total,
     # principalmente quando o texto menciona pagamento/entrada (ex.: "pagou 15000, entrada 8000").
-    if len(big) >= 2 and any(tok in norm for tok in ("pagou", "entrada", "restante", "saldo", "vai me pagar")):
+    if len(big) >= 2 and any(tok in norm for tok in ("pagou", "entrada", "restante", "saldo", "vai me pagar", "mil", "reais")):
         return max(big)
     return big[0] if big else numbers[0]
 
@@ -886,7 +1318,7 @@ def _extract_material_cost(text: str) -> Optional[float]:
             keyword_positions.append(idx)
     candidates: list[float] = []
     for idx in keyword_positions:
-        snippet = text[max(0, idx - 20) : idx + 110]
+        snippet = text[max(0, idx - 90) : idx + 110]
         for v in _currency_candidates(snippet):
             if v > 0:
                 candidates.append(float(v))
@@ -932,12 +1364,14 @@ def _extract_payment_value(text: str, label: str, total: Optional[float], fallba
             r"entrada\s*(?:de|foi)?",
             r"deu\s+(?:uma\s+)?entrada\s*(?:de|foi)?",
             r"me\s+deu",
+            r"me\s+pagou",
             r"recebi",
             r"pagou",
         ]
     else:
         prefixes = [
             r"restante\s*(?:de|foi)?",
+            r"resto\s*(?:de|foi)?",
             r"saldo\s*(?:de|foi)?",
             r"vai\s+me\s+pagar",
             r"vou\s+receber",
@@ -972,12 +1406,12 @@ def _extract_date_near(
         cut_points = [norm_forward.find(stop) for stop in stop_keywords if norm_forward.find(stop) != -1]
         if cut_points:
             forward = forward[: min(cut_points)]
-    parsed = _parse_pt_date(forward, reference_date)
+    parsed = _parse_pt_date(forward, reference_date, full_text=text)
     if parsed:
         return parsed
     if stop_keywords:
         return None
-    return _parse_pt_date(segment, reference_date)
+    return _parse_pt_date(segment, reference_date, full_text=text)
 
 
 def _extract_first_date_by_keywords(
@@ -1000,13 +1434,52 @@ def _extract_sale_date(text: str, reference_date: date) -> date:
     if "ontem" in norm:
         return reference_date - timedelta(days=1)
 
-    parsed = _extract_first_date_by_keywords(
+    stop_keywords = (
+        "restante",
+        "saldo",
+        "receber",
+        "material",
+        "fornecedor",
+        "pagou",
+        "metade",
+        "vai me pagar",
+        "vou receber",
+        "entrada",
+        "entrega",
+        "entregar",
+    )
+    explicit_sale = _extract_first_date_by_keywords(
         text,
         reference_date,
-        keywords=("data da venda", "venda", "fechei", "fechou", "vendi"),
-        stop_keywords=("restante", "saldo", "receber", "material", "fornecedor"),
+        keywords=(
+            "data da venda",
+            "data de venda",
+            "vendi em",
+            "vendi dia",
+            "vendi no dia",
+            "fechei em",
+            "fechei dia",
+            "fechei no dia",
+        ),
+        stop_keywords=stop_keywords,
     )
-    return parsed or reference_date
+    if explicit_sale:
+        return explicit_sale
+
+    just_sold_tokens = (
+        "acabei de vender",
+        "acabei de fazer uma venda",
+        "fiz uma venda",
+        "fiz um servico",
+        "vendi ",
+        "vendemos ",
+        "fechei ",
+        "fechamos ",
+    )
+    if any(tok in norm for tok in just_sold_tokens):
+        return reference_date
+
+    return reference_date
 
 
 def _extract_material_supplier(text: str) -> Optional[str]:
@@ -1055,9 +1528,13 @@ def _contains_explicit_date_hint(text: str) -> bool:
     norm = _normalize(text)
     if any(token in norm for token in ("hoje", "amanha", "ontem", "hj")):
         return True
+    if _extract_month_from_text(text):
+        return True
     if re.search(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", norm):
         return True
-    if re.search(r"\bdia\s+\d{1,2}\b", norm):
+    if re.search(r"\b(?:no\s+)?dia\s+\d{1,2}\b", norm):
+        return True
+    if re.search(r"\b\d{1,2}\s+de\s+[a-z]+\b", norm):
         return True
     return False
 
@@ -1096,6 +1573,66 @@ def _contains_future_balance_hint(text: str) -> bool:
         "restante depois",
     )
     return any(token in norm for token in future_tokens)
+
+
+def recalculate_payments_for_total(command) -> bool:
+    """Recalcula o saldo quando o valor total muda (ex.: correção 'valor: 5877,80')."""
+    total = float(getattr(command, "total_value", None) or 0.0)
+    if total <= 0:
+        return False
+    entry_val = 0.0
+    balance_payment = None
+    for payment in getattr(command, "payments", []) or []:
+        label = str(getattr(payment, "label", "") or "").strip().lower()
+        if label == "entrada":
+            entry_val = float(getattr(payment, "value", 0.0) or 0.0)
+        elif label == "saldo":
+            balance_payment = payment
+    if balance_payment is None:
+        return False
+    new_balance = round(max(total - entry_val, 0.0), 2)
+    if abs(float(balance_payment.value or 0.0) - new_balance) < 0.005:
+        return False
+    balance_payment.value = new_balance
+    return True
+
+
+def should_replace_pending_preview(text: str) -> bool:
+    """
+    Detecta quando o usuário enviou uma mensagem completa nova (ex.: outra venda)
+    em vez de uma correção pontual da prévia pendente (ex.: 'cliente: João').
+    """
+    raw = (text or "").strip()
+    if len(raw) < 35:
+        return False
+    norm = _normalize(raw)
+    sale_markers = (
+        "vendi",
+        "vender",
+        "vendemos",
+        "acabei de vender",
+        "fechei",
+        "fechamos",
+        "fiz uma venda",
+        "fiz outra venda",
+        "fiz um servico",
+        "comprou",
+    )
+    if not any(marker in norm for marker in sale_markers):
+        return False
+    detail_markers = (
+        "valor",
+        "pagou",
+        "paguei",
+        "entrada",
+        "metade",
+        "restante",
+        "saldo",
+        "por ",
+        "r$",
+        " mil",
+    )
+    return any(marker in norm for marker in detail_markers)
 
 
 def parse_financial_message(message: str, reference_date: Optional[date] = None) -> ParseResult:
@@ -1176,8 +1713,11 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
     # a entrada deve ser considerada paga na data da venda.
     if "hoje" in norm_text and any(tok in norm_text for tok in ("pagou", "entrada", "metade")):
         entry_date = sale_date
+    if re.search(r"\b(?:me\s+)?pagou\b", norm_text) or re.search(r"\bpaguei\b", norm_text):
+        entry_date = sale_date
     balance_segment = (
         _segment_near(raw_text, "restante")
+        or _segment_near(raw_text, "resto")
         or _segment_near(raw_text, "saldo")
         or _segment_near(raw_text, "vai me pagar")
         or _segment_near(raw_text, "vou receber")
@@ -1211,12 +1751,22 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
         or entry_date
     )
     # Heurística: "amanha" + contexto de saldo/restante => saldo vence amanhã.
-    if ("amanha" in norm_text) and any(tok in norm_text for tok in ("restante", "saldo", "receber", "recebo", "vai me pagar")):
+    if ("amanha" in norm_text) and any(tok in norm_text for tok in ("restante", "resto", "saldo", "receber", "recebo", "vai me pagar", "vamos pagar")):
         balance_date = max(balance_date, reference_date + timedelta(days=1))
 
     balance_future_hint = _contains_future_balance_hint(balance_segment or "") or _contains_future_balance_hint(raw_text)
     if balance_segment and not _contains_explicit_date_hint(balance_segment) and balance_future_hint:
         balance_date = max(balance_date, sale_date + timedelta(days=1))
+
+    # Se o texto menciona um mês (ex.: "junho") mas o trecho do saldo só tem "dia 30",
+    # usar o mês informado em vez do mês atual.
+    msg_month = _extract_month_from_text(raw_text)
+    if msg_month and balance_segment:
+        seg_norm = _normalize(balance_segment)
+        if msg_month and not _extract_month_from_text(balance_segment):
+            day_match = re.search(r"\bdia\s+(\d{1,2})\b", seg_norm)
+            if day_match:
+                balance_date = _build_date(int(day_match.group(1)), msg_month, reference_date)
 
     # Prazo/entrega do serviço (independente de pagamento).
     # Ex.: "entrego dia 20", "prazo dia 20", "finalizar dia 20", "até dia 20".
@@ -1260,17 +1810,24 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
     # assumir que o maior valor é o TOTAL e o menor é a ENTRADA.
     # Isso evita o aviso e calcula corretamente o restante.
     if total_value and entry_value and entry_value > (total_value + 0.01):
-        # Só aplicar quando a mensagem mencionar explicitamente "entrada"
-        # (para não confundir outros fluxos).
-        if "entrada" in norm_text:
-            bigger = float(entry_value)
-            smaller = float(total_value)
-            total_value = bigger
-            entry_value = smaller
-            balance_value = None
-            warnings.append(
-                "Ajuste automático: valor maior interpretado como total e o menor como entrada."
-            )
+        paid_context = ("entrada" in norm_text) or bool(re.search(r"\b(?:me\s+)?pagou\b", norm_text))
+        if paid_context and numbers:
+            candidate_total = max(n for n in numbers if n >= entry_value - 0.01)
+            if candidate_total >= entry_value - 0.01:
+                total_value = candidate_total
+                balance_value = round(max(total_value - entry_value, 0), 2)
+                warnings.append(
+                    "Ajuste automático: total alinhado ao valor da venda (ex.: 10 mil) e saldo recalculado."
+                )
+            elif "entrada" in norm_text:
+                bigger = float(entry_value)
+                smaller = float(total_value)
+                total_value = bigger
+                entry_value = smaller
+                balance_value = None
+                warnings.append(
+                    "Ajuste automático: valor maior interpretado como total e o menor como entrada."
+                )
 
     material_cost = _extract_material_cost(raw_text)
     if material_cost is None:
@@ -1510,22 +2067,21 @@ def detect_intent(message: str) -> str:
             r"adicionar(?:\s+o)?\s+valor\s+de\s+material",
             r"compra\s+de\s+material",
             r"gastar",
+            r"gastei",
             r"gasto",
         ],
         max_gap_words=8,
     )
     material_allocations = _extract_material_allocations(message, date.today())
-    delivery_date = _extract_first_date_by_keywords(
-        message,
-        date.today(),
-        keywords=("data de entrega", "data entrega", "entrega", "entregar"),
-    )
+    delivery_date = _extract_delivery_update_date(message, date.today())
     payment_amount = _extract_amount_after_prefix(
         message,
         prefixes=[r"pagou", r"paguei", r"recebi", r"recebeu", r"entrada"],
         max_gap_words=0,
     )
     # Refund sempre ganha, mesmo que a mensagem tenha outros tokens.
+    if (not sale_creation_context) and sale_id and _is_service_delivery_finalized(message) and not status and not (material_allocations or material_cost):
+        return "delivery_finalize"
     if (not sale_creation_context) and sale_id and delivery_date and not status and not (material_allocations or material_cost):
         return "delivery_update"
     if (not sale_creation_context) and sale_id and (material_allocations or material_cost) and not status:
@@ -1544,7 +2100,7 @@ def detect_intent(message: str) -> str:
 def parse_status_update_message(message: str, reference_date: Optional[date] = None) -> StatusUpdateCommand:
     if reference_date is None:
         reference_date = date.today()
-    sale_id = _extract_sale_id_from_text(message)
+    sale_id = _extract_target_sale_id_for_updates(message) or _extract_sale_id_from_text(message)
     if not sale_id:
         raise ValueError("ID VENDA nao identificado na mensagem.")
     status = _extract_status_value(message)
@@ -1577,18 +2133,122 @@ def parse_refund_message(message: str, reference_date: Optional[date] = None) ->
     return RefundCommand(customer=customer, amount=float(amount or 0.0), reason=reason, ref_date=ref_date)
 
 
+def apply_preview_corrections(
+    message: str,
+    command: FinancialCommand,
+    reference_date: Optional[date] = None,
+) -> bool:
+    """
+    Aplica correções pontuais na prévia (ex.: 'a data será em junho', 'entrega 30/06').
+    Retorna True se algum campo foi atualizado.
+    """
+    if reference_date is None:
+        reference_date = date.today()
+    raw = message.strip()
+    if not raw:
+        return False
+    norm = _normalize(raw)
+    updated = False
+
+    def _apply_delivery_date(parsed: Optional[date]) -> None:
+        nonlocal updated
+        if parsed is None:
+            return
+        command.service_due_date = parsed
+        for payment in command.payments:
+            if str(payment.label).strip().lower() == "saldo":
+                payment.due_date = parsed
+        updated = True
+
+    preferred_day: Optional[int] = None
+    if command.service_due_date:
+        preferred_day = command.service_due_date.day
+    else:
+        for payment in command.payments:
+            if str(payment.label).strip().lower() == "saldo" and payment.due_date:
+                preferred_day = payment.due_date.day
+                break
+
+    date_hint_tokens = (
+        "entrega",
+        "entregar",
+        "prazo",
+        "data de entrega",
+        "data entrega",
+        "data",
+        "venc",
+        "saldo",
+        "restante",
+        "pagamento",
+        "junho",
+        "janeiro",
+        "fevereiro",
+        "marco",
+        "abril",
+        "maio",
+        "julho",
+        "agosto",
+        "setembro",
+        "outubro",
+        "novembro",
+        "dezembro",
+    )
+    has_date_hint = any(tok in norm for tok in date_hint_tokens) or re.search(r"\d{1,2}[/-]\d", raw)
+
+    if has_date_hint:
+        parsed = _parse_pt_date(raw, reference_date, full_text=raw)
+        if parsed is None:
+            parsed = _date_from_month_mention(raw, reference_date, preferred_day=preferred_day)
+        if parsed:
+            if any(tok in norm for tok in ("data da venda", "data de venda", "venda")) and not any(
+                tok in norm for tok in ("entrega", "entregar", "prazo", "saldo", "restante")
+            ):
+                command.sale_date = parsed
+                updated = True
+            else:
+                _apply_delivery_date(parsed)
+
+    if not updated and _extract_month_from_text(raw):
+        parsed = _date_from_month_mention(raw, reference_date, preferred_day=preferred_day)
+        _apply_delivery_date(parsed)
+
+    return updated
+
+
 def parse_message(message: str, reference_date: Optional[date] = None) -> ParseResult:
     financial_result = parse_financial_message(message, reference_date)
     intent = detect_intent(message)
+    if intent == "delivery_finalize":
+        if reference_date is None:
+            reference_date = date.today()
+        target_sale_id = _extract_target_sale_id_for_updates(message) or ""
+        delivery_date = _parse_pt_date(message, reference_date, full_text=message) or reference_date
+        missing: list[str] = []
+        if not target_sale_id:
+            missing.append("ID VENDA")
+        return ParseResult(
+            command=FinancialCommand(
+                customer=_extract_customer(message) or "",
+                description=f"Confirmar entrega da venda {target_sale_id or '-'}",
+                sale_date=reference_date,
+                total_value=0.0,
+                payments=[],
+                sale_id=target_sale_id or None,
+                service_due_date=delivery_date,
+                service_status="finalizado",
+            ),
+            missing_fields=missing,
+            detected_values={
+                "id_venda": target_sale_id or "-",
+                "data_entrega": delivery_date.strftime("%d/%m/%Y"),
+            },
+            intent="delivery_finalize",
+        )
     if intent == "delivery_update":
         if reference_date is None:
             reference_date = date.today()
         target_sale_id = _extract_target_sale_id_for_updates(message) or ""
-        delivery_date = _extract_first_date_by_keywords(
-            message,
-            reference_date,
-            keywords=("data de entrega", "data entrega", "entrega", "entregar", "dia"),
-        ) or _parse_pt_date(message, reference_date)
+        delivery_date = _extract_delivery_update_date(message, reference_date)
         missing: list[str] = []
         if not target_sale_id:
             missing.append("ID VENDA")

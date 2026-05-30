@@ -20,9 +20,11 @@ import requests
 from src.bot_processor import (
     apply_parse_result,
     build_preview,
+    get_default_workbook,
     process_command,
+    sale_id_from_parse_result,
 )
-from src.parser import parse_message
+from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer
 from src.transcription import TranscriptionError, transcribe_audio
 
 # Carregar .env
@@ -71,31 +73,23 @@ def _acquire_single_instance_lock() -> None:
 
     atexit.register(_cleanup)
 
-HELP_TEXT = """Olá! Eu atualizo a planilha com vendas, estornos e status.
+HELP_TEXT = """Olá! Eu sou o assistente da sua planilha.
 
-📝 **Texto ou 🎤 áudio** – tanto faz: você pode *escrever* ou *gravar um áudio*. Eu interpreto do mesmo jeito e mostro uma prévia antes de salvar.
+Pode me mandar *áudio* ou *texto*. Eu entendo a mensagem, mostro uma prévia e só salvo quando você confirmar.
 
-📋 **Resumo da planilha**
-*Resumo* ou *Status* ou *Planilha*
+*Comandos rápidos*
+• *Resumo* - mostra os totais da planilha
+• *Prévia* - mostra vendas, pendências e entregas
+• *Status* - mostra a situação financeira
 
-💰 **Registrar venda** (texto ou áudio)
-Exemplo (igual ao app):
-• Hoje vendi uma placa para a cliente Ana Flores por 3000, ela pagou metade agora e o restante dia 15
+*Exemplos do que você pode falar*
+• Vendi uma placa para o cliente 004 por 1547,27 e ele pagou tudo.
+• Cliente 004 comprou um banner de 3000, deu 500 de entrada e o restante dia 30.
+• ID VENDA 1001 pagou 1547,27 hoje.
+• Gastei 200 de material para ID VENDA 1001.
 
-🔁 **Atualizar venda existente por ID VENDA** (texto ou áudio)
-Exemplo (igual ao app):
-• Depois voce pode falar: ID VENDA 1001, ja pagou tudo, atualiza para pago
-
-🔄 **Estorno**
-Exemplo:
-• Estorno da venda 123
-
-✏️ **Status / Quitação**
-Exemplos:
-• Cliente João pagou o saldo
-• ID VENDA 1001, ja pagou tudo, atualiza para pago
-
-Antes de salvar mostro uma *prévia*. Quer alterar? Envie a correção. Tudo certo? Responda *SIM* ou *OK* para salvar na planilha."""
+Se a prévia estiver correta, responda *SIM* ou *OK*.
+Para corrigir, envie: Valor: 1547,27, Cliente: 004 ou Produto: Fachada."""
 
 # Teclado de menu (botões que aparecem abaixo do campo de digitação)
 MAIN_MENU_KEYBOARD = {
@@ -748,6 +742,7 @@ def run_polling() -> None:
     # (ex.: ele escreve a transcrição mas não repete o id), usamos o último
     # ID Cliente extraído com sucesso para destravar a prévia.
     last_customer_by_chat: dict[int | str, str] = {}
+    last_sale_id_by_chat: dict[int | str, str] = {}
     last_reminder_check = 0.0
 
     while True:
@@ -793,9 +788,10 @@ def run_polling() -> None:
                             from_voice = True
                             send_message(
                                 chat_id,
-                                "🎤 *Interpretação do áudio:*\n\n" + text + "\n\n"
-                                "Abaixo mostro o que será salvo. Confira e responda *SIM* para confirmar "
-                                "ou envie a *correção* por texto.",
+                                "🎤 *Áudio entendido!*\n\n"
+                                f"{text}\n\n"
+                                "Agora vou montar a prévia do lançamento. Confira os campos e responda *SIM* para salvar, "
+                                "ou envie a correção por texto.",
                                 parse_mode="Markdown",
                                 reply_markup=MAIN_MENU_KEYBOARD,
                             )
@@ -896,7 +892,7 @@ def run_polling() -> None:
                     cmd = parse_result.command
                     # Se ainda faltar ID Cliente, não salva: pede o ID e recoloca a prévia pendente.
                     # Para atualização de status e atualização de entrega, nao exigimos cmd.customer.
-                    if parse_result.intent not in ("status_update", "delivery_update", "payment_update"):
+                    if parse_result.intent not in ("status_update", "delivery_update", "delivery_finalize", "payment_update"):
                         if "ID Cliente" in parse_result.missing_fields or not (cmd.customer or "").strip():
                             pending_preview[chat_id] = pending
                             send_message(
@@ -920,12 +916,18 @@ def run_polling() -> None:
                     for p in cmd.payments:
                         if (p.status or "").strip().lower() != "pago":
                             pending_amount += float(p.value or 0.0)
-                    if (cmd.service_due_date is None) and ((cmd.total_value or 0.0) > 0.01) and (pending_amount <= 0.01):
+                    needs_delivery_date = (
+                        parse_result.intent not in ("status_update", "payment_update", "delivery_update", "delivery_finalize")
+                        and cmd.service_due_date is None
+                        and (cmd.total_value or 0.0) > 0.01
+                        and pending_amount <= 0.01
+                    )
+                    if needs_delivery_date:
                         pending_delivery[chat_id] = pending
                         send_message(
                             chat_id,
-                            "Qual a *Data de Entrega* deste serviço? (ex.: 20/03 ou 20/03/2026)\n"
-                            "Responda somente com a data.",
+                            "Qual a *Data de Entrega* deste serviço? (ex.: 20/03, 20/03/2026 ou *hoje*)\n"
+                            "Se já foi entregue, pode responder por exemplo: *foi finalizado hoje*.",
                             parse_mode="Markdown",
                         )
                         continue
@@ -936,7 +938,10 @@ def run_polling() -> None:
                         original_text=original_text,
                         chat_id=str(chat_id),
                     )
-                    send_message(chat_id, reply)
+                    remembered = sale_id_from_parse_result(parse_result)
+                    if remembered:
+                        last_sale_id_by_chat[chat_id] = remembered
+                    send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
                     # Enviar imagem atualizada da aba de vendas para facilitar visualização.
                     workbook_path = os.getenv("WORKBOOK_PATH", "").strip()
                     if not workbook_path:
@@ -964,112 +969,132 @@ def run_polling() -> None:
                 cancel_words = ("não", "nao", "cancelar", "cancela")
                 if text.strip().lower() in cancel_words and chat_id in pending_preview:
                     pending_preview.pop(chat_id, None)
-                    send_message(chat_id, "Cancelado. Pode enviar os dados de novo quando quiser.")
+                    send_message(chat_id, "❌ Cancelado. Pode enviar os dados de novo quando quiser.", reply_markup=MAIN_MENU_KEYBOARD)
                     continue
 
                 # Correção pontual da prévia (Cliente/Produto/Valor) antes de confirmar
                 if chat_id in pending_preview and text.strip():
-                    lower = text.strip().lower()
-                    pending = pending_preview.get(chat_id)
-                    if pending:
-                        parse_result = pending["parse_result"]
-                        cmd = parse_result.command
-                        updated = False
-                        # Atualizar cliente
-                        if lower.startswith("cliente"):
-                            import re
-                            _, _, rest = text.partition(":")
-                            if not rest:
-                                rest = text.split("cliente", 1)[-1]
-                            new_name = rest.strip(" :-")
-                            if new_name:
-                                # Aceita formatos como "cliente id 004" e guarda só o número.
-                                m_id = re.search(r"\d+", new_name)
+                    if should_replace_pending_preview(text):
+                        pending_preview.pop(chat_id, None)
+                    else:
+                        lower = text.strip().lower()
+                        pending = pending_preview.get(chat_id)
+                        if pending:
+                            parse_result = pending["parse_result"]
+                            cmd = parse_result.command
+                            updated = False
+                            # Atualizar cliente
+                            if lower.startswith("cliente"):
+                                import re
+                                _, _, rest = text.partition(":")
+                                if not rest:
+                                    rest = text.split("cliente", 1)[-1]
+                                new_name = rest.strip(" :-")
+                                if new_name:
+                                    # Aceita formatos como "cliente id 004" e guarda só o número.
+                                    m_id = re.search(r"\d+", new_name)
+                                    if m_id:
+                                        digits = m_id.group(0)
+                                        digits = digits.zfill(3) if len(digits) <= 3 else digits
+                                        cmd.customer = digits
+                                    else:
+                                        cmd.customer = new_name
+                                    updated = True
+                            # Atualizar ID VENDA
+                            if not updated and ("id venda" in lower or lower.startswith("venda")):
+                                import re
+                                m_id = re.search(r"\d+", text)
                                 if m_id:
                                     digits = m_id.group(0)
                                     digits = digits.zfill(3) if len(digits) <= 3 else digits
-                                    cmd.customer = digits
-                                else:
-                                    cmd.customer = new_name
-                                updated = True
-                        # Atualizar ID VENDA
-                        if not updated and ("id venda" in lower or lower.startswith("venda")):
-                            import re
-                            m_id = re.search(r"\d+", text)
-                            if m_id:
-                                digits = m_id.group(0)
-                                digits = digits.zfill(3) if len(digits) <= 3 else digits
-                                cmd.sale_id = digits
-                                updated = True
-                        # Atualizar produto
-                        if not updated and ("produto" in lower):
-                            _, _, rest = text.partition(":")
-                            if not rest:
-                                rest = text.split("produto", 1)[-1]
-                            new_prod = rest.strip(" :-")
-                            if new_prod:
-                                cmd.product_id = new_prod
-                                parse_result.command.description = new_prod
-                                updated = True
-                        # Atualizar valor total
-                        if not updated and ("valor" in lower):
-                            import re
-
-                            m = re.search(r"(\\d{1,3}(?:[\\.\\s]\\d{3})*(?:,\\d{1,2})?|\\d+(?:,\\d{1,2})?)", text)
-                            if m:
-                                raw = m.group(1)
-                                raw_norm = raw.replace(".", "").replace(" ", "").replace(",", ".")
-                                try:
-                                    new_total = float(raw_norm)
-                                    cmd.total_value = new_total
+                                    cmd.sale_id = digits
                                     updated = True
-                                except Exception:
-                                    pass
-                        if updated:
-                            # Se o usuário forneceu o ID Cliente, remover da lista de missing.
-                            if (cmd.customer or "").strip() and "ID Cliente" in parse_result.missing_fields:
-                                parse_result.missing_fields = [
-                                    f for f in parse_result.missing_fields if f != "ID Cliente"
-                                ]
-                            # Se o usuário forneceu o ID VENDA, remover da lista de missing.
-                            if getattr(cmd, "sale_id", None) and "ID VENDA" in parse_result.missing_fields:
-                                parse_result.missing_fields = [
-                                    f for f in parse_result.missing_fields if f != "ID VENDA"
-                                ]
-                            pending["parse_result"] = parse_result
-                            preview_text = build_preview(parse_result)
-                            send_message(chat_id, preview_text, parse_mode="Markdown")
-                            continue
+                            # Atualizar produto
+                            if not updated and ("produto" in lower):
+                                _, _, rest = text.partition(":")
+                                if not rest:
+                                    rest = text.split("produto", 1)[-1]
+                                new_prod = rest.strip(" :-")
+                                if new_prod:
+                                    cmd.product_id = new_prod
+                                    parse_result.command.description = new_prod
+                                    updated = True
+                            # Atualizar valor total
+                            if not updated and ("valor" in lower):
+                                _, _, rest = text.partition(":")
+                                value_text = (rest or text).strip()
+                                parsed_value = parse_money_value(value_text)
+                                if parsed_value is None:
+                                    parsed_value = _extract_total_value(text, _currency_candidates(text))
+                                if parsed_value is not None and parsed_value > 0:
+                                    cmd.total_value = parsed_value
+                                    recalculate_payments_for_total(cmd)
+                                    updated = True
+                            if not updated:
+                                from src.parser import apply_preview_corrections
+                                updated = apply_preview_corrections(text, cmd)
+                            if updated:
+                                # Se pagamento mudou na mensagem, recalcular entrada/saldo.
+                                if any(tok in lower for tok in ("pagou", "paguei", "entrada", "metade", "restante", "saldo")):
+                                    fresh = parse_message(text, reference_date=date.today())
+                                    if fresh.intent == parse_result.intent and not fresh.missing_fields:
+                                        pending["parse_result"] = fresh
+                                        pending["original_text"] = text
+                                        parse_result = fresh
+                                # Se o usuário forneceu o ID Cliente, remover da lista de missing.
+                                if (cmd.customer or "").strip() and "ID Cliente" in parse_result.missing_fields:
+                                    parse_result.missing_fields = [
+                                        f for f in parse_result.missing_fields if f != "ID Cliente"
+                                    ]
+                                # Se o usuário forneceu o ID VENDA, remover da lista de missing.
+                                if getattr(cmd, "sale_id", None) and "ID VENDA" in parse_result.missing_fields:
+                                    parse_result.missing_fields = [
+                                        f for f in parse_result.missing_fields if f != "ID VENDA"
+                                    ]
+                                pending["parse_result"] = parse_result
+                                preview_text = build_preview(parse_result)
+                                send_message(chat_id, preview_text, parse_mode="Markdown")
+                                continue
 
                 # Resposta de data de entrega pendente
                 if chat_id in pending_delivery:
                     try:
-                        from datetime import datetime
                         pending = pending_delivery.get(chat_id)
                         if not pending:
                             continue
                         raw = text.strip()
-                        parsed = None
-                        for fmt in ("%d/%m/%Y", "%d/%m/%y", "%d/%m"):
-                            try:
-                                dt = datetime.strptime(raw, fmt)
-                                if fmt == "%d/%m":
-                                    dt = dt.replace(year=date.today().year)
-                                parsed = dt.date()
-                                break
-                            except Exception:
-                                continue
+                        parsed = _parse_pt_date(raw, date.today(), full_text=raw)
+                        if parsed is None:
+                            from datetime import datetime
+                            for fmt in ("%d/%m/%Y", "%d/%m/%y", "%d/%m"):
+                                try:
+                                    dt = datetime.strptime(raw, fmt)
+                                    if fmt == "%d/%m":
+                                        dt = dt.replace(year=date.today().year)
+                                    parsed = dt.date()
+                                    break
+                                except Exception:
+                                    continue
                         if parsed is None:
                             raise ValueError("Data inválida.")
                         parse_result = pending["parse_result"]
                         parse_result.command.service_due_date = parsed
+                        if _is_service_delivery_finalized(raw):
+                            parse_result.command.service_status = "finalizado"
                         reply = apply_parse_result(
                             parse_result,
                             origin=pending.get("origin", "telegram"),
                             original_text=pending.get("original_text", ""),
                             chat_id=str(chat_id),
                         )
-                        send_message(chat_id, reply)
+                        if _is_service_delivery_finalized(raw):
+                            sale_id = getattr(parse_result.command, "sale_id", None)
+                            if sale_id:
+                                workbook_path = get_default_workbook()
+                                if workbook_path:
+                                    from src.excel_store import SpreadsheetService
+                                    SpreadsheetService(workbook_path).finalize_service(str(sale_id))
+                        send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
                         pending_delivery.pop(chat_id, None)
                         continue
                     except Exception:
@@ -1087,7 +1112,7 @@ def run_polling() -> None:
                                 chat_id,
                                 "Não entendi a data, então vou salvar sem Data de Entrega.",
                             )
-                            send_message(chat_id, reply)
+                            send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
                         continue
 
                 # Atualizar status baseado em ID do cliente (ex.: "Cliente ID 002 pagou")
@@ -1133,10 +1158,7 @@ def run_polling() -> None:
                                 if cid not in normalized_ids:
                                     normalized_ids.append(cid)
 
-                            workbook_path = os.getenv("WORKBOOK_PATH", "").strip()
-                            if not workbook_path:
-                                from src.workbook_paths import default_workbook_path
-                                workbook_path = default_workbook_path([Path.cwd(), Path.cwd().parent])
+                            workbook_path = get_default_workbook()
 
                             if workbook_path and Path(workbook_path).exists():
                                 from src.excel_store import SpreadsheetService
@@ -1220,7 +1242,7 @@ def run_polling() -> None:
                 if any(cmd_strip.startswith(kw) for kw in short_cmd_keywords):
                     pending_preview.pop(chat_id, None)
                     reply = process_command(text, origin="telegram")
-                    send_message(chat_id, reply)
+                    send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
                     # Para Status/Resumo/Planilha/Prévia, também envia uma imagem (facilita visualização).
                     if cmd_strip.startswith(("status", "resumo", "planilha", "prévia", "previa")):
                         workbook_path = os.getenv("WORKBOOK_PATH", "").strip()
@@ -1251,22 +1273,51 @@ def run_polling() -> None:
                     continue
 
                 # Interpretar mensagem: se tiver dados completos, mostrar prévia; senão, pedir o que falta
-                parse_result = parse_message(text, reference_date=date.today())
+                parse_text = enrich_with_last_sale_context(text, last_sale_id_by_chat.get(chat_id))
+                if parse_text != text:
+                    print(f"[Telegram] Contexto: último ID VENDA {last_sale_id_by_chat.get(chat_id)} aplicado no chat {chat_id}")
+                parse_result = parse_message(parse_text, reference_date=date.today())
 
                 # Atualiza cache quando conseguir extrair cliente.
                 parsed_customer = (getattr(parse_result.command, "customer", "") or "").strip()
+                explicit_customer = (_extract_customer(text) or _extract_customer(parse_text) or "").strip()
+                if explicit_customer:
+                    parse_result.command.customer = explicit_customer
+                    parse_result.missing_fields = [
+                        f for f in parse_result.missing_fields if f != "ID Cliente"
+                    ]
+                    parsed_customer = explicit_customer
                 if parsed_customer and parsed_customer != "-":
                     last_customer_by_chat[chat_id] = parsed_customer
 
                 # Fallback: se faltou somente "ID Cliente", tente preencher com o último conhecido.
                 if "ID Cliente" in parse_result.missing_fields:
-                    cached_customer = last_customer_by_chat.get(chat_id)
+                    cached_customer = None if should_replace_pending_preview(text) else last_customer_by_chat.get(chat_id)
                     if cached_customer:
                         parse_result.command.customer = cached_customer
                         parse_result.missing_fields = [
                             f for f in parse_result.missing_fields if f != "ID Cliente"
                         ]
                         print(f"[Telegram] Fallback de 'ID Cliente' usado no chat {chat_id}: {cached_customer}")
+
+                # Fallback: atualização de entrega/status logo após outra ação ("para ele", "entrega hoje").
+                if "ID VENDA" in parse_result.missing_fields and parse_result.intent in (
+                    "status_update",
+                    "delivery_update",
+                    "delivery_finalize",
+                    "payment_update",
+                ):
+                    cached_sale_id = last_sale_id_by_chat.get(chat_id)
+                    if cached_sale_id:
+                        cmd.sale_id = cached_sale_id
+                        parse_result.missing_fields = [
+                            f for f in parse_result.missing_fields if f != "ID VENDA"
+                        ]
+                        print(f"[Telegram] Fallback de 'ID VENDA' usado no chat {chat_id}: {cached_sale_id}")
+
+                remembered_sale = sale_id_from_parse_result(parse_result)
+                if remembered_sale:
+                    last_sale_id_by_chat[chat_id] = remembered_sale
 
                 # Inferencia: quando for gasto de material e faltar "ID VENDA",
                 # tente localizar a venda pendente pelo "ID Cliente" informado.
@@ -1329,6 +1380,7 @@ def run_polling() -> None:
                         "refund",
                         "status_update",
                         "delivery_update",
+                        "delivery_finalize",
                         "material_update",
                     ):
                         preview_text = build_preview(parse_result)
@@ -1352,6 +1404,7 @@ def run_polling() -> None:
                         "refund",
                         "status_update",
                         "delivery_update",
+                        "delivery_finalize",
                         "material_update",
                     ):
                         preview_text = build_preview(parse_result)
@@ -1390,6 +1443,7 @@ def run_polling() -> None:
                     "refund",
                     "status_update",
                     "delivery_update",
+                    "delivery_finalize",
                     "material_update",
                 ):
                     preview_text = build_preview(parse_result)
@@ -1399,14 +1453,17 @@ def run_polling() -> None:
                         "original_text": text,
                         "origin": "audio" if from_voice else "telegram",
                     }
+                    remembered = sale_id_from_parse_result(parse_result)
+                    if remembered:
+                        last_sale_id_by_chat[chat_id] = remembered
                     continue
 
                 # Outros casos (ex.: só texto que não é venda/estorno): processar direto
                 reply = process_command(text, origin="telegram")
-                send_message(chat_id, reply)
+                send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
             except Exception as e:
-                reply = f"Erro: {e}"
-                send_message(chat_id, reply)
+                reply = f"⚠️ Não consegui processar essa mensagem: {e}"
+                send_message(chat_id, reply, reply_markup=MAIN_MENU_KEYBOARD)
                 print(f"[Telegram] Erro ao processar: {e}")
 
         if not updates:
@@ -1494,6 +1551,7 @@ def _run_local_test(args: argparse.Namespace) -> None:
         "refund",
         "status_update",
         "delivery_update",
+        "delivery_finalize",
         "material_update",
     ):
         preview_text = build_preview(parse_result)

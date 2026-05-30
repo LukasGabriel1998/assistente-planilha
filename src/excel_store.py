@@ -4,12 +4,13 @@ from copy import copy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import os
 import re
 import unicodedata
 import zipfile
 
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.styles import PatternFill
 
 from .models import FinancialCommand, RefundCommand, StatusUpdateCommand
@@ -28,6 +29,10 @@ SALES_HEADER_ROW = 2
 TEMPLATE_ROW = 3
 ANCHOR_TEMPLATE_ROW = 1048576
 DATA_START_ROW = 3
+# Coluna J: caixas de totais (rótulos + fórmulas). O robô nunca deve escrever nem copiar estilo daqui.
+SALES_SUMMARY_COL = "J"
+# Última coluna da tabela de vendas (cabeçalhos na linha 2). Evita tratar J2 (fórmula) como cabeçalho.
+SALES_TABLE_LAST_COL = "I"
 SALES_REQUIRED_HEADERS = {
     # A aba TOTAL DE VENDAS DE 2026 agora usa explicitamente:
     # Coluna A: Data de venda
@@ -150,10 +155,15 @@ class SpreadsheetService:
         empty_cols: tuple[str, ...],
         *,
         start_row: int = DATA_START_ROW,
+        skip_rows: set[int] | frozenset[int] | None = None,
     ) -> int:
         row = start_row
         max_row = min(ws.max_row, SpreadsheetService.MAX_DATA_ROW)
+        blocked = skip_rows or frozenset()
         while row <= max_row:
+            if row in blocked:
+                row += 1
+                continue
             if all(ws[f"{col}{row}"].value in (None, "") for col in empty_cols):
                 return row
             row += 1
@@ -175,8 +185,84 @@ class SpreadsheetService:
         ws[f"{col}{row}"].number_format = "DD/MM/YYYY"
 
     @staticmethod
+    def _preserve_user_layout() -> bool:
+        """
+        Quando ativo (padrão), evita normalizar/reformatar a planilha inteira e não mexe na coluna J.
+        Não impede copiar o padrão da linha 1048576 nem as cores de entrega/status.
+        """
+        val = os.getenv("SPREADSHEET_PRESERVE_LAYOUT", "1").strip().lower()
+        return val not in ("0", "false", "no", "off")
+
+    @classmethod
+    def _apply_anchor_row_style(
+        cls,
+        wb,
+        ws,
+        row: int,
+        logical_sheet_name: str,
+        cols: tuple[str, ...],
+    ) -> tuple:
+        """Replica o padrão visual da linha 1048576 (ou template oculto) na linha alvo."""
+        anchor = cls._anchor_template_row_for(logical_sheet_name)
+        if anchor and (
+            cls._row_has_padrao(ws, anchor, cols)
+            or cls._row_has_values(ws, anchor, cols)
+            or cls._row_has_any_border(ws, anchor, cols)
+        ):
+            cls._copy_row_style_between(ws, anchor, ws, row, cols, apply_row_dimensions=False)
+            return ws, anchor
+        template_ws, template_row = cls._template_source(wb, ws, logical_sheet_name, cols)
+        if not (template_ws is ws and template_row == row):
+            cls._copy_row_style_between(
+                template_ws, template_row, ws, row, cols, apply_row_dimensions=False
+            )
+        return template_ws, template_row
+
+    @classmethod
+    def _is_service_delivered(cls, ws, sales_cols: dict[str, str], row: int) -> bool:
+        legacy_status_col = sales_cols.get("status")
+        if not legacy_status_col:
+            return False
+        status_txt = cls._normalize_name(str(ws[f"{legacy_status_col}{row}"].value or ""))
+        return status_txt == "finalizado"
+
+    @classmethod
+    def _apply_sales_row_visual_status(
+        cls,
+        ws,
+        sales_cols: dict[str, str],
+        row: int,
+        *,
+        pending_amount: float = 0.0,
+        service_delivered: bool | None = None,
+    ) -> None:
+        """
+        Aplica cores conforme o padrão da planilha:
+        - Status de valor (H): amarelo se pendente, verde se pago.
+        - Data de Entrega (B): amarelo até entregar, verde quando entregue.
+        """
+        if service_delivered is None:
+            service_delivered = cls._is_service_delivered(ws, sales_cols, row)
+
+        status_col = sales_cols.get("status de valor")
+        if status_col:
+            ws[f"{status_col}{row}"].fill = (
+                FILL_PENDING if abs(float(pending_amount or 0.0)) > 0.01 else FILL_DONE
+            )
+
+        delivery_col = sales_cols.get("data de entrega")
+        if delivery_col:
+            ws[f"{delivery_col}{row}"].fill = FILL_DONE if service_delivered else FILL_PENDING
+
+    @classmethod
+    def _maybe_set_cell_fill(cls, cell, fill) -> None:
+        cell.fill = fill
+
+    @staticmethod
     def _ensure_number_format_if_general(ws, col: str, row: int, fmt: str) -> None:
         """Só aplica formato se a célula estiver em General; não sobrescreve formatação da planilha."""
+        if SpreadsheetService._preserve_user_layout():
+            return
         cell = ws[f"{col}{row}"]
         current = str(getattr(cell, "number_format", None) or "General").strip()
         if not current or current == "General":
@@ -189,18 +275,46 @@ class SpreadsheetService:
         return str(value)
 
     @classmethod
-    def _header_map(cls, ws, header_row: int = SALES_HEADER_ROW) -> dict[str, str]:
+    def _header_map(
+        cls,
+        ws,
+        header_row: int = SALES_HEADER_ROW,
+        *,
+        max_col: str | None = None,
+    ) -> dict[str, str]:
         headers: dict[str, str] = {}
-        for col_idx in range(1, ws.max_column + 1):
+        last_col_idx = ws.max_column
+        if max_col:
+            last_col_idx = min(last_col_idx, column_index_from_string(max_col))
+        for col_idx in range(1, last_col_idx + 1):
             value = ws.cell(row=header_row, column=col_idx).value
             if value in (None, ""):
                 continue
-            headers[cls._normalize_name(str(value))] = get_column_letter(col_idx)
+            if not isinstance(value, str):
+                continue
+            headers[cls._normalize_name(value)] = get_column_letter(col_idx)
         return headers
+
+    @staticmethod
+    def _cell_has_content(value) -> bool:
+        return value not in (None, "")
+
+    @classmethod
+    def _sales_summary_rows(cls, ws, *, scan_limit: int = 40) -> set[int]:
+        """Linhas reservadas pelos blocos de totais na coluna J (rótulos e fórmulas SUM)."""
+        rows: set[int] = set()
+        for row in range(1, min(ws.max_row, scan_limit) + 1):
+            if cls._cell_has_content(ws[f"{SALES_SUMMARY_COL}{row}"].value):
+                rows.add(row)
+        return rows
+
+    @classmethod
+    def _is_sales_summary_row(cls, ws, row: int) -> bool:
+        return cls._cell_has_content(ws[f"{SALES_SUMMARY_COL}{row}"].value)
 
     @classmethod
     def _sales_columns(cls, ws) -> dict[str, str]:
-        headers = cls._header_map(ws, header_row=SALES_HEADER_ROW)
+        headers = cls._header_map(ws, header_row=SALES_HEADER_ROW, max_col=SALES_TABLE_LAST_COL)
         # Compatibilidade: algumas versões antigas da planilha usavam "Data".
         # Se existir "Data de venda", tratamos como a data principal.
         if "data" not in headers and "data de venda" in headers:
@@ -539,6 +653,8 @@ class SpreadsheetService:
     @classmethod
     def _save_padrao_row3_to_template(cls, wb, ws, logical_sheet_name: str) -> None:
         """Salva o padrão da linha 3 no template. Se a linha 1048576 já for o padrão (tem formatação ou dados), não sobrescreve."""
+        if cls._preserve_user_layout():
+            return
         # Para abas com linha-âncora (1048576), não usar linha 3 como fonte.
         if cls._anchor_template_row_for(logical_sheet_name) is not None:
             return
@@ -557,15 +673,15 @@ class SpreadsheetService:
         todas as linhas que o robô preencher seguem esse padrão. A linha 1048576 não é apagada."""
         if cls._anchor_template_row_for(logical_sheet_name) is None:
             return None
-        all_cols = cls._sheet_style_cols(ws)
-        # Usar 1048576 se tiver formatação OU qualquer valor em qualquer coluna (ex.: exemplo do usuário)
         tem_padrao = cls._row_has_padrao(ws, ANCHOR_TEMPLATE_ROW, cols)
-        tem_valor = cls._row_has_values(ws, ANCHOR_TEMPLATE_ROW, all_cols)
+        tem_valor = cls._row_has_values(ws, ANCHOR_TEMPLATE_ROW, cols)
         if not tem_padrao and not tem_valor:
             return None
+        if cls._preserve_user_layout():
+            return ws, ANCHOR_TEMPLATE_ROW
         template_ws = cls._ensure_template_sheet(wb, logical_sheet_name)
-        cls._copy_row_style_between(ws, ANCHOR_TEMPLATE_ROW, template_ws, TEMPLATE_ROW, all_cols)
-        cls._clear_row_values(template_ws, TEMPLATE_ROW, all_cols)
+        cls._copy_row_style_between(ws, ANCHOR_TEMPLATE_ROW, template_ws, TEMPLATE_ROW, cols)
+        cls._clear_row_values(template_ws, TEMPLATE_ROW, cols)
         return template_ws, TEMPLATE_ROW
 
     @staticmethod
@@ -624,24 +740,34 @@ class SpreadsheetService:
         return True
 
     @staticmethod
-    def _copy_sheet_layout(source_ws, target_ws, row_limit: int = 12, style_cols: tuple[str, ...] | None = None) -> None:
+    def _copy_sheet_layout(
+        source_ws,
+        target_ws,
+        row_limit: int = 12,
+        style_cols: tuple[str, ...] | None = None,
+        *,
+        layout_cols: tuple[str, ...] | None = None,
+    ) -> None:
         max_col = source_ws.max_column
         all_cols = tuple(get_column_letter(col_idx) for col_idx in range(1, max_col + 1))
         cols_to_check = style_cols or all_cols
+        copy_cols = layout_cols or style_cols or all_cols
+        copy_col_idx = {column_index_from_string(col) for col in copy_cols}
         for merged in list(target_ws.merged_cells.ranges):
             target_ws.unmerge_cells(str(merged))
         for row in range(1, min(source_ws.max_row, row_limit) + 1):
             # Linhas de dados vazias e sem formato: não sobrescrever o template (mantém padrão da planilha)
             if row >= DATA_START_ROW and SpreadsheetService._row_empty_and_no_style(source_ws, row, cols_to_check):
                 continue
-            SpreadsheetService._copy_row_style_between(source_ws, row, target_ws, row, all_cols)
-            for col_idx in range(1, max_col + 1):
+            SpreadsheetService._copy_row_style_between(source_ws, row, target_ws, row, copy_cols)
+            for col_idx in copy_col_idx:
                 source = source_ws.cell(row=row, column=col_idx)
                 target = target_ws.cell(row=row, column=col_idx)
                 target.value = source.value
         for merged in source_ws.merged_cells.ranges:
-            target_ws.merge_cells(str(merged))
-        for col_idx in range(1, max_col + 1):
+            if merged.min_col in copy_col_idx and merged.max_col in copy_col_idx:
+                target_ws.merge_cells(str(merged))
+        for col_idx in copy_col_idx:
             col = get_column_letter(col_idx)
             source_dim = source_ws.column_dimensions[col]
             target_dim = target_ws.column_dimensions[col]
@@ -688,23 +814,43 @@ class SpreadsheetService:
 
     @classmethod
     def _sync_template_store(cls, wb, source_ws, logical_sheet_name: str, source_row: int = TEMPLATE_ROW) -> None:
+        if cls._preserve_user_layout():
+            return
         template_ws = cls._ensure_template_sheet(wb, logical_sheet_name)
         style_cols = cls._layout_cols_for_sheet(source_ws, logical_sheet_name)
-        cls._copy_sheet_layout(source_ws, template_ws, row_limit=12, style_cols=style_cols)
-        all_cols = cls._sheet_style_cols(source_ws)
+        cls._copy_sheet_layout(
+            source_ws, template_ws, row_limit=12, style_cols=style_cols, layout_cols=style_cols
+        )
         if source_row != TEMPLATE_ROW:
-            cls._copy_row_style_between(source_ws, source_row, template_ws, TEMPLATE_ROW, all_cols)
+            cls._copy_row_style_between(source_ws, source_row, template_ws, TEMPLATE_ROW, style_cols)
         # Hidden template sheets should keep only layout/style, never previous business data.
         for row in range(DATA_START_ROW, min(template_ws.max_row, 12) + 1):
-            cls._clear_row_values(template_ws, row, all_cols)
+            cls._clear_row_values(template_ws, row, style_cols)
         # Guardar o padrão também na última linha da planilha (só estilo, sem valores), como referência permanente.
         # O robô nunca escreve dados lá; usa só para copiar o padrão e não sobrescrever fora dele.
-        if source_row == TEMPLATE_ROW and cls._anchor_template_row_for(logical_sheet_name) is not None:
+        if (
+            not cls._preserve_user_layout()
+            and source_row == TEMPLATE_ROW
+            and cls._anchor_template_row_for(logical_sheet_name) is not None
+        ):
             cls._copy_row_style_between(source_ws, TEMPLATE_ROW, source_ws, ANCHOR_TEMPLATE_ROW, style_cols)
             cls._clear_row_values(source_ws, ANCHOR_TEMPLATE_ROW, style_cols)
 
     @classmethod
     def _template_source(cls, wb, ws, logical_sheet_name: str, cols: tuple[str, ...]):
+        anchored_sheet = cls._anchor_template_row_for(logical_sheet_name) is not None
+        anchor_row = cls._anchor_template_row_for(logical_sheet_name)
+
+        if cls._preserve_user_layout():
+            result = cls._load_padrao_from_anchor_row(wb, ws, logical_sheet_name, cols)
+            if result is not None:
+                return result
+            if anchored_sheet and anchor_row:
+                return ws, anchor_row
+            if cls._row_3_has_padrao(ws, cols):
+                return ws, TEMPLATE_ROW
+            return ws, TEMPLATE_ROW
+
         template_ws = cls._ensure_template_sheet(wb, logical_sheet_name)
         anchored_sheet = cls._anchor_template_row_for(logical_sheet_name) is not None
         # Importante: em abas "ancoradas", o padrão é a linha 1048576.
@@ -753,10 +899,7 @@ class SpreadsheetService:
     @classmethod
     def _copy_sales_row_style_from_template(cls, wb, ws_sales, row: int) -> None:
         cols = cls._sales_style_cols(ws_sales)
-        template_ws, template_row = cls._template_source(wb, ws_sales, SHEET_SALES, cols)
-        cls._copy_row_style_between(
-            template_ws, template_row, ws_sales, row, cols, apply_row_dimensions=False
-        )
+        cls._apply_anchor_row_style(wb, ws_sales, row, SHEET_SALES, cols)
 
     @classmethod
     def _prepare_row_from_template(
@@ -770,26 +913,8 @@ class SpreadsheetService:
         search_limit: int = 50,
     ):
         if cls._row_has_values(ws, row, cols):
-            return ws, row
-        # Se a linha já está formatada (ex.: bordas já desenhadas pelo usuário),
-        # não copiar estilo do template para não sobrescrever o layout.
-        if cls._row_has_any_border(ws, row, cols):
-            return ws, row
-
-        # Sempre usar o padrão salvo no template (linha 3) quando existir; não usar outras linhas visíveis que podem ter formato errado
-        template_ws, template_row = cls._template_source(wb, ws, logical_sheet_name, cols)
-        if template_ws is ws and template_row != ANCHOR_TEMPLATE_ROW:
-            template_row = cls._append_template_row(ws, row, cols, start_row=start_row, search_limit=search_limit)
-        if not (template_ws is ws and template_row == row):
-            cls._copy_row_style_between(
-                template_ws,
-                template_row,
-                ws,
-                row,
-                cols,
-                apply_row_dimensions=cls._should_copy_row_dimensions_for_target(ws, logical_sheet_name),
-            )
-        return template_ws, template_row
+            return cls._template_source(wb, ws, logical_sheet_name, cols)
+        return cls._apply_anchor_row_style(wb, ws, row, logical_sheet_name, cols)
 
     @classmethod
     def _normalize_sheet_layout(
@@ -800,10 +925,17 @@ class SpreadsheetService:
         *,
         row_limit: int,
     ) -> None:
+        if cls._preserve_user_layout():
+            return
         style_cols = cls._layout_cols_for_sheet(ws, logical_sheet_name)
         template_ws, template_row = cls._template_source(wb, ws, logical_sheet_name, style_cols)
         effective_limit = cls._effective_layout_row_limit(ws, logical_sheet_name, style_cols, minimum_rows=row_limit)
+        summary_rows: set[int] = set()
+        if cls._normalize_name(logical_sheet_name) == cls._normalize_name(SHEET_SALES):
+            summary_rows = cls._sales_summary_rows(ws)
         for row in range(TEMPLATE_ROW, effective_limit + 1):
+            if row in summary_rows:
+                continue
             if template_ws is ws and template_row == row:
                 continue
             if cls._row_has_values(ws, row, style_cols):
@@ -1113,8 +1245,9 @@ class SpreadsheetService:
         _set("Atualizado em", now)
 
         fill = FILL_DONE if self._normalize_name(service_status) == "finalizado" else FILL_PENDING
-        for col in range(1, ws.max_column + 1):
-            ws.cell(row=target_row, column=col).fill = fill
+        if not self._preserve_user_layout():
+            for col in range(1, ws.max_column + 1):
+                ws.cell(row=target_row, column=col).fill = fill
 
     def list_due_reminders(self, wb, today) -> list[dict]:
         """
@@ -1201,8 +1334,9 @@ class SpreadsheetService:
             ws.cell(row=row, column=col_status).value = "FINALIZADO"
             if col_updated:
                 ws.cell(row=row, column=col_updated).value = datetime.now()
-            for col in range(1, ws.max_column + 1):
-                ws.cell(row=row, column=col).fill = FILL_DONE
+            if not self._preserve_user_layout():
+                for col in range(1, ws.max_column + 1):
+                    ws.cell(row=row, column=col).fill = FILL_DONE
             return True
         return False
 
@@ -1224,7 +1358,11 @@ class SpreadsheetService:
             for row in range(DATA_START_ROW, min(ws_sales.max_row + 1, self.MAX_DATA_ROW)):
                 if str(ws_sales[f"{col_sale_id}{row}"].value or "").strip() != str(sale_id).strip():
                     continue
-                ws_sales[f"{col_delivery}{row}"].fill = FILL_DONE
+                pending_col = sales_cols["valor (pendente)"]
+                current_pending = self._to_float(ws_sales[f"{pending_col}{row}"].value)
+                self._apply_sales_row_visual_status(
+                    ws_sales, sales_cols, row, pending_amount=current_pending, service_delivered=True
+                )
                 changed = True
                 break
 
@@ -1261,31 +1399,24 @@ class SpreadsheetService:
         }
 
     def _append_sale(self, wb, ws, cmd: FinancialCommand) -> tuple[int, str, float]:
-        """Adiciona uma linha de venda em qualquer linha. Copia estilo da planilha (negrito, cores, formato); só preenche valores."""
+        """Adiciona uma linha de venda. Só preenche valores; layout (fonte, cor, borda) fica como na planilha."""
         sales_cols = self._sales_columns(ws)
         style_cols = self._sales_style_cols(ws)
+        sale_empty_cols = (
+            sales_cols["id produto"],
+            sales_cols["total de vendas (pago)"],
+            sales_cols["valor (pendente)"],
+            sales_cols["id venda"],
+        )
         row = self._next_row_for_empty_cols(
             ws,
-            (
-                sales_cols["id produto"],
-                sales_cols["total de vendas (pago)"],
-                sales_cols["valor (pendente)"],
-                sales_cols["id venda"],
-            ),
+            sale_empty_cols,
             start_row=DATA_START_ROW,
+            skip_rows=self._sales_summary_rows(ws),
         )
-        template_ws, template_row = self._prepare_row_from_template(
-            wb,
-            ws,
-            row,
-            SHEET_SALES,
-            style_cols,
-            start_row=TEMPLATE_ROW,
+        template_ws, template_row = self._apply_anchor_row_style(
+            wb, ws, row, SHEET_SALES, style_cols
         )
-        # Não sobrescrever bordas/estilo que já existam na linha (muitos usuários formatam a tabela inteira).
-        # Só aplica o template quando a linha estiver realmente sem estilo.
-        if not self._row_has_any_style(ws, row, style_cols):
-            self._copy_sales_row_style_from_template(wb, ws, row)
 
         paid_amount = round(sum(p.value for p in cmd.payments if p.status == "pago"), 2)
         pending_amount = round(sum(p.value for p in cmd.payments if p.status != "pago"), 2)
@@ -1312,20 +1443,6 @@ class SpreadsheetService:
 
         if delivery_date:
             ws[f"{sales_cols['data de entrega']}{row}"] = self._excel_date_value(delivery_date)
-            delivery_cell = ws[f"{sales_cols['data de entrega']}{row}"]
-            ref_date = datetime.now().date()
-            due_date = delivery_date
-            # Cor segue regra:
-            # - Se pagou (sem pendente), verde.
-            # - Se ainda há pendente e a entrega é futura, amarelo.
-            # - Se pendente e entrega nao é futura, mantem o preenchimento-base do template.
-            if abs(float(pending_amount or 0.0)) < 0.01:
-                delivery_cell.fill = FILL_DONE
-            elif due_date and due_date > ref_date:
-                delivery_cell.fill = FILL_PENDING
-        else:
-            # Se não houver prazo, limpa cor para manter o estilo original da planilha.
-            ws[f"{sales_cols['data de entrega']}{row}"].fill = copy(template_ws[f"{sales_cols['data de entrega']}{template_row}"].fill)
         ws[f"{sales_cols['id cliente']}{row}"] = cmd.customer
         ws[f"{sales_cols['id produto']}{row}"] = cmd.product_id or cmd.description
         ws[f"{sales_cols['total de vendas (pago)']}{row}"] = float(paid_amount)
@@ -1333,9 +1450,14 @@ class SpreadsheetService:
         ws[f"{sales_cols['id venda']}{row}"] = sale_id
         ws[f"{sales_cols['status de valor']}{row}"] = value_status_display
 
-        # Garantir formato data/moeda quando a célula estiver em General (não sobrescreve formatação da planilha)
-        self._ensure_number_format_if_general(ws, sales_cols["data de venda"], row, "DD/MM/YYYY")
-        self._ensure_number_format_if_general(ws, sales_cols["data de entrega"], row, "DD/MM/YYYY")
+        service_delivered = (cmd.service_status or "").strip().lower() == "finalizado"
+        self._apply_sales_row_visual_status(
+            ws,
+            sales_cols,
+            row,
+            pending_amount=pending_amount,
+            service_delivered=service_delivered,
+        )
         return row, sale_id, paid_amount
 
     def _append_material(
@@ -1434,16 +1556,16 @@ class SpreadsheetService:
             ws_material = wb[material_name]
             ws_fixed = wb[fixed_name]
             ws_log = self._ensure_log_sheet(wb)
-            # Salva o padrão da linha 3 no template (negrito, cores, amarelo em pendente). Mesmo que a pessoa apague a linha 3, o robô mantém esse padrão.
-            self._save_padrao_row3_to_template(wb, ws_sales, sales_name)
-            self._save_padrao_row3_to_template(wb, ws_material, material_name)
-            self._save_padrao_row3_to_template(wb, ws_fixed, fixed_name)
             self._cleanup_incomplete_sales_rows(ws_sales)
             self._cleanup_incomplete_material_rows(ws_material)
             self._cleanup_incomplete_fixed_rows(ws_fixed)
-            self._normalize_sheet_layout(wb, ws_sales, sales_name, row_limit=120)
-            self._normalize_sheet_layout(wb, ws_material, material_name, row_limit=120)
-            self._normalize_sheet_layout(wb, ws_fixed, fixed_name, row_limit=120)
+            if not self._preserve_user_layout():
+                self._save_padrao_row3_to_template(wb, ws_sales, sales_name)
+                self._save_padrao_row3_to_template(wb, ws_material, material_name)
+                self._save_padrao_row3_to_template(wb, ws_fixed, fixed_name)
+                self._normalize_sheet_layout(wb, ws_sales, sales_name, row_limit=120)
+                self._normalize_sheet_layout(wb, ws_material, material_name, row_limit=120)
+                self._normalize_sheet_layout(wb, ws_fixed, fixed_name, row_limit=120)
             actions: list[WriteAction] = []
             log_root = datetime.now().strftime("%Y%m%d%H%M%S")
             created_sale_id: str | None = cmd.sale_id
@@ -1618,9 +1740,11 @@ class SpreadsheetService:
             sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
             ws_sales = wb[sales_name]
             ws_log = self._ensure_log_sheet(wb)
-            self._save_padrao_row3_to_template(wb, ws_sales, sales_name)
+            if not self._preserve_user_layout():
+                self._save_padrao_row3_to_template(wb, ws_sales, sales_name)
             self._cleanup_incomplete_sales_rows(ws_sales)
-            self._normalize_sheet_layout(wb, ws_sales, sales_name, row_limit=120)
+            if not self._preserve_user_layout():
+                self._normalize_sheet_layout(wb, ws_sales, sales_name, row_limit=120)
             sales_cols = self._sales_columns(ws_sales)
             style_cols = self._sales_style_cols(ws_sales)
             row = self._next_row_for_empty_cols(
@@ -1632,16 +1756,12 @@ class SpreadsheetService:
                     sales_cols["id venda"],
                 ),
                 start_row=DATA_START_ROW,
+                skip_rows=self._sales_summary_rows(ws_sales),
             )
             amount = -abs(float(refund.amount))
             sale_id = self._generate_sale_id(ws_sales, sales_cols["id venda"])
-            template_ws, template_row = self._prepare_row_from_template(
-                wb,
-                ws_sales,
-                row,
-                SHEET_SALES,
-                style_cols,
-                start_row=TEMPLATE_ROW,
+            template_ws, template_row = self._apply_anchor_row_style(
+                wb, ws_sales, row, SHEET_SALES, style_cols
             )
             status_paid = self._match_text_case(
                 template_ws[f"{sales_cols['status de valor']}{template_row}"].value,
@@ -1654,7 +1774,7 @@ class SpreadsheetService:
             ws_sales[f"{sales_cols['valor (pendente)']}{row}"] = 0.0
             ws_sales[f"{sales_cols['id venda']}{row}"] = sale_id
             ws_sales[f"{sales_cols['status de valor']}{row}"] = status_paid
-            self._ensure_number_format_if_general(ws_sales, sales_cols["data de venda"], row, "DD/MM/YYYY")
+            self._apply_sales_row_visual_status(ws_sales, sales_cols, row, pending_amount=0.0)
             action = WriteAction(sheet=sales_name, row=row, amount=amount, label="Estorno", sale_id=sale_id)
             self._append_log(
                 ws=ws_log,
@@ -1690,17 +1810,15 @@ class SpreadsheetService:
             sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
             ws_sales = wb[sales_name]
             ws_log = self._ensure_log_sheet(wb)
-            self._save_padrao_row3_to_template(wb, ws_sales, sales_name)
-            self._normalize_sheet_layout(wb, ws_sales, sales_name, row_limit=120)
+            if not self._preserve_user_layout():
+                self._save_padrao_row3_to_template(wb, ws_sales, sales_name)
+                self._normalize_sheet_layout(wb, ws_sales, sales_name, row_limit=120)
             sales_cols = self._sales_columns(ws_sales)
             row = self._find_sale_row(ws_sales, sales_cols["id venda"], status_update.sale_id)
 
             paid_col = sales_cols["total de vendas (pago)"]
             pending_col = sales_cols["valor (pendente)"]
             value_status_col = sales_cols["status de valor"]
-            # Reaplica o padrão visual da linha inteira para recuperar bordas
-            # caso alguém tenha apagado estilo manualmente.
-            self._copy_sales_row_style_from_template(wb, ws_sales, row)
 
             current_paid = self._to_float(ws_sales[f"{paid_col}{row}"].value)
             current_pending = self._to_float(ws_sales[f"{pending_col}{row}"].value)
@@ -1716,49 +1834,9 @@ class SpreadsheetService:
             ws_sales[f"{paid_col}{row}"] = current_paid
             ws_sales[f"{pending_col}{row}"] = current_pending
             ws_sales[f"{value_status_col}{row}"] = status_display
-            # Garante padrão visual do financeiro (cores/fontes do template da linha 3).
-            template_ws, template_row = self._template_source(
-                wb,
-                ws_sales,
-                SHEET_SALES,
-                self._sales_style_cols(ws_sales),
+            self._apply_sales_row_visual_status(
+                ws_sales, sales_cols, row, pending_amount=current_pending
             )
-            self._copy_row_style_between(
-                template_ws,
-                template_row,
-                ws_sales,
-                row,
-                (paid_col, pending_col, value_status_col),
-                apply_row_dimensions=False,
-            )
-            ws_sales[f"{paid_col}{row}"] = current_paid
-            ws_sales[f"{pending_col}{row}"] = current_pending
-            ws_sales[f"{value_status_col}{row}"] = status_display
-            # Quando status muda, refletir também na cor da Data de Entrega.
-            delivery_col = sales_cols.get("data de entrega")
-            if delivery_col:
-                # Reaplica o estilo-base da coluna para preservar bordas/fonte
-                # sem perder o valor já registrado da data de entrega.
-                current_delivery_value = ws_sales[f"{delivery_col}{row}"].value
-                template_ws, template_row = self._template_source(
-                    wb,
-                    ws_sales,
-                    SHEET_SALES,
-                    self._sales_style_cols(ws_sales),
-                )
-                self._copy_row_style_between(
-                    template_ws, template_row, ws_sales, row, (delivery_col,), apply_row_dimensions=False
-                )
-                ws_sales[f"{delivery_col}{row}"] = current_delivery_value
-                delivery_cell = ws_sales[f"{delivery_col}{row}"]
-                ref_date = status_update.ref_date
-                due_date = self._parse_date_cell(current_delivery_value)
-                if abs(float(current_pending or 0.0)) < 0.01:
-                    delivery_cell.fill = FILL_DONE
-                elif due_date and due_date > ref_date:
-                    delivery_cell.fill = FILL_PENDING
-                # Caso nao seja entrega futura (ou nao haja data), mantem o preenchimento do template.
-                self._ensure_number_format_if_general(ws_sales, delivery_col, row, "DD/MM/YYYY")
 
             customer = status_update.customer or str(ws_sales[f"{sales_cols['id cliente']}{row}"].value or "")
             product = str(ws_sales[f"{sales_cols['id produto']}{row}"].value or "")
@@ -1824,17 +1902,11 @@ class SpreadsheetService:
                 return
             # Não reaplicar estilo da linha inteira em updates: preserva bordas já existentes.
             ws_sales[f"{col_delivery}{target_row}"] = self._excel_date_value(delivery_date)
-            # Cor da Data de Entrega acompanha status financeiro atual da linha.
             pending_col = sales_cols["valor (pendente)"]
             current_pending = self._to_float(ws_sales[f"{pending_col}{target_row}"].value)
-            delivery_cell = ws_sales[f"{col_delivery}{target_row}"]
-            if abs(float(current_pending or 0.0)) < 0.01:
-                delivery_cell.fill = FILL_DONE
-            else:
-                # Pendente => amarelo (mesmo se a data for hoje ou passada).
-                delivery_cell.fill = FILL_PENDING
-            # Mantém formato de data se a célula estiver como General.
-            self._ensure_number_format_if_general(ws_sales, col_delivery, target_row, "DD/MM/YYYY")
+            self._apply_sales_row_visual_status(
+                ws_sales, sales_cols, target_row, pending_amount=current_pending
+            )
             self._save_workbook(wb)
         finally:
             wb.close()
@@ -1866,14 +1938,9 @@ class SpreadsheetService:
                 ws_sales[f"{status_col}{row}"].value,
                 self._status_text(current_pending),
             )
-
-            # Atualizar cor da entrega conforme pendência (sem mexer em bordas)
-            if delivery_col:
-                cell = ws_sales[f"{delivery_col}{row}"]
-                if abs(float(current_pending or 0.0)) < 0.01:
-                    cell.fill = FILL_DONE
-                else:
-                    cell.fill = FILL_PENDING
+            self._apply_sales_row_visual_status(
+                ws_sales, sales_cols, row, pending_amount=current_pending
+            )
 
             customer = str(ws_sales[f"{sales_cols['id cliente']}{row}"].value or "")
             product = str(ws_sales[f"{sales_cols['id produto']}{row}"].value or "")
@@ -1923,11 +1990,20 @@ class SpreadsheetService:
             material_name = self._resolve_sheet_name(wb, SHEET_MATERIAL)
             fixed_name = self._resolve_sheet_name(wb, SHEET_FIXED)
             target_name = self._resolve_sheet_name(wb, sheet_name)
+            if (
+                self._normalize_name(target_name) == self._normalize_name(sales_name)
+                and self._is_sales_summary_row(wb[target_name], row)
+            ):
+                raise ValueError(
+                    f"Linha {row} e reservada aos totais na coluna {SALES_SUMMARY_COL}. "
+                    "Use outra linha da tabela de vendas."
+                )
 
             ws = wb[target_name]
             ws_log = self._ensure_log_sheet(wb)
-            self._save_padrao_row3_to_template(wb, ws, target_name)
-            self._normalize_sheet_layout(wb, ws, target_name, row_limit=max(120, row))
+            if not self._preserve_user_layout():
+                self._save_padrao_row3_to_template(wb, ws, target_name)
+                self._normalize_sheet_layout(wb, ws, target_name, row_limit=max(120, row))
 
             target_norm = self._normalize_name(target_name)
             if target_norm in (self._normalize_name(sales_name), self._normalize_name(material_name)):
@@ -1981,34 +2057,34 @@ class SpreadsheetService:
                         ws[f"{sales_cols['status de valor']}{row}"].value,
                         status,
                     )
-                    # Reforça visual do padrão da planilha para valores/status.
-                    template_ws, template_row = self._template_source(
-                        wb,
-                        ws,
-                        SHEET_SALES,
-                        self._sales_style_cols(ws),
-                    )
-                    self._copy_row_style_between(
-                        template_ws,
-                        template_row,
-                        ws,
-                        row,
-                        (
-                            sales_cols["total de vendas (pago)"],
-                            sales_cols["valor (pendente)"],
-                            sales_cols["status de valor"],
-                        ),
-                        apply_row_dimensions=False,
-                    )
-                    ws[f"{sales_cols['total de vendas (pago)']}{row}"] = float(amount)
-                    if ws[f"{sales_cols['valor (pendente)']}{row}"].value in (None, ""):
-                        ws[f"{sales_cols['valor (pendente)']}{row}"] = 0.0
-                    pending_amount = self._to_float(ws[f"{sales_cols['valor (pendente)']}{row}"].value)
-                    status = self._status_text(pending_amount)
-                    ws[f"{sales_cols['status de valor']}{row}"] = self._match_text_case(
-                        ws[f"{sales_cols['status de valor']}{row}"].value,
-                        status,
-                    )
+                    if not self._preserve_user_layout():
+                        template_ws, template_row = self._template_source(
+                            wb,
+                            ws,
+                            SHEET_SALES,
+                            self._sales_style_cols(ws),
+                        )
+                        self._copy_row_style_between(
+                            template_ws,
+                            template_row,
+                            ws,
+                            row,
+                            (
+                                sales_cols["total de vendas (pago)"],
+                                sales_cols["valor (pendente)"],
+                                sales_cols["status de valor"],
+                            ),
+                            apply_row_dimensions=False,
+                        )
+                        ws[f"{sales_cols['total de vendas (pago)']}{row}"] = float(amount)
+                        if ws[f"{sales_cols['valor (pendente)']}{row}"].value in (None, ""):
+                            ws[f"{sales_cols['valor (pendente)']}{row}"] = 0.0
+                        pending_amount = self._to_float(ws[f"{sales_cols['valor (pendente)']}{row}"].value)
+                        status = self._status_text(pending_amount)
+                        ws[f"{sales_cols['status de valor']}{row}"] = self._match_text_case(
+                            ws[f"{sales_cols['status de valor']}{row}"].value,
+                            status,
+                        )
                     self._ensure_number_format_if_general(ws, sales_cols["data de venda"], row, "DD/MM/YYYY")
                 else:
                     material_cols = self._material_columns(ws)
