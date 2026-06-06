@@ -3,7 +3,7 @@
 # Assim, quando você colar o comando no Cloud ele volta limpo.
 
 $ErrorActionPreference = "Stop"
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ScriptDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $ScriptDir
 
 function Stop-TelegramBotProcesses {

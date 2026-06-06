@@ -1,6 +1,6 @@
 # Atualiza o projeto do GitHub e inicia o bot do Telegram (venv + requirements automaticos).
 # Uso: clique com botao direito > Executar com PowerShell, ou no terminal:
-#   powershell -NoProfile -ExecutionPolicy Bypass -File ".\atualizar_e_iniciar_telegram.ps1"
+#   powershell -NoProfile -ExecutionPolicy Bypass -File ".\scripts\atualizar_e_iniciar_telegram.ps1"
 #
 # Opcional: passar o token na linha de comando (grava no .env antes de subir):
 #   .\atualizar_e_iniciar_telegram.ps1 -TelegramToken "123456:ABC..."
@@ -10,7 +10,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ScriptDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $ScriptDir
 
 Write-Host "[Telegram] Pasta do projeto: $ScriptDir" -ForegroundColor Gray

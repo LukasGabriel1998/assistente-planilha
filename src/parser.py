@@ -2133,6 +2133,364 @@ def parse_refund_message(message: str, reference_date: Optional[date] = None) ->
     return RefundCommand(customer=customer, amount=float(amount or 0.0), reason=reason, ref_date=ref_date)
 
 
+_PREVIEW_CORRECTION_FIELD_RE = re.compile(
+    r"(?i)\b("
+    r"data\s+de\s+entrega"
+    r"|data\s+entrega"
+    r"|data\s+(?:da\s+)?venda"
+    r"|nome\s+do\s+cliente"
+    r"|id\s+cliente"
+    r"|cliente(?:\s+id)?"
+    r"|produto"
+    r"|valor\s+total"
+    r"|valor"
+    r"|entrada(?:\s+paga)?"
+    r"|saldo"
+    r"|restante"
+    r"|resto"
+    r"|entrega"
+    r"|id\s+venda"
+    r"|venda"
+    r")\s*[:=]?\s*"
+)
+
+_NL_PREVIEW_CORRECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "cliente",
+        re.compile(
+            r"(?is)\b(?:o\s+)?(?:nome\s+)?(?:do\s+)?cliente\s+"
+            r"(?:é|eh|e\s+é|sera|será|chama|se\s+chama|=|:)\s*"
+            r"(.+?)(?=\s*,\s*|\s+(?:e\s+)?(?:o\s+)?produto\b|\s+valor\b|\s+entrada\b|\s+saldo\b|\s+restante\b|$)"
+        ),
+    ),
+    (
+        "produto",
+        re.compile(
+            r"(?is)\b(?:o\s+)?produto\s+"
+            r"(?:é|eh|e\s+é|sera|será|=|:)\s*"
+            r"(.+?)(?=\s*,\s*|\s+valor\b|\s+entrada\b|\s+saldo\b|\s+restante\b|\s+cliente\b|$)"
+        ),
+    ),
+    (
+        "valor",
+        re.compile(
+            r"(?is)\bvalor\s+total\s+"
+            r"(?:é|eh|de|foi|sera|será|=|:)\s*"
+            r"(.+?)(?=\s*,\s*|\s+entrada\b|\s+saldo\b|\s+restante\b|\s+metade\b|$)"
+        ),
+    ),
+    (
+        "entrada",
+        re.compile(
+            r"(?is)\b(?:a\s+)?entrada\s+"
+            r"(?:é|eh|de|foi|sera|será|=|:)\s*"
+            r"(.+?)(?=\s*,\s*|\s+saldo\b|\s+restante\b|\s+resto\b|$)"
+        ),
+    ),
+    (
+        "saldo",
+        re.compile(
+            r"(?is)\b(?:o\s+)?(?:saldo|restante|resto)\s+"
+            r"(?:é|eh|de|foi|sera|será|=|:)\s*"
+            r"(.+?)(?=\s*,\s*|\s+entrada\b|$)"
+        ),
+    ),
+)
+
+
+def _preview_correction_label_to_key(label: str) -> Optional[str]:
+    label = label.lower().strip()
+    if label.startswith("cliente") or label.startswith("nome do cliente") or label == "id cliente":
+        return "cliente"
+    if label == "produto":
+        return "produto"
+    if label.startswith("valor"):
+        return "valor"
+    if label in ("entrada", "entrada paga"):
+        return "entrada"
+    if label in ("saldo", "restante", "resto"):
+        return "saldo"
+    if label.startswith("data") and "entrega" in label:
+        return "data_entrega"
+    if label.startswith("data") and "venda" in label:
+        return "data_venda"
+    if label == "entrega":
+        return "data_entrega"
+    if label == "id venda" or label == "venda":
+        return "id_venda"
+    return None
+
+
+def _extract_nl_preview_correction_fields(text: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for key, pattern in _NL_PREVIEW_CORRECTION_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        value = match.group(1).strip(" \t\n\r:-,")
+        if value:
+            fields.setdefault(key, value)
+    return fields
+
+
+def _extract_preview_correction_fields(text: str) -> dict[str, str]:
+    """Extrai pares campo->valor (rótulos explícitos ou fala natural)."""
+    raw = text.strip()
+    if not raw:
+        return {}
+    fields: dict[str, str] = {}
+    matches = list(_PREVIEW_CORRECTION_FIELD_RE.finditer(raw))
+    for i, match in enumerate(matches):
+        key = _preview_correction_label_to_key(match.group(1))
+        if not key:
+            continue
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+        value = raw[start:end].strip(" \t\n\r:-,")
+        if value:
+            fields[key] = value
+    for key, value in _extract_nl_preview_correction_fields(raw).items():
+        fields.setdefault(key, value)
+    return fields
+
+
+def _preview_correction_rest(text: str, keyword: str) -> str:
+    _, _, rest = text.partition(":")
+    if not rest:
+        rest = re.split(rf"(?i)\b{re.escape(keyword)}\b", text, maxsplit=1)[-1]
+    return rest.strip(" :-,")
+
+
+def _parse_correction_money(fragment: str, full_text: str) -> Optional[float]:
+    parsed = parse_money_value(fragment)
+    if parsed is not None and parsed > 0:
+        return parsed
+    numbers = _currency_candidates(fragment) or _currency_candidates(full_text)
+    if numbers:
+        return float(numbers[0])
+    match = re.search(
+        r"(\d{1,3}(?:[.\s]\d{3})*(?:,\d{1,2})?|\d+(?:,\d{1,2})?)",
+        fragment,
+    )
+    if not match:
+        return None
+    raw_norm = match.group(1).replace(".", "").replace(" ", "").replace(",", ".")
+    try:
+        return float(raw_norm)
+    except ValueError:
+        return None
+
+
+def _find_payment(command: FinancialCommand, label: str) -> Optional[Payment]:
+    target = label.strip().lower()
+    for payment in command.payments or []:
+        if str(payment.label).strip().lower() == target:
+            return payment
+    return None
+
+
+def _upsert_payment(
+    command: FinancialCommand,
+    label: str,
+    value: float,
+    *,
+    due_date: Optional[date] = None,
+    status: Optional[str] = None,
+) -> bool:
+    payment = _find_payment(command, label)
+    if payment is None:
+        ref = command.sale_date or date.today()
+        default_status = "pago" if label == "entrada" else "pendente"
+        command.payments.append(
+            Payment(
+                label=label.capitalize(),
+                value=float(value),
+                due_date=due_date or ref,
+                status=status or default_status,
+            )
+        )
+        return True
+    payment.value = float(value)
+    if due_date is not None:
+        payment.due_date = due_date
+    if status is not None:
+        payment.status = status
+    return True
+
+
+def _payment_mentioned_in_text(norm: str, label: str) -> bool:
+    if label == "entrada":
+        return any(tok in norm for tok in ("entrada", "pagou", "paguei", "metade", "me deu", "recebi"))
+    return any(tok in norm for tok in ("saldo", "restante", "resto", "receber", "vai me pagar", "vou receber"))
+
+
+def _apply_preview_payment_corrections(
+    text: str,
+    command: FinancialCommand,
+    fields: dict[str, str],
+    reference_date: date,
+) -> bool:
+    """Atualiza entrada/saldo só nos campos citados na mensagem."""
+    norm = _normalize(text)
+    if not any(
+        tok in norm
+        for tok in ("entrada", "saldo", "restante", "resto", "metade", "pagou", "paguei", "receber")
+    ):
+        return False
+
+    total = float(command.total_value or 0.0)
+    numbers = _currency_candidates(text)
+    updated = False
+
+    for pay_label, field_key in (("entrada", "entrada"), ("saldo", "saldo")):
+        if field_key not in fields and not _payment_mentioned_in_text(norm, pay_label):
+            continue
+        value: Optional[float] = None
+        if field_key in fields:
+            value = _parse_correction_money(fields[field_key], text)
+        if value is None:
+            value = _extract_payment_value(text, pay_label, total if total > 0 else None, numbers)
+        if value is None or value <= 0:
+            continue
+
+        due: Optional[date] = None
+        if pay_label == "entrada":
+            due = _extract_first_date_by_keywords(
+                fields.get("entrada", text),
+                reference_date,
+                keywords=("pagou", "entrada", "pago", "hoje"),
+            )
+            status = "pago" if any(tok in norm for tok in ("pagou", "paguei", "pago", "hoje")) else None
+        else:
+            due = _extract_first_date_by_keywords(
+                fields.get("saldo", text),
+                reference_date,
+                keywords=("restante", "saldo", "receber", "vence", "entrega"),
+            )
+            status = "pendente" if _contains_future_balance_hint(text) else None
+
+        _upsert_payment(command, pay_label, value, due_date=due, status=status)
+        updated = True
+
+    return updated
+
+
+def apply_multi_field_corrections(
+    text: str,
+    command: FinancialCommand,
+    parse_result: Optional[ParseResult] = None,
+    reference_date: Optional[date] = None,
+) -> bool:
+    """
+    Aplica correções pontuais na prévia, campo a campo, sem bagunçar o restante.
+    Ex.: 'Cliente: Ana, Produto: Banner, Valor total: 3000, Entrada: 1500, Saldo: 1500'.
+    """
+    if reference_date is None:
+        reference_date = date.today()
+
+    fields = _extract_preview_correction_fields(text)
+    if not fields:
+        lower = text.strip().lower()
+        if lower.startswith("cliente"):
+            rest = _preview_correction_rest(text, "cliente")
+            if rest:
+                fields = {"cliente": rest}
+        elif "id venda" in lower or (lower.startswith("venda") and "data" not in lower):
+            fields = {"id_venda": text}
+        elif "produto" in lower:
+            rest = _preview_correction_rest(text, "produto")
+            if rest:
+                fields = {"produto": rest}
+        elif "valor" in lower:
+            fields = {"valor": _preview_correction_rest(text, "valor") or text}
+
+    if not fields and not any(
+        tok in _normalize(text)
+        for tok in ("entrada", "saldo", "restante", "metade", "pagou", "paguei")
+    ):
+        return False
+
+    updated = False
+    touched_payments = "entrada" in fields or "saldo" in fields
+
+    if "cliente" in fields:
+        new_name = fields["cliente"]
+        m_id = re.search(r"\d+", new_name)
+        only_digits = bool(re.fullmatch(r"\d+", new_name.strip()))
+        if m_id and (
+            only_digits
+            or re.search(r"\bid\b", text, re.I)
+            or re.search(r"cliente\s+id", text, re.I)
+        ):
+            digits = m_id.group(0)
+            command.customer = digits.zfill(3) if len(digits) <= 3 else digits
+        else:
+            command.customer = new_name
+        updated = True
+
+    if "id_venda" in fields:
+        m_id = re.search(r"\d+", fields["id_venda"])
+        if m_id:
+            digits = m_id.group(0)
+            command.sale_id = digits.zfill(3) if len(digits) <= 3 else digits
+            updated = True
+
+    if "produto" in fields:
+        new_prod = fields["produto"]
+        if new_prod:
+            command.product_id = new_prod
+            command.description = new_prod
+            updated = True
+
+    if "data_venda" in fields:
+        parsed = _parse_pt_date(fields["data_venda"], reference_date, full_text=fields["data_venda"])
+        if parsed:
+            command.sale_date = parsed
+            updated = True
+
+    if "data_entrega" in fields:
+        parsed = _parse_pt_date(fields["data_entrega"], reference_date, full_text=fields["data_entrega"])
+        if parsed:
+            command.service_due_date = parsed
+            saldo = _find_payment(command, "saldo")
+            if saldo is not None:
+                saldo.due_date = parsed
+            updated = True
+
+    if "valor" in fields:
+        parsed_value = _parse_correction_money(fields["valor"], text)
+        if parsed_value is not None and parsed_value > 0:
+            command.total_value = parsed_value
+            if not touched_payments:
+                recalculate_payments_for_total(command)
+            updated = True
+
+    if _apply_preview_payment_corrections(text, command, fields, reference_date):
+        updated = True
+        touched_payments = True
+
+    if touched_payments and command.total_value and command.payments:
+        payment_total = round(sum(float(p.value or 0) for p in command.payments), 2)
+        total = round(float(command.total_value), 2)
+        if abs(payment_total - total) >= 0.01 and "valor" not in fields:
+            saldo = _find_payment(command, "saldo")
+            entrada = _find_payment(command, "entrada")
+            if saldo is not None and entrada is not None and "saldo" not in fields:
+                saldo.value = round(max(total - float(entrada.value or 0), 0), 2)
+
+    if updated and parse_result is not None:
+        if (command.customer or "").strip() and "ID Cliente" in parse_result.missing_fields:
+            parse_result.missing_fields = [
+                f for f in parse_result.missing_fields if f != "ID Cliente"
+            ]
+        if getattr(command, "sale_id", None) and "ID VENDA" in parse_result.missing_fields:
+            parse_result.missing_fields = [
+                f for f in parse_result.missing_fields if f != "ID VENDA"
+            ]
+
+    return updated
+
+
 def apply_preview_corrections(
     message: str,
     command: FinancialCommand,

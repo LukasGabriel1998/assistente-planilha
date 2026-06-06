@@ -120,7 +120,7 @@ Para cancelar: `text: "NAO"` ou `action: "cancel"`.
 |---------|--------|-------|
 | App Streamlit | `iniciar_app.bat` | 8501 |
 | API n8n | `iniciar_n8n_api.bat` | 8765 |
-| Bot Telegram (opcional) | `run_telegram_bot.ps1` | — |
+| Bot Telegram (opcional) | `run_telegram_bot_universal.ps1` | — |
 
 Você pode usar **só o n8n** para Telegram/WhatsApp e desligar o `telegram_bot.py`, desde que todos os fluxos passem pela API.
 

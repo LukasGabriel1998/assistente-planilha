@@ -24,7 +24,7 @@
      .\.venv\Scripts\Activate.ps1
      python telegram_bot.py
      
-   Ou dê dois cliques em:  run_telegram_bot.ps1
+   Ou dê dois cliques em:  run_telegram_bot_universal.ps1
 
    - No Telegram, abra o seu bot (pelo @username que você criou) e envie:
      "Resumo"  ou  "Vendi placa para João por 2000"

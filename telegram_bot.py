@@ -24,7 +24,7 @@ from src.bot_processor import (
     process_command,
     sale_id_from_parse_result,
 )
-from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer
+from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer, apply_multi_field_corrections, apply_preview_corrections
 from src.transcription import TranscriptionError, transcribe_audio
 
 # Carregar .env
@@ -982,65 +982,12 @@ def run_polling() -> None:
                         if pending:
                             parse_result = pending["parse_result"]
                             cmd = parse_result.command
-                            updated = False
-                            # Atualizar cliente
-                            if lower.startswith("cliente"):
-                                import re
-                                _, _, rest = text.partition(":")
-                                if not rest:
-                                    rest = text.split("cliente", 1)[-1]
-                                new_name = rest.strip(" :-")
-                                if new_name:
-                                    # Aceita formatos como "cliente id 004" e guarda só o número.
-                                    m_id = re.search(r"\d+", new_name)
-                                    if m_id:
-                                        digits = m_id.group(0)
-                                        digits = digits.zfill(3) if len(digits) <= 3 else digits
-                                        cmd.customer = digits
-                                    else:
-                                        cmd.customer = new_name
-                                    updated = True
-                            # Atualizar ID VENDA
-                            if not updated and ("id venda" in lower or lower.startswith("venda")):
-                                import re
-                                m_id = re.search(r"\d+", text)
-                                if m_id:
-                                    digits = m_id.group(0)
-                                    digits = digits.zfill(3) if len(digits) <= 3 else digits
-                                    cmd.sale_id = digits
-                                    updated = True
-                            # Atualizar produto
-                            if not updated and ("produto" in lower):
-                                _, _, rest = text.partition(":")
-                                if not rest:
-                                    rest = text.split("produto", 1)[-1]
-                                new_prod = rest.strip(" :-")
-                                if new_prod:
-                                    cmd.product_id = new_prod
-                                    parse_result.command.description = new_prod
-                                    updated = True
-                            # Atualizar valor total
-                            if not updated and ("valor" in lower):
-                                _, _, rest = text.partition(":")
-                                value_text = (rest or text).strip()
-                                parsed_value = parse_money_value(value_text)
-                                if parsed_value is None:
-                                    parsed_value = _extract_total_value(text, _currency_candidates(text))
-                                if parsed_value is not None and parsed_value > 0:
-                                    cmd.total_value = parsed_value
-                                    recalculate_payments_for_total(cmd)
-                                    updated = True
+                            updated = apply_multi_field_corrections(
+                                text, cmd, parse_result, reference_date=date.today()
+                            )
                             if not updated:
-                                from src.parser import apply_preview_corrections
                                 updated = apply_preview_corrections(text, cmd)
                             if updated:
-                                # Se pagamento mudou na mensagem, recalcular entrada/saldo.
-                                if any(tok in lower for tok in ("pagou", "paguei", "entrada", "metade", "restante", "saldo")):
-                                    fresh = parse_message(text, reference_date=date.today())
-                                    if fresh.intent == parse_result.intent and not fresh.missing_fields:
-                                        pending["parse_result"] = fresh
-                                        pending["original_text"] = text
-                                        parse_result = fresh
                                 # Se o usuário forneceu o ID Cliente, remover da lista de missing.
                                 if (cmd.customer or "").strip() and "ID Cliente" in parse_result.missing_fields:
                                     parse_result.missing_fields = [

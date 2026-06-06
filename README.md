@@ -93,6 +93,29 @@ python -m streamlit run app.py
 - Antes de salvar: ajuste os campos na tela.
 - Depois de salvar: ative `Mostrar painel avancado` e use `Correcao rapida de linha`.
 
+## Estrutura do projeto
+
+```
+assistente-planilha-1/
+├── app.py                      # Interface web (Streamlit)
+├── launcher.py                 # Janela desktop (pywebview)
+├── telegram_bot.py             # Bot Telegram
+├── n8n_api.py                  # API HTTP para n8n
+├── src/                        # Codigo-fonte principal (parser, planilha, audio)
+│   ├── parser.py               # Interpreta texto em portugues
+│   ├── excel_store.py          # Le/grava Excel
+│   ├── models.py               # Tipos de dados (venda, pagamento, etc.)
+│   ├── bot_processor.py        # Logica compartilhada app + Telegram + n8n
+│   ├── transcription.py        # Audio -> texto (Whisper)
+│   ├── n8n_service.py          # Camada da API n8n
+│   └── workbook_paths.py       # Caminho da planilha
+├── docs/                       # Guias (Telegram, n8n)
+├── scripts/                    # Scripts auxiliares PowerShell
+├── assets/                     # Icones e logos
+├── models/                     # Modelo Whisper local (audio)
+└── n8n/                        # Workflow de exemplo
+```
+
 ## Telegram
 
 Arquivo: `telegram_bot.py`
@@ -101,7 +124,46 @@ Passos:
 
 1. Copiar `.env.example` para `.env`.
 2. Definir `TELEGRAM_BOT_TOKEN` (token do @BotFather).
-3. Rodar `run_telegram_bot.ps1` (ou `python telegram_bot.py`).
+3. Rodar `run_telegram_bot_universal.ps1` (ou `python telegram_bot.py`).
+
+Guia completo: `docs/HOWTO_TELEGRAM.md`
+
+## Testar o codigo-fonte
+
+### 1) App visual (recomendado para testes)
+
+```powershell
+cd "C:\Users\Usuario\Desktop\DEV - PROJETOS\assistente-planilha-1"
+.\iniciar_app.bat
+```
+
+Ou manualmente:
+
+```powershell
+.\.venv_native\Scripts\python.exe -m streamlit run app.py
+```
+
+Abra `http://127.0.0.1:8501`, digite ou grave um comando e confira a previa antes de salvar.
+
+### 2) Parser isolado (sem interface)
+
+```powershell
+.\.venv_native\Scripts\python.exe -c "from src.parser import parse_message; r=parse_message('vendi 2000 pro Joao, entrou metade hoje'); print(r.command); print(r.detected_values)"
+```
+
+### 3) Bot Telegram
+
+```powershell
+.\run_telegram_bot_universal.ps1
+```
+
+### 4) API n8n
+
+```powershell
+.\iniciar_n8n_api.bat
+```
+
+Documentacao interativa: `http://127.0.0.1:8765/docs` — guia em `docs/HOWTO_N8N.md`.
 
 ## Limites deste MVP
 

@@ -1,6 +1,6 @@
 # Inicia a API HTTP para integracao com n8n
 $ErrorActionPreference = "Stop"
-$ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ProjectDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $ProjectDir
 
 $VenvPython = Join-Path $ProjectDir ".venv_native\Scripts\python.exe"

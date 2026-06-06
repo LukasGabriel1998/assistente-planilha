@@ -5,7 +5,6 @@ Reutiliza parser, prévia e gravação da planilha do bot Telegram.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import asdict
 from datetime import date, datetime
 from typing import Any
@@ -19,7 +18,7 @@ from .bot_processor import (
     get_default_workbook,
     process_command,
 )
-from .parser import ParseResult, parse_message
+from .parser import ParseResult, apply_multi_field_corrections, parse_message
 from .transcription import TranscriptionError, transcribe_audio
 
 CONFIRM_WORDS = frozenset(
@@ -38,64 +37,7 @@ def _is_short_read_command(text: str) -> bool:
 
 def _apply_field_correction(parse_result: ParseResult, text: str) -> bool:
     """Correções pontuais na prévia (cliente, produto, valor, id venda)."""
-    lower = text.strip().lower()
-    cmd = parse_result.command
-    updated = False
-
-    if lower.startswith("cliente"):
-        _, _, rest = text.partition(":")
-        if not rest:
-            rest = text.split("cliente", 1)[-1]
-        new_name = rest.strip(" :-")
-        if new_name:
-            m_id = re.search(r"\d+", new_name)
-            if m_id:
-                digits = m_id.group(0)
-                cmd.customer = digits.zfill(3) if len(digits) <= 3 else digits
-            else:
-                cmd.customer = new_name
-            updated = True
-
-    if not updated and ("id venda" in lower or lower.startswith("venda")):
-        m_id = re.search(r"\d+", text)
-        if m_id:
-            digits = m_id.group(0)
-            cmd.sale_id = digits.zfill(3) if len(digits) <= 3 else digits
-            updated = True
-
-    if not updated and "produto" in lower:
-        _, _, rest = text.partition(":")
-        if not rest:
-            rest = text.split("produto", 1)[-1]
-        new_prod = rest.strip(" :-")
-        if new_prod:
-            cmd.product_id = new_prod
-            cmd.description = new_prod
-            updated = True
-
-    if not updated and "valor" in lower:
-        m = re.search(
-            r"(\d{1,3}(?:[.\s]\d{3})*(?:,\d{1,2})?|\d+(?:,\d{1,2})?)",
-            text,
-        )
-        if m:
-            raw_norm = m.group(1).replace(".", "").replace(" ", "").replace(",", ".")
-            try:
-                cmd.total_value = float(raw_norm)
-                updated = True
-            except ValueError:
-                pass
-
-    if updated:
-        if (cmd.customer or "").strip() and "ID Cliente" in parse_result.missing_fields:
-            parse_result.missing_fields = [
-                f for f in parse_result.missing_fields if f != "ID Cliente"
-            ]
-        if getattr(cmd, "sale_id", None) and "ID VENDA" in parse_result.missing_fields:
-            parse_result.missing_fields = [
-                f for f in parse_result.missing_fields if f != "ID VENDA"
-            ]
-    return updated
+    return apply_multi_field_corrections(text, parse_result.command, parse_result)
 
 
 def _parse_result_summary(parse_result: ParseResult) -> dict[str, Any]:

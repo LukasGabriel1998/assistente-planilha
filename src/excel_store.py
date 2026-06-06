@@ -301,7 +301,10 @@ class SpreadsheetService:
 
     @classmethod
     def _sales_summary_rows(cls, ws, *, scan_limit: int = 40) -> set[int]:
-        """Linhas reservadas pelos blocos de totais na coluna J (rótulos e fórmulas SUM)."""
+        """
+        Linhas com conteúdo na coluna J (caixas de totais).
+        Usado só para não sobrescrever estilo de J na normalização — não bloqueia novas vendas em A–I.
+        """
         rows: set[int] = set()
         for row in range(1, min(ws.max_row, scan_limit) + 1):
             if cls._cell_has_content(ws[f"{SALES_SUMMARY_COL}{row}"].value):
@@ -311,6 +314,57 @@ class SpreadsheetService:
     @classmethod
     def _is_sales_summary_row(cls, ws, row: int) -> bool:
         return cls._cell_has_content(ws[f"{SALES_SUMMARY_COL}{row}"].value)
+
+    @classmethod
+    def _sale_data_columns(cls, sales_cols: dict[str, str]) -> tuple[str, ...]:
+        """Colunas da tabela de vendas (A–I). A coluna J (totais) fica de fora."""
+        cols = [
+            sales_cols["data de venda"],
+            sales_cols["data de entrega"],
+            sales_cols["id cliente"],
+            sales_cols["id produto"],
+            sales_cols["total de vendas (pago)"],
+            sales_cols["valor (pendente)"],
+            sales_cols["id venda"],
+            sales_cols["status de valor"],
+        ]
+        status_col = sales_cols.get("status")
+        if status_col and status_col not in cols:
+            cols.append(status_col)
+        return tuple(cols)
+
+    @classmethod
+    def _sale_row_is_available(cls, ws, row: int, sales_cols: dict[str, str]) -> bool:
+        """True se nenhuma célula da tabela de vendas (A–I) na linha tem dado de venda."""
+        if row < DATA_START_ROW or row > cls.MAX_DATA_ROW:
+            return False
+        for col in cls._sale_data_columns(sales_cols):
+            if cls._cell_has_content(ws[f"{col}{row}"].value):
+                return False
+        return True
+
+    @classmethod
+    def _next_sale_data_row(
+        cls,
+        ws,
+        sales_cols: dict[str, str],
+        *,
+        start_row: int = DATA_START_ROW,
+    ) -> int:
+        """
+        Primeira linha livre na tabela (3, 4, 5, 6…).
+        Totais na coluna J não impedem usar a linha — o robô só grava em A–I.
+        """
+        row = start_row
+        scan_until = min(
+            cls.MAX_DATA_ROW,
+            max(min(ws.max_row, cls.MAX_DATA_ROW) + 30, start_row + 30),
+        )
+        while row <= scan_until:
+            if cls._sale_row_is_available(ws, row, sales_cols):
+                return row
+            row += 1
+        return min(row, cls.MAX_DATA_ROW)
 
     @classmethod
     def _sales_columns(cls, ws) -> dict[str, str]:
@@ -1402,18 +1456,7 @@ class SpreadsheetService:
         """Adiciona uma linha de venda. Só preenche valores; layout (fonte, cor, borda) fica como na planilha."""
         sales_cols = self._sales_columns(ws)
         style_cols = self._sales_style_cols(ws)
-        sale_empty_cols = (
-            sales_cols["id produto"],
-            sales_cols["total de vendas (pago)"],
-            sales_cols["valor (pendente)"],
-            sales_cols["id venda"],
-        )
-        row = self._next_row_for_empty_cols(
-            ws,
-            sale_empty_cols,
-            start_row=DATA_START_ROW,
-            skip_rows=self._sales_summary_rows(ws),
-        )
+        row = self._next_sale_data_row(ws, sales_cols)
         template_ws, template_row = self._apply_anchor_row_style(
             wb, ws, row, SHEET_SALES, style_cols
         )
@@ -1747,17 +1790,7 @@ class SpreadsheetService:
                 self._normalize_sheet_layout(wb, ws_sales, sales_name, row_limit=120)
             sales_cols = self._sales_columns(ws_sales)
             style_cols = self._sales_style_cols(ws_sales)
-            row = self._next_row_for_empty_cols(
-                ws_sales,
-                (
-                    sales_cols["id produto"],
-                    sales_cols["total de vendas (pago)"],
-                    sales_cols["valor (pendente)"],
-                    sales_cols["id venda"],
-                ),
-                start_row=DATA_START_ROW,
-                skip_rows=self._sales_summary_rows(ws_sales),
-            )
+            row = self._next_sale_data_row(ws_sales, sales_cols)
             amount = -abs(float(refund.amount))
             sale_id = self._generate_sale_id(ws_sales, sales_cols["id venda"])
             template_ws, template_row = self._apply_anchor_row_style(
@@ -1990,15 +2023,6 @@ class SpreadsheetService:
             material_name = self._resolve_sheet_name(wb, SHEET_MATERIAL)
             fixed_name = self._resolve_sheet_name(wb, SHEET_FIXED)
             target_name = self._resolve_sheet_name(wb, sheet_name)
-            if (
-                self._normalize_name(target_name) == self._normalize_name(sales_name)
-                and self._is_sales_summary_row(wb[target_name], row)
-            ):
-                raise ValueError(
-                    f"Linha {row} e reservada aos totais na coluna {SALES_SUMMARY_COL}. "
-                    "Use outra linha da tabela de vendas."
-                )
-
             ws = wb[target_name]
             ws_log = self._ensure_log_sheet(wb)
             if not self._preserve_user_layout():

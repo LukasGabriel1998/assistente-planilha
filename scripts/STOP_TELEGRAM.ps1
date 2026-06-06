@@ -1,5 +1,5 @@
 $ErrorActionPreference = "SilentlyContinue"
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ScriptDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $ScriptDir
 
 Write-Host "[Telegram] Parando instancias ativas..." -ForegroundColor Cyan

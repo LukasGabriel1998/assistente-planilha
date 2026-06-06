@@ -265,7 +265,8 @@ def build_preview(parse_result: ParseResult) -> str:
     lines.append("")
     lines.append(
         "Se estiver correto, responda *SIM* ou *OK* que eu salvo na planilha.\n"
-        "Para corrigir, envie algo como `Cliente: 004`, `Produto: Fachada` ou `Valor: 1547,27`."
+        "Para corrigir, envie um ou mais campos na mesma mensagem, "
+        "ex.: `Cliente: Adriel, Produto: Banner, Valor total: 3000, Entrada: 1500, Saldo: 1500`."
     )
     return "\n".join(lines)
 
