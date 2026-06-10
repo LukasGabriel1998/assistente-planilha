@@ -549,10 +549,9 @@ def main() -> None:
                 except Exception:
                     pass
     
-        # Modelo de áudio simplificado para o cliente: sempre "small" (bom equilíbrio)
+        model_size = (os.getenv("WHISPER_MODEL", "small") or "small").strip() or "small"
         st.caption("Modelo de áudio (voz → texto)")
-        st.text("Usando: small (recomendado)")
-        model_size = "small"
+        st.text(f"Usando: {model_size}")
     
         save_direct = st.toggle("Salvar direto na planilha após interpretar", value=False)
         show_advanced = st.toggle("Mostrar painel avançado", value=False)

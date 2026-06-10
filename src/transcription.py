@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import builtins
 import os
-from pathlib import Path
+import re
 import sys
+import tempfile
+import threading
+import wave
+from pathlib import Path
 from types import ModuleType
 
 
@@ -20,6 +24,17 @@ _RUNTIME_MODULE_PREFIXES = (
 
 class TranscriptionError(RuntimeError):
     pass
+
+
+_MODEL_INSTANCE_CACHE: dict[str, object] = {}
+_MODEL_CACHE_LOCK = threading.Lock()
+
+_FINANCIAL_INITIAL_PROMPT = (
+    "Transcricao em portugues do Brasil de comandos financeiros falados. "
+    "Preserve nomes proprios, valores monetarios, datas e numeros com precisao. "
+    "Exemplos: vendi placa para o Joao por dois mil reais; entrou metade hoje; "
+    "saldo dia trinta; gastei oitocentos de material; recebi quinhentos da Maria."
+)
 
 
 def _is_runtime_module(module_name: str) -> bool:
@@ -137,6 +152,163 @@ def _resolve_model_source(model_size: str) -> str:
     return model_size
 
 
+def _env_flag(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name, "1" if default else "0").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _resolve_initial_prompt() -> str:
+    custom = os.getenv("WHISPER_INITIAL_PROMPT", "").strip()
+    return custom or _FINANCIAL_INITIAL_PROMPT
+
+
+def _resolve_beam_size() -> int:
+    raw = os.getenv("WHISPER_BEAM_SIZE", "5").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 5
+    return max(1, min(value, 10))
+
+
+def _normalize_audio_samples(samples):
+    import numpy as np
+
+    if samples.size == 0:
+        return samples
+    peak = float(np.max(np.abs(samples)))
+    if peak < 1e-6:
+        return samples
+    target_peak = 0.92
+    return (samples * (target_peak / peak)).astype(np.float32)
+
+
+def _write_mono_wav(path: Path, samples, sample_rate: int = 16000) -> None:
+    import numpy as np
+
+    clipped = np.clip(samples, -1.0, 1.0)
+    pcm = (clipped * 32767.0).astype(np.int16)
+    with wave.open(str(path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm.tobytes())
+
+
+def _prepare_audio_for_whisper(audio_path: Path) -> tuple[Path, Path | None]:
+    """Converte o audio para mono 16 kHz com volume normalizado (melhor para voz)."""
+    if not _env_flag("WHISPER_PREPARE_AUDIO", default=True):
+        return audio_path, None
+
+    try:
+        import av
+        import numpy as np
+    except Exception:
+        return audio_path, None
+
+    samples_chunks: list = []
+    container = None
+    try:
+        container = av.open(str(audio_path))
+        if not container.streams.audio:
+            return audio_path, None
+
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
+        for frame in container.decode(audio=0):
+            resampled = resampler.resample(frame)
+            if resampled is None:
+                continue
+            frames = resampled if isinstance(resampled, list) else [resampled]
+            for item in frames:
+                arr = item.to_ndarray()
+                if arr.ndim > 1:
+                    arr = arr.mean(axis=0)
+                samples_chunks.append(arr.astype(np.float32) / 32768.0)
+
+        flush = resampler.resample(None)
+        if flush is not None:
+            frames = flush if isinstance(flush, list) else [flush]
+            for item in frames:
+                arr = item.to_ndarray()
+                if arr.ndim > 1:
+                    arr = arr.mean(axis=0)
+                samples_chunks.append(arr.astype(np.float32) / 32768.0)
+    except Exception:
+        return audio_path, None
+    finally:
+        if container is not None:
+            try:
+                container.close()
+            except Exception:
+                pass
+
+    if not samples_chunks:
+        return audio_path, None
+
+    samples = _normalize_audio_samples(np.concatenate(samples_chunks))
+    if samples.size < 1600:
+        return audio_path, None
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        _write_mono_wav(tmp_path, samples)
+        return tmp_path, tmp_path
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return audio_path, None
+
+
+def _cleanup_transcription_text(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    cleaned = re.sub(r"\s+([,.;!?])", r"\1", cleaned)
+    return cleaned
+
+
+def _get_whisper_model(WhisperModel: type, model_source: str, cache_root: Path):
+    with _MODEL_CACHE_LOCK:
+        cached = _MODEL_INSTANCE_CACHE.get(model_source)
+        if cached is not None:
+            return cached
+
+        model = WhisperModel(
+            model_source,
+            device="cpu",
+            compute_type="int8",
+            download_root=str(cache_root),
+        )
+        _MODEL_INSTANCE_CACHE[model_source] = model
+        return model
+
+
+def _build_transcribe_kwargs() -> dict:
+    beam_size = _resolve_beam_size()
+    kwargs = {
+        "language": "pt",
+        "task": "transcribe",
+        "beam_size": beam_size,
+        "best_of": beam_size,
+        "temperature": 0.0,
+        "vad_filter": True,
+        "condition_on_previous_text": False,
+        "initial_prompt": _resolve_initial_prompt(),
+        "compression_ratio_threshold": 2.4,
+        "log_prob_threshold": -1.0,
+        "no_speech_threshold": 0.5,
+    }
+    if _env_flag("WHISPER_VAD_PARAMETERS", default=True):
+        kwargs["vad_parameters"] = {
+            "min_silence_duration_ms": 400,
+            "speech_pad_ms": 300,
+            "threshold": 0.45,
+        }
+    return kwargs
+
+
 def transcribe_audio(audio_path: str | Path, model_size: str = "small") -> str:
     audio_path = Path(audio_path)
     if not audio_path.exists():
@@ -156,34 +328,28 @@ def transcribe_audio(audio_path: str | Path, model_size: str = "small") -> str:
     cache_root = Path.cwd() / "models_cache"
     cache_root.mkdir(parents=True, exist_ok=True)
 
+    prepared_path, temp_path = _prepare_audio_for_whisper(audio_path)
+    transcribe_path = prepared_path
+
     try:
-        model = WhisperModel(
-            model_source,
-            device="cpu",
-            compute_type="int8",
-            download_root=str(cache_root),
-        )
-        transcribe_kwargs = {
-            "language": "pt",
-            "task": "transcribe",
-            "beam_size": 5,
-            "best_of": 5,
-            "temperature": 0.0,
-            "vad_filter": True,
-            "condition_on_previous_text": False,
-            "initial_prompt": (
-                "Transcricao financeira em portugues do Brasil. "
-                "Preserve valores monetarios e numeros com o maximo de precisao."
-            ),
-        }
+        model = _get_whisper_model(WhisperModel, model_source, cache_root)
+        transcribe_kwargs = _build_transcribe_kwargs()
         try:
-            segments, _ = model.transcribe(str(audio_path), **transcribe_kwargs)
+            segments, _ = model.transcribe(str(transcribe_path), **transcribe_kwargs)
         except TypeError:
             # Compatibilidade com versoes antigas de faster-whisper.
-            segments, _ = model.transcribe(str(audio_path), language="pt")
-        text = " ".join(seg.text.strip() for seg in segments).strip()
+            segments, _ = model.transcribe(str(transcribe_path), language="pt")
+        text = _cleanup_transcription_text(
+            " ".join(seg.text.strip() for seg in segments)
+        )
     except Exception as exc:  # pragma: no cover - runtime branch
         raise TranscriptionError(f"Erro ao transcrever audio: {exc}") from exc
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     if not text:
         raise TranscriptionError("Nao foi possivel reconhecer fala no audio.")
