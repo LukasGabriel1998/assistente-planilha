@@ -14,25 +14,26 @@ Projeto para cliente leigo, com foco em simplicidade:
 - `src/parser.py`: interpreta texto livre (cliente, venda, entrada, saldo, material, datas).
 - `src/transcription.py`: transcricao local com `faster-whisper`.
 - `src/excel_store.py`: escrita segura no Excel e historico em `Log_Agente`.
-- `iniciar_app.bat`: atalho 1 clique para abrir o app.
+- `run_project.py`: setup automatico + executar App, Telegram ou API n8n (1 clique no Cursor).
 - `launcher.py`: interface desktop para cliente leigo.
 - `build_exe.bat`: gera executavel para distribuicao.
 - `empacotar_cliente.bat`: gera arquivo ZIP pronto para envio.
 - `preparar_modelo_audio.bat`: baixa modelo local de transcricao para uso sem depender de download no primeiro audio.
 
-## Rodar com 1 clique (Windows)
+## Rodar com 1 clique (Cursor / VS Code)
 
-1. Abra a pasta do projeto.
-2. Dê duplo clique em `iniciar_app.bat`.
-3. Mantenha a janela do terminal aberta.
-4. Abra `http://127.0.0.1:8501`.
+1. Abra `run_project.py`.
+2. Clique em **Run** (▶) ou use Run and Debug (`Ctrl+Shift+D`).
+3. Escolha: **Setup + Telegram**, **Setup + App**, etc.
 
-Esse script:
+Ou no terminal:
 
-- cria `.venv` se nao existir;
-- instala dependencias;
-- inicia o Streamlit sem prompt de email.
-- fixa a porta em `8501`.
+```powershell
+python run_project.py --telegram   # Telegram
+python run_project.py --app        # App desktop
+python run_project.py --all        # App + Telegram
+python run_project.py --setup-only # so instala bibliotecas
+```
 
 ## Gerar executavel para cliente
 
@@ -98,6 +99,7 @@ python -m streamlit run app.py
 ```
 assistente-planilha-1/
 ├── app.py                      # Interface web (Streamlit)
+├── run_project.py              # Setup + executar (1 clique)
 ├── launcher.py                 # Janela desktop (pywebview)
 ├── telegram_bot.py             # Bot Telegram
 ├── n8n_api.py                  # API HTTP para n8n
@@ -110,7 +112,6 @@ assistente-planilha-1/
 │   ├── n8n_service.py          # Camada da API n8n
 │   └── workbook_paths.py       # Caminho da planilha
 ├── docs/                       # Guias (Telegram, n8n)
-├── scripts/                    # Scripts auxiliares PowerShell
 ├── assets/                     # Icones e logos
 ├── models/                     # Modelo Whisper local (audio)
 └── n8n/                        # Workflow de exemplo
@@ -124,7 +125,7 @@ Passos:
 
 1. Copiar `.env.example` para `.env`.
 2. Definir `TELEGRAM_BOT_TOKEN` (token do @BotFather).
-3. Rodar `run_telegram_bot_universal.ps1` (ou `python telegram_bot.py`).
+3. Rodar `python run_project.py --telegram` (ou Run em `run_project.py` no Cursor).
 
 Guia completo: `docs/HOWTO_TELEGRAM.md`
 
@@ -134,7 +135,7 @@ Guia completo: `docs/HOWTO_TELEGRAM.md`
 
 ```powershell
 cd "C:\Users\Usuario\Desktop\DEV - PROJETOS\assistente-planilha-1"
-.\iniciar_app.bat
+python run_project.py --app
 ```
 
 Ou manualmente:
@@ -154,13 +155,13 @@ Abra `http://127.0.0.1:8501`, digite ou grave um comando e confira a previa ante
 ### 3) Bot Telegram
 
 ```powershell
-.\run_telegram_bot_universal.ps1
+python run_project.py --telegram
 ```
 
 ### 4) API n8n
 
 ```powershell
-.\iniciar_n8n_api.bat
+python run_project.py --n8n-api
 ```
 
 Documentacao interativa: `http://127.0.0.1:8765/docs` — guia em `docs/HOWTO_N8N.md`.

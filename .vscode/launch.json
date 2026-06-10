@@ -1,0 +1,64 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Telegram (1 clique — nova maquina)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_telegram.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true
+    },
+    {
+      "name": "1 clique: Setup + Telegram",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_project.py",
+      "args": ["--telegram"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true
+    },
+    {
+      "name": "1 clique: Setup + App",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_project.py",
+      "args": ["--app"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true
+    },
+    {
+      "name": "1 clique: Setup + App + Telegram",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_project.py",
+      "args": ["--all"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true
+    },
+    {
+      "name": "1 clique: Setup + API n8n",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_project.py",
+      "args": ["--n8n-api"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true
+    },
+    {
+      "name": "So instalar bibliotecas (setup)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_project.py",
+      "args": ["--setup-only"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true
+    }
+  ]
+}

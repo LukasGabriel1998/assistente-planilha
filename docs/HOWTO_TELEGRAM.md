@@ -24,15 +24,11 @@ O bot do Telegram usa a **mesma planilha** e a mesma lógica do app (vendas, est
 
 ## 3. Rodar o bot
 
-1. Ative o ambiente virtual (se usar):
+1. Abra `run_project.py` no Cursor e clique em **Run** (▶), ou execute:
    ```powershell
-   .\.venv\Scripts\Activate.ps1
+   python run_project.py --telegram
    ```
-2. Execute:
-   ```powershell
-   python telegram_bot.py
-   ```
-3. No Telegram, abra o seu bot (pelo username que você criou) e envie uma mensagem.
+2. No Telegram, abra o seu bot (pelo username que você criou) e envie uma mensagem.
 
 **Não precisa de ngrok nem de abrir porta.** O script usa long polling e funciona atrás de qualquer rede.
 

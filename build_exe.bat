@@ -26,7 +26,7 @@ if not exist "%VENV_DIR%\Scripts\python.exe" (
 )
 
 if not exist "%VENV_DIR%\Scripts\python.exe" (
-  echo [ERRO] Ambiente virtual nao encontrado. Execute iniciar_app.bat primeiro.
+  echo [ERRO] Ambiente virtual nao encontrado. Execute: python run_project.py --setup-only
   pause
   exit /b 1
 )
@@ -96,7 +96,7 @@ if not errorlevel 1 (
   echo [INFO] pywebview encontrado. O build vai incluir janela nativa.
 ) else (
   echo [ERRO] pywebview nao encontrado neste ambiente.
-  echo [DICA] Para gerar o executavel nativo, instale Python 3.13 ou 3.12 e rode iniciar_app.bat para recriar a .venv_native.
+  echo [DICA] Para gerar o executavel nativo, instale Python 3.13 ou 3.12 e rode: python run_project.py --setup-only
   echo [DICA] No Python 3.14 o pywebview/pythonnet pode falhar na instalacao dependendo do ambiente.
   pause
   exit /b 1

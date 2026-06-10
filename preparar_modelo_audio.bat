@@ -10,7 +10,7 @@ if not exist "%VENV_DIR%\Scripts\python.exe" (
 )
 
 if not exist "%VENV_DIR%\Scripts\python.exe" (
-  echo [ERRO] Ambiente virtual nao encontrado. Execute iniciar_app.bat primeiro.
+  echo [ERRO] Ambiente virtual nao encontrado. Execute: python run_project.py --setup-only
   pause
   exit /b 1
 )
