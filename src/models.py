@@ -17,6 +17,15 @@ class RefundCommand:
 
 
 @dataclass
+class DeleteSaleCommand:
+    """Comando para remover um registro de venda (e material vinculado) da planilha."""
+    sale_id: str
+    reason: str
+    ref_date: date
+    remove_material: bool = True
+
+
+@dataclass
 class Payment:
     label: str
     value: float

@@ -30,10 +30,27 @@ _MODEL_INSTANCE_CACHE: dict[str, object] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 
 _FINANCIAL_INITIAL_PROMPT = (
-    "Transcricao em portugues do Brasil de comandos financeiros falados. "
-    "Preserve nomes proprios, valores monetarios, datas e numeros com precisao. "
-    "Exemplos: vendi placa para o Joao por dois mil reais; entrou metade hoje; "
-    "saldo dia trinta; gastei oitocentos de material; recebi quinhentos da Maria."
+    "Transcricao em portugues do Brasil de comandos financeiros falados no Telegram. "
+    "Preserve nomes proprios, valores monetarios, datas, numeros e a palavra chat com precisao. "
+    "Exemplos: chat, aproveitando, adiciona mil reais de material para essa venda; "
+    "ID venda zero zero dois; acabei de fazer uma venda aqui para o Adriel; "
+    "eles compraram uma fachada, pagaram cinco mil e o restante amanha; "
+    "vendi um banner para a Maria por dois mil e quinhentos; "
+    "fechei um servico para a empresa Joao Joao; entrou metade hoje; "
+    "saldo dia trinta; gastei oitocentos de material; orcamento de material."
+)
+
+_COMMON_TRANSCRIPTION_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bbochat(?:e|ing)?\b", re.I), "chat"),
+    (re.compile(r"\bpuxat(?:e|ing)?\b", re.I), "chat"),
+    (re.compile(r"\bte\s+apag(?:a|ar)\b", re.I), "apaga"),
+    (re.compile(r"\bpucha\b", re.I), "chat"),
+    (re.compile(r"\bxat\b", re.I), "chat"),
+    (re.compile(r"\bchate\b", re.I), "chat"),
+    (re.compile(r"\bchats\b", re.I), "chat"),
+    (re.compile(r"\borcamento\b", re.I), "orçamento"),
+    (re.compile(r"\bmateria\s+prima\b", re.I), "matéria-prima"),
+    (re.compile(r"\bbander\b", re.I), "banner"),
 )
 
 
@@ -163,11 +180,11 @@ def _resolve_initial_prompt() -> str:
 
 
 def _resolve_beam_size() -> int:
-    raw = os.getenv("WHISPER_BEAM_SIZE", "5").strip()
+    raw = os.getenv("WHISPER_BEAM_SIZE", "7").strip()
     try:
         value = int(raw)
     except ValueError:
-        return 5
+        return 7
     return max(1, min(value, 10))
 
 
@@ -269,6 +286,15 @@ def _cleanup_transcription_text(text: str) -> str:
     return cleaned
 
 
+def _fix_common_transcription_errors(text: str) -> str:
+    from src.parser import normalize_spoken_ids_in_text
+
+    fixed = normalize_spoken_ids_in_text(text)
+    for pattern, replacement in _COMMON_TRANSCRIPTION_REPLACEMENTS:
+        fixed = pattern.sub(replacement, fixed)
+    return normalize_spoken_ids_in_text(fixed)
+
+
 def _get_whisper_model(WhisperModel: type, model_source: str, cache_root: Path):
     with _MODEL_CACHE_LOCK:
         cached = _MODEL_INSTANCE_CACHE.get(model_source)
@@ -339,8 +365,8 @@ def transcribe_audio(audio_path: str | Path, model_size: str = "small") -> str:
         except TypeError:
             # Compatibilidade com versoes antigas de faster-whisper.
             segments, _ = model.transcribe(str(transcribe_path), language="pt")
-        text = _cleanup_transcription_text(
-            " ".join(seg.text.strip() for seg in segments)
+        text = _fix_common_transcription_errors(
+            _cleanup_transcription_text(" ".join(seg.text.strip() for seg in segments))
         )
     except Exception as exc:  # pragma: no cover - runtime branch
         raise TranscriptionError(f"Erro ao transcrever audio: {exc}") from exc

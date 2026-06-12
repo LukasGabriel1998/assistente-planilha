@@ -10,7 +10,7 @@ from dataclasses import asdict
 from datetime import date
 from pathlib import Path
 from .excel_store import SpreadsheetService, DATA_START_ROW
-from .parser import parse_message, ParseResult, _is_service_delivery_finalized, _parse_pt_date
+from .parser import parse_message, ParseResult, _is_service_delivery_finalized, _is_delivery_explicitly_pending, _parse_pt_date
 from .models import StatusUpdateCommand
 from .workbook_paths import default_workbook_path, resolve_workbook_path
 
@@ -30,6 +30,9 @@ PREVIEW_KEYWORDS = (
 
 def sale_id_from_parse_result(parse_result: ParseResult) -> str | None:
     """Extrai o ID VENDA de um ParseResult para memória de contexto do chat."""
+    dc = getattr(parse_result, "delete_command", None)
+    if dc and getattr(dc, "sale_id", None):
+        return str(dc.sale_id).strip()
     su = getattr(parse_result, "status_update_command", None)
     if su and getattr(su, "sale_id", None):
         return str(su.sale_id).strip()
@@ -46,6 +49,50 @@ def _format_currency_pt(value: float) -> str:
     txt = f"{float(value or 0):,.2f}"
     txt = txt.replace(",", "X").replace(".", ",").replace("X", ".")
     return f"R$ {txt}"
+
+
+def _load_sale_context_for_preview(sale_id: str) -> dict[str, str | float] | None:
+    """Lê cliente, produto e valores da planilha para enriquecer prévias de atualização."""
+    sale_id = str(sale_id or "").strip()
+    if not sale_id:
+        return None
+    workbook_path = get_default_workbook()
+    if not workbook_path or not Path(workbook_path).exists():
+        return None
+    try:
+        service = SpreadsheetService(workbook_path)
+        wb = service._open_workbook(data_only=True)
+        try:
+            sales_name = service._resolve_sheet_name(wb, "TOTAL DE VENDAS DE 2026")
+            ws_sales = wb[sales_name]
+            snapshot = service._sale_snapshot(ws_sales, sale_id)
+            if not snapshot:
+                return None
+            sales_cols = service._sales_columns(ws_sales)
+            col_sale_id = sales_cols["id venda"]
+            total_pago = 0.0
+            total_pendente = 0.0
+            for row in range(DATA_START_ROW, min(ws_sales.max_row + 1, service.MAX_DATA_ROW)):
+                if str(ws_sales[f"{col_sale_id}{row}"].value or "").strip() == sale_id:
+                    total_pago = service._to_float(
+                        ws_sales[f"{sales_cols['total de vendas (pago)']}{row}"].value
+                    )
+                    total_pendente = service._to_float(
+                        ws_sales[f"{sales_cols['valor (pendente)']}{row}"].value
+                    )
+                    break
+            return {
+                "customer": snapshot.get("customer") or "",
+                "product": snapshot.get("description") or "",
+                "sale_date": snapshot.get("sale_date") or "",
+                "total_value": total_pago + total_pendente,
+                "total_pago": total_pago,
+                "total_pendente": total_pendente,
+            }
+        finally:
+            wb.close()
+    except Exception:
+        return None
 
 
 def get_default_workbook() -> str:
@@ -78,6 +125,13 @@ def format_reply(intent: str, actions: list, error: str | None = None) -> str:
     if intent == "refund" and actions:
         a = actions[0]
         return f"✅ *Estorno registrado!*\n\nAba: {a.get('sheet', '')}\nLinha: {a.get('row', '')}"
+    if intent == "sale_delete" and actions:
+        a = actions[0]
+        return (
+            f"✅ *Registro apagado da planilha!*\n\n"
+            f"ID VENDA: {a.get('sale_id', '')}\n"
+            f"Os dados da venda (e material vinculado) foram removidos."
+        )
     if intent == "status_update" and actions:
         a = actions[0]
         return f"✅ *Status atualizado!*\n\nID VENDA: {a.get('sale_id', '')}\nPlanilha atualizada com sucesso."
@@ -217,15 +271,79 @@ def build_preview(parse_result: ParseResult) -> str:
             lines.append(
                 "_Depois, se já entregou, basta dizer: `entrega foi hoje` ou `para ele, entrega hoje`._"
             )
+            lines.append(
+                f"_Lembrete automático será enviado na data de entrega ({delivery}) enquanto não for finalizado._"
+            )
         lines.append(f"🔁 Novo status: *{su.status.upper()}*")
         lines.append("\nSe estiver correto, responda *SIM*. Para corrigir, envie por texto. Para cancelar, responda *NÃO*.")
         return "\n".join(lines)
 
-    # Prévia padrão (venda/estorno/misto)
+    if parse_result.intent == "sale_delete" and getattr(parse_result, "delete_command", None) is not None:
+        dc = parse_result.delete_command
+        if not dc.sale_id and getattr(parse_result.command, "sale_id", None):
+            dc.sale_id = str(parse_result.command.sale_id).strip()
+        if not dc.sale_id:
+            return (
+                "📋 *Entendi assim: apagar registro da planilha*\n\n"
+                "Não identifiquei qual venda apagar.\n"
+                "Informe o *ID VENDA*, por exemplo: `id venda 003` ou `cliente id 003`.\n\n"
+                "Para cancelar, responda *NÃO*."
+            )
+        sale_ctx = _load_sale_context_for_preview(dc.sale_id)
+        if not sale_ctx:
+            return (
+                "📋 *Entendi assim: apagar registro da planilha*\n\n"
+                f"ID VENDA *{dc.sale_id}* não encontrado na planilha.\n"
+                "Confira o ID e tente de novo, ou responda *NÃO* para cancelar."
+            )
+        total_value = float(sale_ctx.get("total_value") or 0.0)
+        total_pago = float(sale_ctx.get("total_pago") or 0.0)
+        total_pendente = float(sale_ctx.get("total_pendente") or 0.0)
+        lines = ["📋 *Entendi assim: apagar registro da planilha*", ""]
+        lines.append(f"🧾 ID VENDA: *{dc.sale_id}*")
+        lines.append(f"👤 Cliente: *{sale_ctx.get('customer') or '-'}*")
+        lines.append(f"📦 Produto: *{sale_ctx.get('product') or '-'}*")
+        lines.append(f"📅 Data da venda: *{sale_ctx.get('sale_date') or '-'}*")
+        if total_value > 0:
+            lines.append(f"💰 Valor total: *{_format_currency_pt(total_value)}*")
+            lines.append(
+                f"   Pago: {_format_currency_pt(total_pago)} | "
+                f"Pendente: {_format_currency_pt(total_pendente)}"
+            )
+        else:
+            lines.append("💰 Valor total: *-*")
+        lines.append(f"🔎 Status atual: *{sale_ctx.get('payment_status') or '-'}*")
+        if sale_ctx.get("delivery_date"):
+            lines.append(f"📅 Data de entrega: *{sale_ctx['delivery_date']}*")
+        lines.append("")
+        lines.append(f"📝 Motivo: _{dc.reason}_")
+        lines.append("")
+        lines.append(
+            "⚠️ *Este registro será removido da planilha* "
+            "(venda, lembrete e material vinculado a este ID)."
+        )
+        lines.append(
+            "\n*Quer mesmo apagar esses dados?* Responda *SIM* para confirmar ou *NÃO* para manter na planilha."
+        )
+        return "\n".join(lines)
+
+    # Prévia padrão (venda/estorno/misto/atualização de material)
     cmd = parse_result.command
-    lines = ["📋 *Entendi assim:*", ""]
-    lines.append(f"👤 Cliente: *{cmd.customer or '-'}*")
-    lines.append(f"📦 Produto: *{cmd.product_id or '-'}*")
+    sale_ctx = (
+        _load_sale_context_for_preview(str(cmd.sale_id))
+        if getattr(cmd, "sale_id", None)
+        else None
+    )
+    customer = (cmd.customer or (sale_ctx or {}).get("customer") or "-").strip() or "-"
+    product = (cmd.product_id or (sale_ctx or {}).get("product") or "-").strip() or "-"
+    total_value = cmd.total_value or ((sale_ctx or {}).get("total_value") if sale_ctx else None)
+
+    if parse_result.intent == "material_update":
+        lines = ["📋 *Entendi assim: adicionar material*", ""]
+    else:
+        lines = ["📋 *Entendi assim:*", ""]
+    lines.append(f"👤 Cliente: *{customer}*")
+    lines.append(f"📦 Produto: *{product}*")
     if getattr(cmd, "sale_id", None):
         lines.append(f"🧾 ID VENDA: *{cmd.sale_id}*")
     elif cmd.material_cost:
@@ -235,9 +353,19 @@ def build_preview(parse_result: ParseResult) -> str:
             lines.append(f"📅 Data da venda: *hoje ({cmd.sale_date.strftime('%d/%m/%Y')})*")
         else:
             lines.append(f"📅 Data da venda: *{cmd.sale_date.strftime('%d/%m/%Y')}*")
+    elif sale_ctx and sale_ctx.get("sale_date"):
+        lines.append(f"📅 Data da venda: *{sale_ctx['sale_date']}*")
     else:
         lines.append("📅 Data da venda: *-*")
-    lines.append(f"💰 Valor total: *{_format_currency_pt(cmd.total_value)}*" if cmd.total_value else "💰 Valor total: *-*")
+    if total_value:
+        lines.append(f"💰 Valor total: *{_format_currency_pt(float(total_value))}*")
+        if sale_ctx and (sale_ctx.get("total_pago") or sale_ctx.get("total_pendente")):
+            lines.append(
+                f"   Pago: {_format_currency_pt(float(sale_ctx['total_pago']))} | "
+                f"Pendente: {_format_currency_pt(float(sale_ctx['total_pendente']))}"
+            )
+    else:
+        lines.append("💰 Valor total: *-*")
     if cmd.payments:
         for p in cmd.payments:
             due_txt = p.due_date.strftime("%d/%m/%Y") if getattr(p, "due_date", None) else "-"
@@ -302,7 +430,7 @@ def apply_parse_result(
             return "Faltou a *Data de Entrega*. Ex.: `entrega 10/04`."
         sale_id = str(cmd.sale_id).strip()
         service.update_sale_delivery_date(sale_id, cmd.service_due_date)
-        if _is_service_delivery_finalized(original_text):
+        if _is_service_delivery_finalized(original_text) and not _is_delivery_explicitly_pending(original_text):
             service.finalize_service(sale_id)
             return format_reply("delivery_finalize", [{"sale_id": sale_id, "sheet": "vendas"}], error=None)
         return format_reply("delivery_update", [{"sale_id": sale_id, "sheet": "vendas"}], error=None)
@@ -347,15 +475,24 @@ def apply_parse_result(
         )
         actions = [action]
         sale_id = parse_result.status_update_command.sale_id
-        if cmd.service_due_date is not None:
+        delivery_still_pending = _is_delivery_explicitly_pending(original_text)
+        if cmd.service_due_date is not None and not delivery_still_pending:
             service.update_sale_delivery_date(sale_id, cmd.service_due_date)
-        elif _is_service_delivery_finalized(original_text):
+        elif _is_service_delivery_finalized(original_text) and not delivery_still_pending:
             delivery_date = _parse_pt_date(original_text, date.today(), full_text=original_text) or date.today()
             service.update_sale_delivery_date(sale_id, delivery_date)
             service.finalize_service(sale_id)
+            service.refresh_delivery_reminder(sale_id, chat_id=chat_id or "", mark_delivered=True)
+        else:
+            service.refresh_delivery_reminder(sale_id, chat_id=chat_id or "", mark_delivered=False)
     elif parse_result.intent == "refund" and parse_result.refund_command is not None:
         action = service.apply_refund(
             parse_result.refund_command, original_text=original_text, origin=origin
+        )
+        actions = [action]
+    elif parse_result.intent == "sale_delete" and parse_result.delete_command is not None:
+        action = service.delete_sale(
+            parse_result.delete_command, original_text=original_text, origin=origin
         )
         actions = [action]
     else:
@@ -486,6 +623,13 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
     elif parse_result.intent == "refund" and parse_result.refund_command is not None:
         action = service.apply_refund(
             parse_result.refund_command,
+            original_text=text,
+            origin=origin,
+        )
+        actions = [action]
+    elif parse_result.intent == "sale_delete" and parse_result.delete_command is not None:
+        action = service.delete_sale(
+            parse_result.delete_command,
             original_text=text,
             origin=origin,
         )

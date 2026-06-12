@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import copy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 import os
 import re
@@ -13,7 +13,7 @@ from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.styles import PatternFill
 
-from .models import FinancialCommand, RefundCommand, StatusUpdateCommand
+from .models import DeleteSaleCommand, FinancialCommand, RefundCommand, StatusUpdateCommand
 
 SHEET_SALES = "TOTAL DE VENDAS DE 2026"
 # Nome normalizado; no Excel a aba pode ser "Compras Matéria-Prima" (com acento).
@@ -1303,6 +1303,57 @@ class SpreadsheetService:
             for col in range(1, ws.max_column + 1):
                 ws.cell(row=target_row, column=col).fill = fill
 
+    def _existing_reminder_chat_id(self, wb, sale_id: str) -> str:
+        if SHEET_REMINDERS not in wb.sheetnames:
+            return ""
+        ws = wb[SHEET_REMINDERS]
+        headers = self._reminders_header_map(ws)
+        col_sale_id = headers.get(self._normalize_name("ID VENDA"), 1)
+        col_chat = headers.get(self._normalize_name("Chat ID"))
+        if not col_chat:
+            return ""
+        for row in range(2, ws.max_row + 1):
+            if str(ws.cell(row=row, column=col_sale_id).value or "").strip() == str(sale_id).strip():
+                return str(ws.cell(row=row, column=col_chat).value or "").strip()
+        return ""
+
+    def refresh_delivery_reminder(
+        self,
+        sale_id: str,
+        chat_id: str = "",
+        *,
+        mark_delivered: bool = False,
+    ) -> None:
+        """Sincroniza lembrete de entrega após atualização de pagamento/status."""
+        wb = self._open_workbook()
+        try:
+            sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
+            ws_sales = wb[sales_name]
+            snap = self._sale_snapshot(ws_sales, str(sale_id).strip())
+            if not snap:
+                return
+            existing_chat = (chat_id or "").strip() or self._existing_reminder_chat_id(wb, sale_id)
+            pending_amount = self._to_float(snap.get("pending_amount"))
+            payment_status_raw = (snap.get("payment_status") or self._status_text(pending_amount)).strip()
+            payment_status = payment_status_raw.upper() if payment_status_raw else ("PENDENTE" if pending_amount > 0.01 else "PAGO")
+            due_date = self._parse_date_cell(snap.get("delivery_date"))
+            sale_date = self._parse_date_cell(snap.get("sale_date")) or date.today()
+            self.upsert_reminder(
+                wb,
+                sale_id=str(sale_id).strip(),
+                customer=snap.get("customer", ""),
+                description=snap.get("description", ""),
+                sale_date=sale_date,
+                due_date=due_date,
+                pending_amount=pending_amount,
+                payment_status=payment_status,
+                service_status="FINALIZADO" if mark_delivered else "PENDENTE",
+                chat_id=existing_chat,
+            )
+            self._save_workbook(wb)
+        finally:
+            wb.close()
+
     def list_due_reminders(self, wb, today) -> list[dict]:
         """
         Retorna lembretes do dia, mas agora com consistência:
@@ -1451,6 +1502,101 @@ class SpreadsheetService:
             "pending_amount": _v("valor (pendente)"),
             "payment_status": _v("status de valor"),
         }
+
+    def _delete_reminder(self, wb, sale_id: str) -> bool:
+        if SHEET_REMINDERS not in wb.sheetnames:
+            return False
+        ws = wb[SHEET_REMINDERS]
+        headers = self._reminders_header_map(ws)
+        col_sale_id = headers.get(self._normalize_name("ID VENDA"), 1)
+        for row in range(2, ws.max_row + 1):
+            if str(ws.cell(row=row, column=col_sale_id).value or "").strip() != str(sale_id).strip():
+                continue
+            for col in range(1, ws.max_column + 1):
+                ws.cell(row=row, column=col).value = None
+            return True
+        return False
+
+    def _count_material_rows_for_sale(self, ws, sale_id: str) -> int:
+        material_cols = self._material_columns(ws)
+        col_sale_id = material_cols.get("id venda")
+        if not col_sale_id:
+            return 0
+        count = 0
+        for row in range(DATA_START_ROW, min(ws.max_row + 1, self.MAX_DATA_ROW)):
+            if str(ws[f"{col_sale_id}{row}"].value or "").strip() == str(sale_id).strip():
+                count += 1
+        return count
+
+    def delete_sale(
+        self,
+        delete_cmd: DeleteSaleCommand,
+        original_text: str = "",
+        origin: str = "telegram",
+    ) -> WriteAction:
+        """Remove linha de venda (e material/lembrete vinculados) da planilha."""
+        wb = self._open_workbook()
+        try:
+            sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
+            ws_sales = wb[sales_name]
+            ws_log = self._ensure_log_sheet(wb)
+            sales_cols = self._sales_columns(ws_sales)
+            sale_id = str(delete_cmd.sale_id).strip()
+            row = self._find_sale_row(ws_sales, sales_cols["id venda"], sale_id)
+            snap = self._sale_snapshot(ws_sales, sale_id)
+            style_cols = self._sales_style_cols(ws_sales)
+            self._clear_row_values(ws_sales, row, style_cols)
+
+            if delete_cmd.remove_material:
+                material_name = self._resolve_sheet_name(wb, SHEET_MATERIAL)
+                ws_material = wb[material_name]
+                material_cols = self._material_columns(ws_material)
+                col_sid = material_cols.get("id venda")
+                if col_sid:
+                    mat_cols = (
+                        material_cols["data"],
+                        material_cols["descricao"],
+                        material_cols["valor"],
+                    )
+                    if material_cols.get("fornecedor"):
+                        mat_cols = (material_cols["fornecedor"],) + mat_cols
+                    mat_cols = mat_cols + (col_sid,)
+                    for mat_row in range(DATA_START_ROW, min(ws_material.max_row + 1, self.MAX_DATA_ROW)):
+                        if str(ws_material[f"{col_sid}{mat_row}"].value or "").strip() != sale_id:
+                            continue
+                        self._clear_row_values(ws_material, mat_row, mat_cols)
+
+            self._delete_reminder(wb, sale_id)
+            action = WriteAction(
+                sheet=sales_name,
+                row=row,
+                amount=0.0,
+                label="Exclusao",
+                sale_id=sale_id,
+            )
+            self._append_log(
+                ws=ws_log,
+                log_id=f"{datetime.now().strftime('%Y%m%d%H%M%S')}-D-1",
+                origin=origin,
+                cmd=FinancialCommand(
+                    customer=(snap or {}).get("customer") or "",
+                    description=delete_cmd.reason,
+                    sale_date=delete_cmd.ref_date,
+                    total_value=0.0,
+                    payments=[],
+                    sale_id=sale_id,
+                    product_id=(snap or {}).get("description") or "",
+                ),
+                amount=0.0,
+                ref_date=delete_cmd.ref_date,
+                sheet=sales_name,
+                row=row,
+                original_text=original_text or delete_cmd.reason,
+            )
+            self._save_workbook(wb)
+            return action
+        finally:
+            wb.close()
 
     def _append_sale(self, wb, ws, cmd: FinancialCommand) -> tuple[int, str, float]:
         """Adiciona uma linha de venda. Só preenche valores; layout (fonte, cor, borda) fica como na planilha."""
