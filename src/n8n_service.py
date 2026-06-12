@@ -193,6 +193,7 @@ def handle_message(
             "delivery_update",
             "delivery_finalize",
             "material_update",
+            "sale_delete",
         ):
             preview = build_preview(parse_result)
             extra = ""

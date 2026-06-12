@@ -24,7 +24,7 @@ from src.bot_processor import (
     process_command,
     sale_id_from_parse_result,
 )
-from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer, apply_multi_field_corrections, apply_preview_corrections
+from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer, apply_multi_field_corrections, apply_preview_corrections, extract_supplemental_sale_id
 from src.transcription import TranscriptionError, transcribe_audio
 
 # Carregar .env
@@ -929,7 +929,7 @@ def run_polling() -> None:
                     cmd = parse_result.command
                     # Se ainda faltar ID Cliente, não salva: pede o ID e recoloca a prévia pendente.
                     # Para atualização de status e atualização de entrega, nao exigimos cmd.customer.
-                    if parse_result.intent not in ("status_update", "delivery_update", "delivery_finalize", "payment_update"):
+                    if parse_result.intent not in ("status_update", "delivery_update", "delivery_finalize", "payment_update", "sale_delete"):
                         if "ID Cliente" in parse_result.missing_fields or not (cmd.customer or "").strip():
                             pending_preview[chat_id] = pending
                             send_message(
@@ -954,7 +954,7 @@ def run_polling() -> None:
                         if (p.status or "").strip().lower() != "pago":
                             pending_amount += float(p.value or 0.0)
                     needs_delivery_date = (
-                        parse_result.intent not in ("status_update", "payment_update", "delivery_update", "delivery_finalize")
+                        parse_result.intent not in ("status_update", "payment_update", "delivery_update", "delivery_finalize", "sale_delete")
                         and cmd.service_due_date is None
                         and (cmd.total_value or 0.0) > 0.01
                         and pending_amount <= 0.01
@@ -1017,6 +1017,21 @@ def run_polling() -> None:
                         lower = text.strip().lower()
                         pending = pending_preview.get(chat_id)
                         if pending:
+                            repl = parse_message(text, reference_date=date.today())
+                            if (
+                                repl.intent == "sale_delete"
+                                and repl.delete_command
+                                and repl.delete_command.sale_id
+                                and not repl.missing_fields
+                            ):
+                                pending_preview[chat_id] = {
+                                    "parse_result": repl,
+                                    "original_text": text,
+                                    "origin": pending.get("origin", "telegram"),
+                                }
+                                send_message(chat_id, build_preview(repl), parse_mode="Markdown")
+                                continue
+                        if pending:
                             parse_result = pending["parse_result"]
                             cmd = parse_result.command
                             updated = apply_multi_field_corrections(
@@ -1024,6 +1039,17 @@ def run_polling() -> None:
                             )
                             if not updated:
                                 updated = apply_preview_corrections(text, cmd)
+                            if not updated and "ID VENDA" in parse_result.missing_fields:
+                                supplemental_id = extract_supplemental_sale_id(text)
+                                if supplemental_id:
+                                    cmd.sale_id = supplemental_id
+                                    dc = getattr(parse_result, "delete_command", None)
+                                    if dc is not None:
+                                        dc.sale_id = supplemental_id
+                                    parse_result.missing_fields = [
+                                        f for f in parse_result.missing_fields if f != "ID VENDA"
+                                    ]
+                                    updated = True
                             if updated:
                                 # Se o usuário forneceu o ID Cliente, remover da lista de missing.
                                 if (cmd.customer or "").strip() and "ID Cliente" in parse_result.missing_fields:
@@ -1035,6 +1061,9 @@ def run_polling() -> None:
                                     parse_result.missing_fields = [
                                         f for f in parse_result.missing_fields if f != "ID VENDA"
                                     ]
+                                dc = getattr(parse_result, "delete_command", None)
+                                if dc is not None and getattr(cmd, "sale_id", None):
+                                    dc.sale_id = str(cmd.sale_id).strip()
                                 pending["parse_result"] = parse_result
                                 preview_text = build_preview(parse_result)
                                 send_message(chat_id, preview_text, parse_mode="Markdown")
@@ -1366,6 +1395,7 @@ def run_polling() -> None:
                         "delivery_update",
                         "delivery_finalize",
                         "material_update",
+                        "sale_delete",
                     ):
                         preview_text = build_preview(parse_result)
                         send_message(
@@ -1390,6 +1420,7 @@ def run_polling() -> None:
                         "delivery_update",
                         "delivery_finalize",
                         "material_update",
+                        "sale_delete",
                     ):
                         preview_text = build_preview(parse_result)
                         send_message(
@@ -1429,6 +1460,7 @@ def run_polling() -> None:
                     "delivery_update",
                     "delivery_finalize",
                     "material_update",
+                    "sale_delete",
                 ):
                     preview_text = build_preview(parse_result)
                     send_message(chat_id, preview_text, parse_mode="Markdown")
@@ -1537,6 +1569,7 @@ def _run_local_test(args: argparse.Namespace) -> None:
         "delivery_update",
         "delivery_finalize",
         "material_update",
+        "sale_delete",
     ):
         preview_text = build_preview(parse_result)
         print(preview_text)
