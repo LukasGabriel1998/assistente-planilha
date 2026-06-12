@@ -724,6 +724,26 @@ def get_updates(offset: int | None = None) -> list[dict]:
         return []
 
 
+def _print_bot_identity() -> None:
+    """Mostra no terminal qual bot esta conectado."""
+    try:
+        r = requests.get(f"{BASE_URL}/getMe", timeout=10)
+        if r.status_code != 200:
+            print(f"[Telegram] Aviso: API retornou HTTP {r.status_code}", flush=True)
+            return
+        data = r.json()
+        if not data.get("ok"):
+            print(f"[Telegram] Aviso: token invalido ou bot inacessivel.", flush=True)
+            return
+        bot = data.get("result", {})
+        name = bot.get("first_name", "?")
+        username = bot.get("username", "")
+        label = f"@{username}" if username else name
+        print(f"[Telegram] Conectado: {label} ({name})", flush=True)
+    except Exception as e:
+        print(f"[Telegram] Aviso: nao foi possivel validar bot na API: {e}", flush=True)
+
+
 def run_polling() -> None:
     """Loop principal: processa mensagens e responde."""
     _acquire_single_instance_lock()
@@ -731,7 +751,13 @@ def run_polling() -> None:
         print("[Telegram] Configure TELEGRAM_BOT_TOKEN no .env (token do @BotFather).")
         return
 
-    print("[Telegram] Bot iniciado. Aguardando mensagens... (Ctrl+C para parar)")
+    workbook = get_default_workbook()
+    print("[Telegram] Bot iniciado. Aguardando mensagens... (Ctrl+C para parar)", flush=True)
+    if workbook:
+        print(f"[Telegram] Planilha ativa: {workbook}", flush=True)
+    _print_bot_identity()
+    print(f"[Telegram] {time.strftime('%H:%M:%S')} — polling ativo (atualiza a cada ~2 min)", flush=True)
+
     next_offset = None
     seen_update_ids: set[int] = set()
     seen_message_keys: set[tuple[int | str, int]] = set()
@@ -744,9 +770,20 @@ def run_polling() -> None:
     last_customer_by_chat: dict[int | str, str] = {}
     last_sale_id_by_chat: dict[int | str, str] = {}
     last_reminder_check = 0.0
+    last_status_ping = time.time()
+    status_interval_s = 120.0
 
     while True:
         updates = get_updates(offset=next_offset)
+        now = time.time()
+        if not updates and now - last_status_ping >= status_interval_s:
+            print(
+                f"[Telegram] {time.strftime('%H:%M:%S')} — online, aguardando mensagens...",
+                flush=True,
+            )
+            last_status_ping = now
+        elif updates:
+            last_status_ping = now
         for update in updates:
             uid = update.get("update_id", 0)
             if isinstance(uid, int) and uid in seen_update_ids:

@@ -89,6 +89,27 @@ def _bootstrap_and_reexec() -> None:
     raise SystemExit(result.returncode)
 
 
+def _print_startup_status() -> None:
+    from src.bootstrap import ENV_FILE, PROJECT_DIR, load_dotenv_into_os
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    workbook = os.getenv("WORKBOOK_PATH", "").strip().strip('"').strip("'")
+
+    _log("--- Status do robo ---")
+    _log(f"Pasta    : {PROJECT_DIR}")
+    _log(f"Python   : {sys.executable}")
+    _log(f".env     : {'OK' if ENV_FILE.is_file() else 'NAO ENCONTRADO'}")
+    if token and token != "COLOQUE_SEU_TOKEN_AQUI":
+        masked = f"{token[:6]}...{token[-4:]}" if len(token) > 12 else "***"
+        _log(f"Token    : configurado ({masked})")
+    else:
+        _log("Token    : NAO CONFIGURADO")
+    if workbook and Path(workbook).is_file():
+        _log(f"Planilha : {workbook}")
+    else:
+        _log("Planilha : sera detectada automaticamente")
+    _log("--------------------")
+
+
 def _start_telegram() -> None:
     from src.bootstrap import (
         ensure_workbook_path,
@@ -107,13 +128,13 @@ def _start_telegram() -> None:
     py = setup_project(verbose=False, prefix="Telegram")
     load_dotenv_into_os()
     ensure_workbook_path(prefix="Telegram")
+    _print_startup_status()
     stop_old_bot_instances(prefix="Telegram")
     validate_telegram_token()
 
     bot = PROJECT_DIR / "telegram_bot.py"
-    blog(f"Projeto: {PROJECT_DIR}", prefix="Telegram")
-    blog("Bot ativo. Ctrl+C para parar.", prefix="Telegram")
-    proc = subprocess.run([str(py), str(bot)], cwd=str(PROJECT_DIR))
+    blog("Iniciando bot... (mensagens aparecem abaixo)", prefix="Telegram")
+    proc = subprocess.run([str(py), "-u", str(bot)], cwd=str(PROJECT_DIR))
     raise SystemExit(proc.returncode)
 
 
