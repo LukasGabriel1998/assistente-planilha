@@ -314,6 +314,24 @@ class SpreadsheetService:
                 return True
         return False
 
+    def is_sale_delivered(self, sale_id: str) -> bool:
+        """True quando a venda já está marcada como entregue (Data de Entrega verde)."""
+        sale_id = str(sale_id or "").strip()
+        if not sale_id:
+            return False
+        wb = self._open_workbook(data_only=True)
+        try:
+            sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
+            ws_sales = wb[sales_name]
+            sales_cols = self._sales_columns(ws_sales)
+            try:
+                row = self._find_sale_row(ws_sales, sales_cols["id venda"], sale_id)
+            except ValueError:
+                return False
+            return self._is_service_delivered(ws_sales, sales_cols, row)
+        finally:
+            wb.close()
+
     @classmethod
     def _apply_sales_row_visual_status(
         cls,

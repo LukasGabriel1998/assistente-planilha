@@ -1249,6 +1249,64 @@ def _workbook_path_for_bot() -> str:
     return wb_path or ""
 
 
+def _is_sale_already_delivered(sale_id: str | None) -> bool:
+    """Consulta a planilha: Data de Entrega verde = serviço já entregue."""
+    sale_id = str(sale_id or "").strip()
+    if not sale_id:
+        return False
+    workbook_path = _workbook_path_for_bot()
+    if not workbook_path or not Path(workbook_path).exists():
+        return False
+    try:
+        from src.excel_store import SpreadsheetService
+
+        return SpreadsheetService(workbook_path).is_sale_delivered(sale_id)
+    except Exception:
+        return False
+
+
+def _should_ask_delivery_date(parse_result, cmd) -> bool:
+    """
+    Pergunta data de entrega só em venda nova com valor.
+    Atualizações (custo, pagamento, status etc.) e vendas já entregues não perguntam.
+    """
+    if parse_result.intent in (
+        "status_update",
+        "payment_update",
+        "delivery_update",
+        "delivery_finalize",
+        "sale_delete",
+        "material_update",
+        "mixed_update",
+    ):
+        return False
+
+    has_material = bool(
+        (getattr(cmd, "material_cost", None) or 0) > 0
+        or getattr(cmd, "material_allocations", None)
+    )
+    sale_id = getattr(cmd, "sale_id", None)
+    if has_material and sale_id:
+        return False
+
+    if cmd.service_due_date is not None:
+        return False
+    if (cmd.total_value or 0.0) <= 0.01:
+        return False
+
+    pending_amount = 0.0
+    for p in cmd.payments:
+        if (p.status or "").strip().lower() != "pago":
+            pending_amount += float(p.value or 0.0)
+    if pending_amount > 0.01:
+        return False
+
+    if sale_id and _is_sale_already_delivered(str(sale_id)):
+        return False
+
+    return True
+
+
 def _build_dashboard_reply(cmd_strip: str) -> tuple[str, str | None]:
     """
     Gera texto + imagem abrindo a planilha uma única vez (Prévia/Status/Resumo).
@@ -1961,16 +2019,7 @@ def run_polling() -> None:
                         continue
                     # Se não informou data de entrega e for um fluxo de venda (tem valor/parcelas),
                     # e não houver pendência de pagamento, perguntar a data.
-                    pending_amount = 0.0
-                    for p in cmd.payments:
-                        if (p.status or "").strip().lower() != "pago":
-                            pending_amount += float(p.value or 0.0)
-                    needs_delivery_date = (
-                        parse_result.intent not in ("status_update", "payment_update", "delivery_update", "delivery_finalize", "sale_delete")
-                        and cmd.service_due_date is None
-                        and (cmd.total_value or 0.0) > 0.01
-                        and pending_amount <= 0.01
-                    )
+                    needs_delivery_date = _should_ask_delivery_date(parse_result, cmd)
                     if needs_delivery_date:
                         pending_delivery[chat_id] = pending
                         send_message(
@@ -2132,7 +2181,10 @@ def run_polling() -> None:
                                 except Exception:
                                     continue
                         if parsed is None:
-                            raise ValueError("Data inválida.")
+                            if _is_service_delivery_finalized(raw):
+                                parsed = date.today()
+                            else:
+                                raise ValueError("Data inválida.")
                         parse_result = pending["parse_result"]
                         parse_result.command.service_due_date = parsed
                         if _is_service_delivery_finalized(raw):

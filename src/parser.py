@@ -704,6 +704,8 @@ def _is_service_delivery_finalized(text: str) -> bool:
         return True
     if re.search(r"\bja\s+entreg", norm):
         return True
+    if re.search(r"\bja\s+foi\s+entreg", norm):
+        return True
     return any(
         token in norm
         for token in (
@@ -1279,6 +1281,8 @@ def _extract_target_sale_id_for_updates(text: str) -> Optional[str]:
             "matéria prima",
             "gastar",
             "gasto",
+            "custo",
+            "custos",
             "adiciona",
             "adicionar",
             "ajusta",
@@ -2121,11 +2125,46 @@ def parse_multi_sales_message(
     return results if len(results) >= 2 else None
 
 
+_SERVICE_COST_PREFIXES = (
+    r"custo(?:\s+de)?",
+    r"custos(?:\s+de)?",
+    r"custou",
+    r"teve\s+um\s+custo(?:\s+de)?",
+    r"tive\s+um\s+custo(?:\s+de)?",
+    r"houve\s+um\s+custo(?:\s+de)?",
+)
+
+
+def _is_service_cost_update(text: str) -> bool:
+    """True quando o usuário informa custo de um serviço/venda já existente (não valor da venda)."""
+    return bool(re.search(r"\bcust(?:o|os|ou)\b", _normalize(text), flags=re.IGNORECASE))
+
+
+def _extract_service_cost_amount(text: str) -> Optional[float]:
+    """Extrai valor citado junto de 'custo' (ex.: 'tive um custo de 800 reais')."""
+    value = _extract_amount_after_prefix(
+        text,
+        prefixes=list(_SERVICE_COST_PREFIXES),
+        max_gap_words=3,
+    )
+    if value:
+        return value
+    return _extract_amount_before_prefix(
+        text,
+        prefixes=[r"custo(?:\s+de)?", r"custos(?:\s+de)?"],
+        max_gap_words=5,
+    )
+
+
 def _extract_material_cost(text: str) -> Optional[float]:
     """
     Extrai custo de material priorizando o trecho próximo a palavras-chave
     para evitar capturar "metade" da venda por engano.
     """
+    if _is_service_cost_update(text):
+        service_cost = _extract_service_cost_amount(text)
+        if service_cost:
+            return service_cost
     norm = _normalize(text)
     keyword_positions: list[int] = []
     material_keywords = (
@@ -2134,6 +2173,9 @@ def _extract_material_cost(text: str) -> Optional[float]:
         r"\bfornecedor\b",
         r"\bgastar\b",
         r"\bgasto\b",
+        r"\bcusto\b",
+        r"\bcustos\b",
+        r"\bcustou\b",
         r"\bcompr(?:ar|ei)\s+(?:de\s+)?material\b",
         r"\bcompra\s+de\s+material\b",
     )
@@ -2522,9 +2564,12 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
         elif sale_digits and cust_norm.startswith(sale_digits):
             customer = ""
     product_id = _extract_product(raw_text) or ""
-    total_value = _extract_total_value(raw_text, numbers)
+    service_cost_update = bool(
+        (not sale_creation_context) and sale_id and _is_service_cost_update(raw_text)
+    )
+    total_value = None if service_cost_update else _extract_total_value(raw_text, numbers)
     itemized_products, itemized_total = _extract_itemized_products_and_total(raw_text)
-    if itemized_total is not None:
+    if itemized_total is not None and not service_cost_update:
         total_value = itemized_total
     if len(itemized_products) >= 2:
         product_id = " + ".join(itemized_products)
@@ -2543,9 +2588,11 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
             "comprei",
             "gastar",
             "gasto",
+            "custo",
+            "custos",
             "pagar",
         )
-    )
+    ) or service_cost_update
     material_reference_only = bool(
         (not sale_creation_context)
         and (status_value is None)
@@ -2696,6 +2743,11 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
         )
     if material_cost is None:
         material_cost = _extract_amount_after_prefix(raw_text, prefixes=[r"gastar", r"gasto"], max_gap_words=8)
+    if material_cost is None and _is_service_cost_update(raw_text):
+        material_cost = _extract_service_cost_amount(raw_text)
+    if service_cost_update and material_cost:
+        total_value = None
+        product_id = ""
     if material_cost is None:
         material_cost = _extract_amount_before_prefix(
             raw_text,
@@ -2923,20 +2975,22 @@ def detect_intent(message: str) -> str:
         return "sale_delete"
     sale_id = _extract_target_sale_id_for_updates(message) or _extract_delete_sale_id(message)
     status = _extract_status_value(message)
-    material_cost = _extract_amount_after_prefix(
-        message,
-        prefixes=[
-            r"material",
-            r"materia prima",
-            r"mat[eé]ria prima",
-            r"adicionar(?:\s+o)?\s+valor\s+de\s+material",
-            r"compra\s+de\s+material",
-            r"gastar",
-            r"gastei",
-            r"gasto",
-        ],
-        max_gap_words=8,
-    )
+    material_cost = _extract_material_cost(message)
+    if material_cost is None:
+        material_cost = _extract_amount_after_prefix(
+            message,
+            prefixes=[
+                r"material",
+                r"materia prima",
+                r"mat[eé]ria prima",
+                r"adicionar(?:\s+o)?\s+valor\s+de\s+material",
+                r"compra\s+de\s+material",
+                r"gastar",
+                r"gastei",
+                r"gasto",
+            ],
+            max_gap_words=8,
+        )
     material_allocations = _extract_material_allocations(message, date.today())
     delivery_date = _extract_delivery_update_date(message, date.today())
     payment_amount = _extract_amount_after_prefix(

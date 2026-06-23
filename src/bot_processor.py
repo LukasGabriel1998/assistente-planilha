@@ -167,7 +167,7 @@ def build_missing_fields_message(
             "Beleza! Quase lá — me manda mais alguns detalhes pra atualizar a planilha:"
         ),
         "material_update": (
-            "Entendi! Só preciso de mais alguns dados sobre a matéria-prima:"
+            "Entendi! Só preciso de mais alguns dados sobre o custo do serviço:"
         ),
         "refund": "Ok, vi que é um estorno. Me ajuda com mais algumas informações:",
         "status_update": (
@@ -387,9 +387,38 @@ def build_preview(parse_result: ParseResult) -> str:
     total_value = cmd.total_value or ((sale_ctx or {}).get("total_value") if sale_ctx else None)
 
     if parse_result.intent == "material_update":
-        lines = ["📋 *Entendi assim: adicionar material*", ""]
-    else:
-        lines = ["📋 *Entendi assim:*", ""]
+        lines = ["📋 *Entendi assim: registrar custo do serviço*", ""]
+        if getattr(cmd, "sale_id", None):
+            lines.append(f"🧾 ID VENDA: *{cmd.sale_id}*")
+        lines.append(f"👤 Cliente: *{customer}*")
+        lines.append(f"📦 Produto: *{product}*")
+        if sale_ctx and sale_ctx.get("sale_date"):
+            lines.append(f"📅 Data da venda: *{sale_ctx['sale_date']}*")
+        if sale_ctx and (sale_ctx.get("total_pago") or sale_ctx.get("total_pendente")):
+            total_sale = float(sale_ctx.get("total_value") or 0)
+            if total_sale > 0:
+                lines.append(f"💰 Valor da venda (sem alteração): *{_format_currency_pt(total_sale)}*")
+        cost_amount = cmd.material_cost
+        if not cost_amount and getattr(cmd, "material_allocations", None):
+            cost_amount = sum(float(a.amount) for a in cmd.material_allocations)
+        if cost_amount:
+            lines.append(f"🧱 Custo do serviço: *{_format_currency_pt(float(cost_amount))}*")
+        lines.append("")
+        lines.append(
+            "_A venda existente não será alterada — só o custo será registrado em Compras Matéria-Prima._"
+        )
+        if cmd.warnings:
+            lines.append("")
+            for w in cmd.warnings:
+                lines.append(f"⚠️ {w}")
+        lines.append("")
+        lines.append(
+            "Se estiver correto, responda *SIM* ou *OK* que eu salvo na planilha.\n"
+            "Para corrigir, envie por texto. Ex.: `Custo: 900`."
+        )
+        return "\n".join(lines)
+
+    lines = ["📋 *Entendi assim:*", ""]
     lines.append(f"👤 Cliente: *{customer}*")
     lines.append(f"📦 Produto: *{product}*")
     if getattr(cmd, "sale_id", None):
