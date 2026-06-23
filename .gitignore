@@ -15,6 +15,7 @@ models_cache/
 *.xltx
 *.xltm
 .telegram_bot.lock
+logs/
 ngrok.exe
 # Cópia local / pasta paralela (não versionar)
 assistente-planilha/
