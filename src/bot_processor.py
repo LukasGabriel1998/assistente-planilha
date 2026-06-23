@@ -272,7 +272,8 @@ def build_preview(parse_result: ParseResult) -> str:
                 "_Depois, se já entregou, basta dizer: `entrega foi hoje` ou `para ele, entrega hoje`._"
             )
             lines.append(
-                f"_Lembrete automático será enviado na data de entrega ({delivery}) enquanto não for finalizado._"
+                f"_No dia da entrega ({delivery}), lembretes automáticos às 6h e a cada 2h "
+                f"(entrega e valor pendente, se houver)._"
             )
         lines.append(f"🔁 Novo status: *{su.status.upper()}*")
         lines.append("\nSe estiver correto, responda *SIM*. Para corrigir, envie por texto. Para cancelar, responda *NÃO*.")

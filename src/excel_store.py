@@ -84,9 +84,13 @@ class SpreadsheetService:
                 "Selecione o arquivo principal da planilha."
             )
 
-    def _open_workbook(self, *, data_only: bool = False):
+    def _open_workbook(self, *, data_only: bool = False, read_only: bool = False):
         try:
-            return load_workbook(self.workbook_path, data_only=data_only)
+            return load_workbook(
+                self.workbook_path,
+                data_only=data_only,
+                read_only=read_only,
+            )
         except PermissionError as exc:
             raise PermissionError(
                 "Nao foi possivel abrir a planilha. Feche o arquivo no Excel e tente novamente."
@@ -139,6 +143,83 @@ class SpreadsheetService:
 
     # Última linha da planilha guarda só o padrão (estilo, sem valores). O robô nunca escreve dados lá.
     MAX_DATA_ROW = ANCHOR_TEMPLATE_ROW - 1
+    TELEGRAM_ROW_SCAN_LIMIT = 500
+
+    @classmethod
+    def _scan_row_cap(cls, ws, start_row: int = DATA_START_ROW, max_rows_scan: int | None = None) -> int:
+        """Limite superior de varredura — evita percorrer milhões de linhas por causa da linha âncora."""
+        limit = max_rows_scan if max_rows_scan is not None else cls.TELEGRAM_ROW_SCAN_LIMIT
+        return min(ws.max_row, cls.MAX_DATA_ROW, start_row + max(1, limit) - 1)
+
+    @classmethod
+    def _effective_data_end_row(
+        cls,
+        ws,
+        key_col: str,
+        start_row: int = DATA_START_ROW,
+        max_rows_scan: int | None = None,
+    ) -> int:
+        """Última linha com dado real, sem varrer a planilha inteira."""
+        cap = cls._scan_row_cap(ws, start_row, max_rows_scan)
+        if getattr(ws, "read_only", False):
+            from openpyxl.utils import column_index_from_string
+
+            col_idx = column_index_from_string(key_col)
+            last = start_row
+            for row in ws.iter_rows(min_row=start_row, max_row=cap, min_col=col_idx, max_col=col_idx):
+                if row[0].value not in (None, ""):
+                    last = row[0].row
+            return last
+        for row in range(cap, start_row - 1, -1):
+            if ws[f"{key_col}{row}"].value not in (None, ""):
+                return row
+        return start_row
+
+    def _sum_column_range(
+        self,
+        ws,
+        col: str | None,
+        start_row: int,
+        end_row: int,
+    ) -> float:
+        if not col or end_row < start_row:
+            return 0.0
+        if getattr(ws, "read_only", False):
+            from openpyxl.utils import column_index_from_string
+
+            col_idx = column_index_from_string(col)
+            total = 0.0
+            for row in ws.iter_rows(min_row=start_row, max_row=end_row, min_col=col_idx, max_col=col_idx):
+                total += self._to_float(row[0].value)
+            return total
+        total = 0.0
+        for row in range(start_row, end_row + 1):
+            total += self._to_float(ws[f"{col}{row}"].value)
+        return total
+
+    def _count_filled_rows(
+        self,
+        ws,
+        key_col: str | None,
+        start_row: int,
+        end_row: int,
+    ) -> int:
+        if not key_col or end_row < start_row:
+            return 0
+        if getattr(ws, "read_only", False):
+            from openpyxl.utils import column_index_from_string
+
+            col_idx = column_index_from_string(key_col)
+            count = 0
+            for row in ws.iter_rows(min_row=start_row, max_row=end_row, min_col=col_idx, max_col=col_idx):
+                if row[0].value not in (None, ""):
+                    count += 1
+            return count
+        count = 0
+        for row in range(start_row, end_row + 1):
+            if ws[f"{key_col}{row}"].value not in (None, ""):
+                count += 1
+        return count
 
     @staticmethod
     def _next_row(ws, key_col: str = "A", start_row: int = DATA_START_ROW) -> int:
@@ -1356,10 +1437,11 @@ class SpreadsheetService:
 
     def list_due_reminders(self, wb, today) -> list[dict]:
         """
-        Retorna lembretes do dia, mas agora com consistência:
-        - Ignora lembretes cujos IDs não existam mais na aba de Vendas.
-        - Busca cliente/descrição/valores diretamente da aba de Vendas
-          (evita notificar "cliente apagado" por lembretes antigos).
+        Retorna lembretes do dia da entrega com consistência:
+        - Entrega: enquanto o serviço não estiver FINALIZADO.
+        - Cobrança: enquanto houver valor pendente no mesmo dia da entrega
+          (mesmo após marcar como entregue).
+        - Ignora IDs que não existam mais na aba de Vendas.
         """
         if SHEET_REMINDERS not in wb.sheetnames:
             return []
@@ -1373,7 +1455,6 @@ class SpreadsheetService:
         if not idx_due or not idx_status:
             return []
 
-        # Aba de vendas (fonte da verdade para dados exibidos no lembrete)
         sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
         ws_sales = wb[sales_name]
         sales_cols = self._sales_columns(ws_sales)
@@ -1382,20 +1463,17 @@ class SpreadsheetService:
         today_txt = self._excel_date_value(today)
 
         for row in range(2, ws_rem.max_row + 1):
-            status = str(ws_rem.cell(row=row, column=idx_status).value or "").strip()
-            if self._normalize_name(status) == "finalizado":
-                continue
-
             due_raw = str(ws_rem.cell(row=row, column=idx_due).value or "").strip()
             if not (due_raw and due_raw == today_txt):
                 continue
 
-            # Lê campos mínimos do lembrete
             sale_id = str(ws_rem.cell(row=row, column=headers.get(self._normalize_name("ID VENDA"), 1)).value or "").strip()
             if not sale_id:
                 continue
 
-            # Se a venda foi apagada/limpada na planilha, não notificar.
+            service_status = str(ws_rem.cell(row=row, column=idx_status).value or "").strip()
+            service_finalized = self._normalize_name(service_status) == "finalizado"
+
             try:
                 sales_row = self._find_sale_row(ws_sales, sales_cols["id venda"], sale_id)
             except Exception:
@@ -1407,8 +1485,11 @@ class SpreadsheetService:
             paid_amount = self._to_float(ws_sales[f"{sales_cols['total de vendas (pago)']}{sales_row}"].value)
             total_amount = round(pending_amount + paid_amount, 2)
 
-            # Retorna também os campos originais do lembrete (Chat ID), mas
-            # injeta cliente/descrição/valores atuais.
+            needs_delivery = not service_finalized
+            needs_payment = pending_amount > 0.01
+            if not needs_delivery and not needs_payment:
+                continue
+
             record: dict = {}
             for key, idx in headers.items():
                 record[key] = str(ws_rem.cell(row=row, column=idx).value or "")
@@ -1418,6 +1499,9 @@ class SpreadsheetService:
             record["descricao"] = product_desc
             record["pending_amount_num"] = pending_amount
             record["total_amount_num"] = total_amount
+            record["needs_delivery_reminder"] = needs_delivery
+            record["needs_payment_reminder"] = needs_payment
+            record["service_finalized"] = service_finalized
 
             result.append(record)
 
@@ -2371,9 +2455,11 @@ class SpreadsheetService:
         finally:
             wb.close()
 
-    def get_planilha_summary(self, max_rows_scan: int = 500) -> str:
+    def get_planilha_summary(self, max_rows_scan: int = 500, wb=None) -> str:
         """Resumo amigável de vendas, matéria-prima, gastos fixos e lucro para o bot."""
-        wb = self._open_workbook(data_only=True)
+        own_wb = wb is None
+        if own_wb:
+            wb = self._open_workbook(data_only=True)
         try:
             def _format_currency_pt(value: float) -> str:
                 txt = f"{float(value):,.2f}"
@@ -2391,13 +2477,14 @@ class SpreadsheetService:
             n_sales = 0
             total_pago = 0.0
             total_pendente = 0.0
-            for row in range(DATA_START_ROW, min(ws_sales.max_row + 1, DATA_START_ROW + max_rows_scan)):
-                if col_id and ws_sales[f"{col_id}{row}"].value not in (None, ""):
-                    n_sales += 1
-                if col_pago:
-                    total_pago += self._to_float(ws_sales[f"{col_pago}{row}"].value)
-                if col_pendente:
-                    total_pendente += self._to_float(ws_sales[f"{col_pendente}{row}"].value)
+            sales_end = (
+                self._effective_data_end_row(ws_sales, col_id, max_rows_scan=max_rows_scan)
+                if col_id
+                else self._scan_row_cap(ws_sales, max_rows_scan=max_rows_scan)
+            )
+            n_sales = self._count_filled_rows(ws_sales, col_id, DATA_START_ROW, sales_end)
+            total_pago = self._sum_column_range(ws_sales, col_pago, DATA_START_ROW, sales_end)
+            total_pendente = self._sum_column_range(ws_sales, col_pendente, DATA_START_ROW, sales_end)
 
             # Totais de matéria-prima
             material_name = self._resolve_sheet_name(wb, SHEET_MATERIAL)
@@ -2407,18 +2494,20 @@ class SpreadsheetService:
             col_desc = mat_cols.get("descricao")
             n_mat = 0
             total_mat = 0.0
-            for row in range(DATA_START_ROW, min(ws_mat.max_row + 1, DATA_START_ROW + max_rows_scan)):
-                if col_desc and ws_mat[f"{col_desc}{row}"].value not in (None, ""):
-                    n_mat += 1
-                if col_val:
-                    total_mat += self._to_float(ws_mat[f"{col_val}{row}"].value)
+            mat_end = (
+                self._effective_data_end_row(ws_mat, col_desc, max_rows_scan=max_rows_scan)
+                if col_desc
+                else self._scan_row_cap(ws_mat, max_rows_scan=max_rows_scan)
+            )
+            n_mat = self._count_filled_rows(ws_mat, col_desc, DATA_START_ROW, mat_end)
+            total_mat = self._sum_column_range(ws_mat, col_val, DATA_START_ROW, mat_end)
 
             # Totais de gastos fixos (somando a coluna Valor)
             fixed_name = self._resolve_sheet_name(wb, SHEET_FIXED)
             ws_fixed = wb[fixed_name]
             total_fixos = 0.0
-            for row in range(DATA_START_ROW, min(ws_fixed.max_row + 1, DATA_START_ROW + max_rows_scan)):
-                total_fixos += self._to_float(ws_fixed[f"D{row}"].value)
+            fix_end = self._effective_data_end_row(ws_fixed, "D", max_rows_scan=max_rows_scan)
+            total_fixos = self._sum_column_range(ws_fixed, "D", DATA_START_ROW, fix_end)
 
             # Fallback (se o modelo mudar e a aba não existir/estragar leitura).
             # Lucro deve usar vendas totais (pago + pendente), para bater com a aba.
@@ -2440,11 +2529,14 @@ class SpreadsheetService:
         except Exception as e:
             return f"Erro ao ler planilha: {e}"
         finally:
-            wb.close()
+            if own_wb:
+                wb.close()
 
-    def get_sales_preview(self, limit: int = 12) -> str:
+    def get_sales_preview(self, limit: int = 12, wb=None) -> str:
         """Prévia curta para o Telegram: últimas vendas com pendência e/ou prazo de entrega."""
-        wb = self._open_workbook(data_only=True)
+        own_wb = wb is None
+        if own_wb:
+            wb = self._open_workbook(data_only=True)
         try:
             sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
             ws = wb[sales_name]
@@ -2459,33 +2551,81 @@ class SpreadsheetService:
             col_sale_date = sales_cols.get("data de venda")
 
             rows: list[dict[str, str]] = []
-            for row in range(min(ws.max_row, self.MAX_DATA_ROW), DATA_START_ROW - 1, -1):
-                sale_id = str(ws[f"{col_id}{row}"].value or "").strip()
-                if not sale_id:
-                    continue
-                customer = str(ws[f"{col_customer}{row}"].value or "").strip()
-                desc = str(ws[f"{col_desc}{row}"].value or "").strip()
-                pending = self._to_float(ws[f"{col_pending}{row}"].value)
-                status = str(ws[f"{col_status}{row}"].value or "").strip()
-                delivery = str(ws[f"{col_delivery}{row}"].value or "").strip()
-                sale_date = str(ws[f"{col_sale_date}{row}"].value or "").strip()
+            end_row = self._effective_data_end_row(ws, col_id)
+            if getattr(ws, "read_only", False):
+                from openpyxl.utils import column_index_from_string
 
-                # Mostrar sempre se tiver pendência ou entrega informada
-                if (pending <= 0.01) and (not delivery):
-                    continue
-                rows.append(
-                    {
-                        "id": sale_id,
-                        "cliente": customer,
-                        "desc": desc,
-                        "pendente": pending,
-                        "status": status,
-                        "entrega": delivery,
-                        "data": sale_date,
-                    }
-                )
-                if len(rows) >= limit:
-                    break
+                idx_map = {
+                    "id": column_index_from_string(col_id),
+                    "customer": column_index_from_string(col_customer),
+                    "desc": column_index_from_string(col_desc),
+                    "pending": column_index_from_string(col_pending),
+                    "status": column_index_from_string(col_status),
+                    "delivery": column_index_from_string(col_delivery),
+                }
+                if col_sale_date:
+                    idx_map["sale_date"] = column_index_from_string(col_sale_date)
+                min_col = min(idx_map.values())
+                max_col = max(idx_map.values())
+                collected: list[dict[str, str]] = []
+                for row_cells in ws.iter_rows(
+                    min_row=DATA_START_ROW,
+                    max_row=end_row,
+                    min_col=min_col,
+                    max_col=max_col,
+                ):
+                    values = {cell.column: cell.value for cell in row_cells}
+
+                    def _val(key: str):
+                        col_i = idx_map.get(key)
+                        return values.get(col_i) if col_i else None
+
+                    sale_id = str(_val("id") or "").strip()
+                    if not sale_id:
+                        continue
+                    pending = self._to_float(_val("pending"))
+                    delivery = str(_val("delivery") or "").strip()
+                    if (pending <= 0.01) and (not delivery):
+                        continue
+                    collected.append(
+                        {
+                            "id": sale_id,
+                            "cliente": str(_val("customer") or "").strip(),
+                            "desc": str(_val("desc") or "").strip(),
+                            "pendente": pending,
+                            "status": str(_val("status") or "").strip(),
+                            "entrega": delivery,
+                            "data": str(_val("sale_date") or "").strip() if col_sale_date else "",
+                        }
+                    )
+                rows = list(reversed(collected[-limit:]))
+            else:
+                for row in range(end_row, DATA_START_ROW - 1, -1):
+                    sale_id = str(ws[f"{col_id}{row}"].value or "").strip()
+                    if not sale_id:
+                        continue
+                    customer = str(ws[f"{col_customer}{row}"].value or "").strip()
+                    desc = str(ws[f"{col_desc}{row}"].value or "").strip()
+                    pending = self._to_float(ws[f"{col_pending}{row}"].value)
+                    status = str(ws[f"{col_status}{row}"].value or "").strip()
+                    delivery = str(ws[f"{col_delivery}{row}"].value or "").strip()
+                    sale_date = str(ws[f"{col_sale_date}{row}"].value or "").strip()
+
+                    if (pending <= 0.01) and (not delivery):
+                        continue
+                    rows.append(
+                        {
+                            "id": sale_id,
+                            "cliente": customer,
+                            "desc": desc,
+                            "pendente": pending,
+                            "status": status,
+                            "entrega": delivery,
+                            "data": sale_date,
+                        }
+                    )
+                    if len(rows) >= limit:
+                        break
 
             if not rows:
                 return "📄 *Prévia da planilha*\n\nNenhuma venda com pendência ou prazo de entrega encontrada nas últimas linhas."
@@ -2518,7 +2658,8 @@ class SpreadsheetService:
                 lines.append("Dica: envie `ID VENDA 001 pagou` para atualizar o status.")
             return "\n".join(lines)
         finally:
-            wb.close()
+            if own_wb:
+                wb.close()
 
     def get_pending_sales_by_customer(
         self,

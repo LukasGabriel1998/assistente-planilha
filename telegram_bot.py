@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import atexit
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -73,23 +74,75 @@ def _acquire_single_instance_lock() -> None:
 
     atexit.register(_cleanup)
 
-HELP_TEXT = """Olá! Eu sou o assistente da sua planilha.
+HELP_TEXT = """👋 *Olá! Eu sou o assistente da sua planilha.*
 
-Pode me mandar *áudio* ou *texto*. Eu entendo a mensagem, mostro uma prévia e só salvo quando você confirmar.
+⚙️ *Como funciona*
+🎙️ Você manda *áudio* ou *texto*
+📋 Eu mostro uma *prévia* com os dados
+✅ Você confirma com *SIM* ou *OK*
+💾 Pronto — salvo na planilha!
 
-*Comandos rápidos*
-• *Resumo* - mostra os totais da planilha
-• *Prévia* - mostra vendas, pendências e entregas
-• *Status* - mostra a situação financeira
+🔹🔹🔹
 
-*Exemplos do que você pode falar*
-• Vendi uma placa para o cliente 004 por 1547,27 e ele pagou tudo.
-• Cliente 004 comprou um banner de 3000, deu 500 de entrada e o restante dia 30.
-• ID VENDA 1001 pagou 1547,27 hoje.
-• Gastei 200 de material para ID VENDA 1001.
+🆕 *Exemplo 1 — registrar uma venda nova*
 
-Se a prévia estiver correta, responda *SIM* ou *OK*.
-Para corrigir, envie: Valor: 1547,27, Cliente: 004 ou Produto: Fachada."""
+É a primeira vez dessa venda. Fale o *nome do cliente* e siga este roteiro — campo por campo:
+
+👤 Cliente: _nome do cliente_
+📦 Produto: _o que foi vendido_
+📅 Data da venda: _hoje ou a data_
+💰 Valor total: _valor do pedido_
+   Pago: _entrada_ | Pendente: _o que falta_
+🔎 Status: _pendente ou pago_
+📅 Data de entrega: _quando entrega_
+
+💬 *Na prática, pode falar assim:*
+_"Vendi um letreiro para a Lucia hoje por 2200. Deu 700 de entrada, falta 1500 pro dia 25. Entrega na quarta."_
+
+💡 Ao salvar, a planilha gera o 🧾 *ID VENDA* (ex.: 012). Guarde esse código para as próximas mensagens.
+
+🔹🔹🔹
+
+📂 *Exemplo 2 — venda que já está na planilha*
+
+A venda já foi salva. Agora use o 🧾 *ID VENDA*:
+
+👤 Cliente: _já cadastrado_
+🧾 ID VENDA: _012_
+💰 Valor total: _já na planilha_
+   Pago: _atualizado_ | Pendente: _atualizado_
+🔎 Status: _pendente → pago_
+📅 Data de entrega: _já cadastrada_
+
+💬 *Cliente pagou o que faltava:*
+_"ID VENDA 012 recebeu o saldo de 1500 hoje."_
+
+💬 *Cliente quitou tudo:*
+_"ID VENDA 012 pagou tudo hoje."_
+
+🔹🔹🔹
+
+🔧 *Exemplo 3 — algo aconteceu depois da venda*
+
+Com o 🧾 *ID VENDA* em mãos, você também pode avisar:
+
+💬 *Gasto com material:*
+_"Gastei 350 de tinta na ID VENDA 012."_
+
+💬 *Mudança na entrega:*
+_"A entrega da ID VENDA 012 ficou para sexta."_
+
+🔹🔹🔹
+
+⚡ *Botões rápidos*
+📋 *Prévia* — vendas, pendências e entregas
+📊 *Resumo* — totais da planilha
+💹 *Status* — situação financeira
+
+✅ *Depois da prévia*
+👍 Está certo → responda *SIM* ou *OK*
+✏️ Precisa ajustar → mande só o que mudou:
+`Cliente: Lucia, Valor: 2200, Entrada: 700`"""
 
 # Teclado de menu (botões que aparecem abaixo do campo de digitação)
 MAIN_MENU_KEYBOARD = {
@@ -100,6 +153,64 @@ MAIN_MENU_KEYBOARD = {
     "resize_keyboard": True,
     "one_time_keyboard": False,
 }
+
+_FONT_CACHE: dict[tuple[int, bool], object] = {}
+
+
+def _load_telegram_font(size: int, bold: bool = False):
+    """Carrega fonte uma vez e reutiliza (acelera geração de imagens)."""
+    from PIL import ImageFont  # type: ignore
+
+    key = (size, bold)
+    cached = _FONT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    candidates = (
+        [
+            r"C:\Windows\Fonts\segoeuib.ttf",
+            r"C:\Windows\Fonts\arialbd.ttf",
+            r"C:\Windows\Fonts\calibrib.ttf",
+        ]
+        if bold
+        else [
+            r"C:\Windows\Fonts\segoeui.ttf",
+            r"C:\Windows\Fonts\arial.ttf",
+            r"C:\Windows\Fonts\calibri.ttf",
+        ]
+    )
+    for fp in candidates:
+        try:
+            font = ImageFont.truetype(fp, size=size)
+            _FONT_CACHE[key] = font
+            return font
+        except Exception:
+            continue
+    font = ImageFont.load_default()
+    _FONT_CACHE[key] = font
+    return font
+
+
+def _save_telegram_image(img) -> str:
+    """Salva imagem em JPEG (mais rápido e leve para enviar no Telegram)."""
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    tmp.close()
+    img.save(tmp.name, format="JPEG", quality=88, optimize=False)
+    return tmp.name
+
+
+def send_chat_action(chat_id: int | str, action: str = "typing") -> None:
+    """Indica no Telegram que o bot está processando (melhora percepção de velocidade)."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        requests.post(
+            f"{BASE_URL}/sendChatAction",
+            json={"chat_id": str(chat_id), "action": action},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
 
 def _maybe_build_text_image_png(text: str) -> str | None:
     """
@@ -174,25 +285,28 @@ def _maybe_build_text_image_png(text: str) -> str | None:
         draw.text((card_x0 + 18, y), ln, fill=color, font=font)
         y += line_h
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    tmp.close()
-    img.save(tmp.name, format="PNG", optimize=True)
-    return tmp.name
+    return _save_telegram_image(img)
 
 
-def _maybe_build_status_table_image(workbook_path: str) -> str | None:
+def _maybe_build_status_table_image(
+    workbook_path: str,
+    wb=None,
+    svc=None,
+) -> str | None:
     """
     Gera imagem estilo "TOTAL DOS LUCROS MENSAIS E ANUAIS" com valores dinâmicos.
     """
     try:
-        from PIL import Image, ImageDraw, ImageFont  # type: ignore
+        from PIL import Image, ImageDraw  # type: ignore
         from src.excel_store import SpreadsheetService, SHEET_SALES, SHEET_MATERIAL, SHEET_FIXED, DATA_START_ROW
     except Exception:
         return None
 
     try:
-        svc = SpreadsheetService(workbook_path)
-        wb = svc._open_workbook(data_only=True)
+        own_wb = wb is None
+        if own_wb:
+            svc = SpreadsheetService(workbook_path)
+            wb = svc._open_workbook(data_only=True)
         try:
             ws_sales = wb[svc._resolve_sheet_name(wb, SHEET_SALES)]
             ws_mat = wb[svc._resolve_sheet_name(wb, SHEET_MATERIAL)]
@@ -203,31 +317,21 @@ def _maybe_build_status_table_image(workbook_path: str) -> str | None:
             col_paid = sales_cols.get("total de vendas (pago)")
             col_pending = sales_cols.get("valor (pendente)")
 
-            total_paid = 0.0
-            total_pending = 0.0
-            for row in range(DATA_START_ROW, min(ws_sales.max_row + 1, svc.MAX_DATA_ROW)):
-                if col_id and ws_sales[f"{col_id}{row}"].value in (None, ""):
-                    continue
-                if col_paid:
-                    total_paid += svc._to_float(ws_sales[f"{col_paid}{row}"].value)
-                if col_pending:
-                    total_pending += svc._to_float(ws_sales[f"{col_pending}{row}"].value)
+            sales_end = svc._effective_data_end_row(ws_sales, col_id) if col_id else svc._scan_row_cap(ws_sales)
+            total_paid = svc._sum_column_range(ws_sales, col_paid, DATA_START_ROW, sales_end)
+            total_pending = svc._sum_column_range(ws_sales, col_pending, DATA_START_ROW, sales_end)
 
             mat_cols = svc._material_columns(ws_mat)
             col_mat_desc = mat_cols.get("descricao")
             col_mat_val = mat_cols.get("valor")
-            total_mat = 0.0
-            for row in range(DATA_START_ROW, min(ws_mat.max_row + 1, svc.MAX_DATA_ROW)):
-                if col_mat_desc and ws_mat[f"{col_mat_desc}{row}"].value in (None, ""):
-                    continue
-                if col_mat_val:
-                    total_mat += svc._to_float(ws_mat[f"{col_mat_val}{row}"].value)
+            mat_end = svc._effective_data_end_row(ws_mat, col_mat_desc) if col_mat_desc else svc._scan_row_cap(ws_mat)
+            total_mat = svc._sum_column_range(ws_mat, col_mat_val, DATA_START_ROW, mat_end)
 
-            total_fix = 0.0
-            for row in range(DATA_START_ROW, min(ws_fix.max_row + 1, svc.MAX_DATA_ROW)):
-                total_fix += svc._to_float(ws_fix[f"D{row}"].value)
+            fix_end = svc._scan_row_cap(ws_fix)
+            total_fix = svc._sum_column_range(ws_fix, "D", DATA_START_ROW, fix_end)
         finally:
-            wb.close()
+            if own_wb:
+                wb.close()
     except Exception:
         return None
 
@@ -238,31 +342,10 @@ def _maybe_build_status_table_image(workbook_path: str) -> str | None:
         txt = f"{float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
         return f"R$ {txt}"
 
-    def _load_font(size: int, bold: bool = False):
-        candidates = (
-            [
-                r"C:\Windows\Fonts\segoeuib.ttf",
-                r"C:\Windows\Fonts\arialbd.ttf",
-                r"C:\Windows\Fonts\calibrib.ttf",
-            ]
-            if bold
-            else [
-                r"C:\Windows\Fonts\segoeui.ttf",
-                r"C:\Windows\Fonts\arial.ttf",
-                r"C:\Windows\Fonts\calibri.ttf",
-            ]
-        )
-        for fp in candidates:
-            try:
-                return ImageFont.truetype(fp, size=size)
-            except Exception:
-                continue
-        return ImageFont.load_default()
-
-    font_title = _load_font(26, bold=True)
-    font_meta = _load_font(17, bold=False)
-    font_label = _load_font(17, bold=False)
-    font_value = _load_font(24, bold=True)
+    font_title = _load_telegram_font(26, bold=True)
+    font_meta = _load_telegram_font(17, bold=False)
+    font_label = _load_telegram_font(17, bold=False)
+    font_value = _load_telegram_font(24, bold=True)
 
     # Grade 2x3: mais legível no Telegram do que 6 colunas em uma única faixa
     kpi = [
@@ -349,15 +432,14 @@ def _maybe_build_status_table_image(workbook_path: str) -> str | None:
         vw = _vlen(val, font_value)
         draw.text((x + cell_w - 16 - vw, y + 44), val, fill=val_color, font=font_value)
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    tmp.close()
-    img.save(tmp.name, format="PNG", optimize=True)
-    return tmp.name
+    return _save_telegram_image(img)
 
 
 def _maybe_build_sales_snippet_image(
     workbook_path: str,
     *,
+    wb=None,
+    svc=None,
     sale_id: str | None = None,
     limit: int = 7,
     title_main: str = "TOTAL DE VENDAS - Visão atual",
@@ -375,8 +457,10 @@ def _maybe_build_sales_snippet_image(
         return None
 
     try:
-        svc = SpreadsheetService(workbook_path)
-        wb = svc._open_workbook(data_only=True)
+        own_wb = wb is None
+        if own_wb:
+            svc = SpreadsheetService(workbook_path)
+            wb = svc._open_workbook(data_only=True)
         try:
             ws = wb[svc._resolve_sheet_name(wb, SHEET_SALES)]
             cols = svc._sales_columns(ws)
@@ -400,9 +484,23 @@ def _maybe_build_sales_snippet_image(
             id_col = cols.get("id venda")
             data_rows: list[int] = []
             if id_col:
-                for r in range(DATA_START_ROW, min(ws.max_row + 1, svc.MAX_DATA_ROW)):
-                    if ws[f"{id_col}{r}"].value not in (None, ""):
-                        data_rows.append(r)
+                sales_end = svc._effective_data_end_row(ws, id_col)
+                if getattr(ws, "read_only", False):
+                    from openpyxl.utils import column_index_from_string
+
+                    col_idx = column_index_from_string(id_col)
+                    for row in ws.iter_rows(
+                        min_row=DATA_START_ROW,
+                        max_row=sales_end,
+                        min_col=col_idx,
+                        max_col=col_idx,
+                    ):
+                        if row[0].value not in (None, ""):
+                            data_rows.append(row[0].row)
+                else:
+                    for r in range(DATA_START_ROW, sales_end + 1):
+                        if ws[f"{id_col}{r}"].value not in (None, ""):
+                            data_rows.append(r)
             if not data_rows:
                 return None
 
@@ -439,36 +537,16 @@ def _maybe_build_sales_snippet_image(
 
             rows_txt = [[_cell_txt(c, key, r) for c, _label, key in col_pairs] for r in last_rows]
         finally:
-            wb.close()
+            if own_wb:
+                wb.close()
     except Exception:
         return None
 
     # Renderização visual premium
-    def _load_font(size: int, bold: bool = False):
-        candidates = []
-        if bold:
-            candidates = [
-                "C:\\Windows\\Fonts\\segoeuib.ttf",
-                "C:\\Windows\\Fonts\\arialbd.ttf",
-                "C:\\Windows\\Fonts\\calibrib.ttf",
-            ]
-        else:
-            candidates = [
-                "C:\\Windows\\Fonts\\segoeui.ttf",
-                "C:\\Windows\\Fonts\\arial.ttf",
-                "C:\\Windows\\Fonts\\calibri.ttf",
-            ]
-        for fp in candidates:
-            try:
-                return ImageFont.truetype(fp, size=size)
-            except Exception:
-                continue
-        return ImageFont.load_default()
-
-    font_body = _load_font(24, bold=False)
-    font_header = _load_font(22, bold=True)
-    font_title = _load_font(30, bold=True)
-    font_meta = _load_font(20, bold=False)
+    font_body = _load_telegram_font(24, bold=False)
+    font_header = _load_telegram_font(22, bold=True)
+    font_title = _load_telegram_font(30, bold=True)
+    font_meta = _load_telegram_font(20, bold=False)
 
     pad = 22
     card_pad = 18
@@ -638,27 +716,54 @@ def _maybe_build_sales_snippet_image(
             draw.text((tx, y + cell_pad_y), text_value, fill=cell_ink, font=font_body)
             x += w
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    tmp.close()
-    img.save(tmp.name, format="PNG", optimize=True)
-    return tmp.name
+    return _save_telegram_image(img)
 
 
-def send_photo(chat_id: int | str, image_path: str, caption: str = "") -> bool:
-    """Envia uma foto para o chat (sendPhoto)."""
+def send_photo(
+    chat_id: int | str,
+    image_path: str,
+    caption: str = "",
+    parse_mode: str | None = None,
+    reply_markup: dict | None = None,
+) -> bool:
+    """Envia uma foto para o chat (sendPhoto), com legenda opcional."""
     if not TELEGRAM_BOT_TOKEN:
         return False
     try:
         with open(image_path, "rb") as f:
             files = {"photo": f}
-            data = {"chat_id": str(chat_id)}
+            data: dict[str, str] = {"chat_id": str(chat_id)}
             if caption:
                 data["caption"] = caption[:1024]
+            if parse_mode:
+                data["parse_mode"] = parse_mode
+            if reply_markup:
+                data["reply_markup"] = json.dumps(reply_markup)
             r = requests.post(f"{BASE_URL}/sendPhoto", data=data, files=files, timeout=30)
             return r.status_code == 200
     except Exception as e:
         print(f"[Telegram] Erro ao enviar foto: {e}")
         return False
+
+
+def send_reply(
+    chat_id: int | str,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+    reply_markup: dict | None = None,
+    image_path: str | None = None,
+) -> bool:
+    """Envia texto ou foto com legenda (uma única mensagem quando há imagem)."""
+    if image_path:
+        return send_photo(
+            chat_id,
+            image_path,
+            caption=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+    return send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
 
 
 def send_message(
@@ -724,6 +829,171 @@ def get_updates(offset: int | None = None) -> list[dict]:
         return []
 
 
+def _format_currency_pt(value: float) -> str:
+    txt = f"{float(value):,.2f}"
+    txt = txt.replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {txt}"
+
+
+def _build_scheduled_reminder_message(item: dict) -> tuple[str, list[str]]:
+    """Monta texto do lembrete e lista de tipos enviados (entrega/cobranca)."""
+    sale_id = item.get("id venda") or ""
+    cliente = item.get("cliente", "")
+    desc = item.get("descricao", "")
+    pending_amount = float(item.get("pending_amount_num") or 0.0)
+    needs_delivery = bool(item.get("needs_delivery_reminder"))
+    needs_payment = bool(item.get("needs_payment_reminder"))
+    kinds: list[str] = []
+    if needs_delivery:
+        kinds.append("entrega")
+    if needs_payment:
+        kinds.append("cobranca")
+
+    if needs_delivery and needs_payment:
+        header = "⏰ *Lembrete do dia — entrega e cobrança*"
+    elif needs_payment:
+        header = "💰 *Cobrança — valor pendente hoje*"
+    else:
+        header = "🚚 *Lembrete de entrega hoje*"
+
+    lines = [
+        header,
+        "",
+        f"🧾 ID VENDA: *{sale_id}*",
+        f"👤 Cliente: *{cliente}*",
+        f"📦 Produto: *{desc}*",
+        "",
+    ]
+    if needs_delivery:
+        lines.append("🚚 *Entrega:* ainda não marcada como entregue.")
+        lines.append(f"Quando entregar, envie: `FINALIZAR ID VENDA {sale_id}`")
+        lines.append("")
+    elif needs_payment and item.get("service_finalized"):
+        lines.append("✅ *Entrega:* já marcada como entregue.")
+        lines.append("")
+
+    if needs_payment:
+        lines.append(f"💰 *Pendente:* {_format_currency_pt(pending_amount)} — receber hoje.")
+        lines.append(f"Quando receber, envie: `ID VENDA {sale_id} pagou`")
+
+    return "\n".join(lines), kinds
+
+
+def _workbook_path_for_bot() -> str:
+    wb_path = os.getenv("WORKBOOK_PATH", "").strip()
+    if not wb_path:
+        from src.workbook_paths import default_workbook_path
+        wb_path = default_workbook_path([Path.cwd(), Path.cwd().parent])
+    return wb_path or ""
+
+
+def _build_dashboard_reply(cmd_strip: str) -> tuple[str, str | None]:
+    """
+    Gera texto + imagem abrindo a planilha uma única vez (Prévia/Status/Resumo).
+    Retorna (legenda, caminho_imagem).
+    """
+    from src.excel_store import SpreadsheetService
+
+    workbook_path = _workbook_path_for_bot()
+    if not workbook_path or not Path(workbook_path).exists():
+        return process_command(cmd_strip, origin="telegram"), None
+
+    svc = SpreadsheetService(workbook_path)
+    wb = svc._open_workbook(data_only=True)
+    img_path: str | None = None
+    try:
+        if cmd_strip.startswith(("prévia", "previa")):
+            reply = svc.get_sales_preview(wb=wb)
+            img_path = _maybe_build_sales_snippet_image(
+                workbook_path,
+                wb=wb,
+                svc=svc,
+                title_main="TOTAL DE VENDAS - Visão atual",
+                meta_line="Pendências e entregas • Atualizado ao vivo com base na planilha",
+            )
+        elif cmd_strip.startswith(("status", "resumo", "planilha")):
+            reply = svc.get_planilha_summary(wb=wb)
+            img_path = _maybe_build_status_table_image(workbook_path, wb=wb, svc=svc)
+        else:
+            return process_command(cmd_strip, origin="telegram"), None
+    finally:
+        wb.close()
+
+    if not img_path:
+        img_path = _maybe_build_text_image_png(reply)
+        if img_path:
+            return "", img_path
+    return reply, img_path
+
+
+def _process_scheduled_reminders(tracker) -> None:
+    """Envia lembretes no dia da entrega: a partir das 6h, a cada 2h."""
+    from src.excel_store import SpreadsheetService
+    from src.reminder_scheduler import current_reminder_slot
+    from src.workbook_paths import default_workbook_path
+
+    slot = current_reminder_slot()
+    if not slot:
+        return
+    today, slot_hour = slot
+
+    wb_path = os.getenv("WORKBOOK_PATH", "").strip()
+    if not wb_path:
+        wb_path = default_workbook_path([Path.cwd(), Path.cwd().parent])
+    if not wb_path or not Path(wb_path).exists():
+        return
+
+    svc = SpreadsheetService(wb_path)
+    wb = svc._open_workbook(data_only=True)
+    try:
+        due = svc.list_due_reminders(wb, today)
+    finally:
+        wb.close()
+
+    if not due:
+        return
+
+    admin_chat = os.getenv("ADMIN_CHAT_ID", "").strip()
+    for item in due[:20]:
+        sale_id = str(item.get("id venda") or "").strip()
+        if not sale_id:
+            continue
+
+        send_delivery = bool(item.get("needs_delivery_reminder")) and not tracker.was_sent(
+            "entrega", sale_id, today, slot_hour
+        )
+        send_payment = bool(item.get("needs_payment_reminder")) and not tracker.was_sent(
+            "cobranca", sale_id, today, slot_hour
+        )
+        if not send_delivery and not send_payment:
+            continue
+
+        preview_item = dict(item)
+        preview_item["needs_delivery_reminder"] = send_delivery
+        preview_item["needs_payment_reminder"] = send_payment
+        msg_txt, kinds = _build_scheduled_reminder_message(preview_item)
+        if not kinds:
+            continue
+
+        chat_target = (item.get("chat id") or "").strip()
+        sent = False
+        if chat_target:
+            sent = send_message(chat_target, msg_txt, parse_mode="Markdown")
+        if admin_chat:
+            send_message(admin_chat, msg_txt, parse_mode="Markdown")
+            sent = True
+        if not sent:
+            continue
+
+        for kind in kinds:
+            tracker_key = "entrega" if kind == "entrega" else "cobranca"
+            tracker.mark_sent(tracker_key, sale_id, today, slot_hour)
+        print(
+            f"[Telegram] Lembrete enviado ID VENDA {sale_id} "
+            f"({', '.join(kinds)}) slot {slot_hour:02d}h"
+        )
+
+
 def run_polling() -> None:
     """Loop principal: processa mensagens e responde."""
     _acquire_single_instance_lock()
@@ -744,6 +1014,9 @@ def run_polling() -> None:
     last_customer_by_chat: dict[int | str, str] = {}
     last_sale_id_by_chat: dict[int | str, str] = {}
     last_reminder_check = 0.0
+    from src.reminder_scheduler import ReminderSlotTracker
+
+    reminder_tracker = ReminderSlotTracker()
 
     while True:
         updates = get_updates(offset=next_offset)
@@ -941,12 +1214,12 @@ def run_polling() -> None:
                     remembered = sale_id_from_parse_result(parse_result)
                     if remembered:
                         last_sale_id_by_chat[chat_id] = remembered
-                    send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
-                    # Enviar imagem atualizada da aba de vendas para facilitar visualização.
+                    send_chat_action(chat_id, "upload_photo")
                     workbook_path = os.getenv("WORKBOOK_PATH", "").strip()
                     if not workbook_path:
                         from src.workbook_paths import default_workbook_path
                         workbook_path = default_workbook_path([Path.cwd(), Path.cwd().parent])
+                    img_path = None
                     if workbook_path:
                         img_path = _maybe_build_sales_snippet_image(
                             workbook_path,
@@ -954,14 +1227,20 @@ def run_polling() -> None:
                             if getattr(parse_result, "intent", "") == "status_update"
                             else getattr(parse_result.command, "sale_id", None),
                         )
+                    try:
+                        send_reply(
+                            chat_id,
+                            reply,
+                            parse_mode="Markdown",
+                            reply_markup=MAIN_MENU_KEYBOARD,
+                            image_path=img_path,
+                        )
+                    finally:
                         if img_path:
                             try:
-                                send_photo(chat_id, img_path)
-                            finally:
-                                try:
-                                    Path(img_path).unlink(missing_ok=True)
-                                except Exception:
-                                    pass
+                                Path(img_path).unlink(missing_ok=True)
+                            except Exception:
+                                pass
                     print(f"[Telegram] Planilha atualizada para {chat_id}")
                     continue
 
@@ -1217,35 +1496,26 @@ def run_polling() -> None:
                 cmd_strip = cmd_lower.strip()
                 if any(cmd_strip.startswith(kw) for kw in short_cmd_keywords):
                     pending_preview.pop(chat_id, None)
-                    reply = process_command(text, origin="telegram")
-                    send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
-                    # Para Status/Resumo/Planilha/Prévia, também envia uma imagem (facilita visualização).
                     if cmd_strip.startswith(("status", "resumo", "planilha", "prévia", "previa")):
-                        workbook_path = os.getenv("WORKBOOK_PATH", "").strip()
-                        if not workbook_path:
-                            from src.workbook_paths import default_workbook_path
-                            workbook_path = default_workbook_path([Path.cwd(), Path.cwd().parent])
+                        send_chat_action(chat_id, "upload_photo")
+                        caption, img_path = _build_dashboard_reply(cmd_strip)
+                    else:
+                        caption = process_command(text, origin="telegram")
                         img_path = None
-                        if workbook_path:
-                            # Status/Resumo/Planilha: card financeiro (lucros). Prévia: tabela de vendas (clientes/pendências).
-                            if cmd_strip.startswith(("prévia", "previa")):
-                                img_path = _maybe_build_sales_snippet_image(
-                                    workbook_path,
-                                    title_main="TOTAL DE VENDAS - Visão atual",
-                                    meta_line="Pendências e entregas • Atualizado ao vivo com base na planilha",
-                                )
-                            else:
-                                img_path = _maybe_build_status_table_image(workbook_path)
-                        if not img_path:
-                            img_path = _maybe_build_text_image_png(reply)
+                    try:
+                        send_reply(
+                            chat_id,
+                            caption,
+                            parse_mode="Markdown",
+                            reply_markup=MAIN_MENU_KEYBOARD,
+                            image_path=img_path,
+                        )
+                    finally:
                         if img_path:
                             try:
-                                send_photo(chat_id, img_path)
-                            finally:
-                                try:
-                                    Path(img_path).unlink(missing_ok=True)
-                                except Exception:
-                                    pass
+                                Path(img_path).unlink(missing_ok=True)
+                            except Exception:
+                                pass
                     continue
 
                 # Interpretar mensagem: se tiver dados completos, mostrar prévia; senão, pedir o que falta
@@ -1448,61 +1718,13 @@ def run_polling() -> None:
         if not updates:
             time.sleep(0.5)
 
-        # Checagem de lembretes (a cada ~10 minutos)
-        if time.time() - last_reminder_check >= 600:
+        # Lembretes: checagem a cada ~1 min; envio às 6h e a cada 2h no dia da entrega.
+        if time.time() - last_reminder_check >= 60:
             last_reminder_check = time.time()
             try:
-                from src.excel_store import SpreadsheetService
-                from src.workbook_paths import default_workbook_path
-                from pathlib import Path
-                wb_path = os.getenv("WORKBOOK_PATH", "").strip()
-                if not wb_path:
-                    wb_path = default_workbook_path([Path.cwd(), Path.cwd().parent])
-                if wb_path and Path(wb_path).exists():
-                    svc = SpreadsheetService(wb_path)
-                    wb = svc._open_workbook(data_only=True)
-                    try:
-                        due = svc.list_due_reminders(wb, date.today())
-                    finally:
-                        wb.close()
-                    admin_chat = os.getenv("ADMIN_CHAT_ID", "").strip()
-                    for item in due[:20]:
-                        sale_id = item.get("id venda") or item.get("id venda".lower()) or ""
-                        cliente = item.get("cliente", "")
-                        desc = item.get("descricao", "")
-                        pending_amount = item.get("pending_amount_num", None)
-                        total_amount = item.get("total_amount_num", None)
-
-                        def _format_currency_pt(value: float) -> str:
-                            txt = f"{float(value):,.2f}"
-                            # pt-BR: separador decimal vírgula e milhares ponto
-                            txt = txt.replace(",", "X").replace(".", ",").replace("X", ".")
-                            return f"R$ {txt}"
-
-                        value_line = ""
-                        try:
-                            if pending_amount is not None and float(pending_amount or 0.0) > 0.01:
-                                value_line = f"Valor pendente: {_format_currency_pt(float(pending_amount))}\n"
-                            elif total_amount is not None:
-                                value_line = f"Valor total: {_format_currency_pt(float(total_amount))}\n"
-                        except Exception:
-                            value_line = ""
-
-                        msg_txt = (
-                            f"⏰ *Lembrete de entrega hoje*\n"
-                            f"ID VENDA: {sale_id}\n"
-                            f"Cliente: {cliente}\n"
-                            f"Descricao: {desc}\n\n"
-                            f"{value_line}"
-                            f"Se já finalizou, envie: FINALIZAR ID VENDA {sale_id}"
-                        )
-                        chat_target = (item.get("chat id") or "").strip()
-                        if chat_target:
-                            send_message(chat_target, msg_txt, parse_mode="Markdown")
-                        if admin_chat:
-                            send_message(admin_chat, msg_txt, parse_mode="Markdown")
-            except Exception:
-                pass
+                _process_scheduled_reminders(reminder_tracker)
+            except Exception as e:
+                print(f"[Telegram] Erro nos lembretes: {e}")
 
 
 def _run_local_test(args: argparse.Namespace) -> None:
