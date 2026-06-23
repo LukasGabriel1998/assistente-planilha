@@ -229,6 +229,65 @@ def _strip_leading_article(text: str) -> str:
     return re.sub(r"^(?:um|uma|o|a)\s+", "", text.strip(), flags=re.IGNORECASE)
 
 
+_PRODUCT_TRAILING_STOP_WORDS = frozenset(
+    {
+        "pra",
+        "para",
+        "pro",
+        "eles",
+        "elas",
+        "ele",
+        "ela",
+        "vendi",
+        "vendemos",
+        "vender",
+        "fechei",
+        "fechamos",
+        "cliente",
+        "por",
+        "valor",
+        "pagou",
+        "pagaram",
+        "restante",
+        "saldo",
+        "entrada",
+        "no",
+        "dia",
+        "data",
+        "mes",
+        "mês",
+        "eu",
+        "aqui",
+    }
+    | BAD_PRODUCT_WORDS
+)
+
+
+def _trim_product_name(candidate: str) -> str:
+    """Recorta ruído comum após o nome do produto em frases faladas."""
+    candidate = _clean_extracted_phrase(candidate)
+    candidate = _strip_leading_article(candidate)
+    if not candidate:
+        return ""
+    candidate = re.split(r"[,.;]", candidate, maxsplit=1)[0].strip()
+    candidate = re.split(
+        r"\s+(?:pra|para|pro)\s+(?:eles|elas|ele|ela|o|a|mim|nos|nós|gente|cliente)\b",
+        candidate,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+    words = candidate.split()
+    trimmed: list[str] = []
+    for word in words:
+        norm = _normalize(word.strip(".,;:"))
+        if norm in _PRODUCT_TRAILING_STOP_WORDS and trimmed:
+            break
+        if norm in {"vendi", "vendemos", "vender", "fechei", "fechamos"}:
+            break
+        trimmed.append(word)
+    return " ".join(trimmed).strip(" ,.-")
+
+
 def _humanize_label(text: str) -> str:
     def _title_fragment(fragment: str) -> str:
         if not fragment:
@@ -429,7 +488,7 @@ def _word_window_after_prefix(text: str, prefix: str, max_words: int = 16) -> st
         return ""
     fragment = norm_text[match.end() :]
     fragment = re.split(
-        r"[,.;]|\b(?:para|pra|cliente|id venda|id cliente|produto|data|dia)\b",
+        r"[,.;]|\b(?:para|pra|cliente|id venda|id cliente|produto|data|dia|restante|saldo|amanha|amanhã|e o restante|mas)\b",
         fragment,
         maxsplit=1,
     )[0]
@@ -465,11 +524,30 @@ def parse_money_value(fragment: str) -> Optional[float]:
     return _parse_money_from_fragment(fragment)
 
 
+def _parse_spoken_amount_pt(fragment: str) -> Optional[float]:
+    """Interpreta valor falado por extenso (ex.: dois mil setecentos e setenta e sete)."""
+    norm = _normalize(fragment)
+    if not re.search(
+        r"\b(mil|cento|cem|reais?|real|centavos?|centavo|" + NUMBER_WORD_PATTERN + r")\b",
+        norm,
+        flags=re.IGNORECASE,
+    ):
+        return None
+    word_value = _parse_number_words_pt(norm)
+    if word_value is None or word_value <= 0:
+        return None
+    return round(float(word_value), 2)
+
+
 def _parse_money_from_fragment(fragment: str) -> Optional[float]:
     norm = _normalize(fragment)
     phrase_value = _parse_money_phrase(norm)
     if phrase_value is not None:
         return phrase_value
+
+    spoken = _parse_spoken_amount_pt(norm)
+    if spoken is not None and _is_money_like(norm):
+        return spoken
 
     mil_match = re.search(r"(\d+(?:[.,]\d+)?)\s*mil\b", norm, flags=re.IGNORECASE)
     if mil_match:
@@ -478,7 +556,7 @@ def _parse_money_from_fragment(fragment: str) -> Optional[float]:
             return round(base * 1000.0, 2)
 
     word_thousand = re.search(
-        r"\b(" + "|".join(re.escape(word) for word in WORD_UNITS.keys()) + r")\s+mil\b",
+        r"\b(" + "|".join(re.escape(word) for word in WORD_UNITS.keys()) + r")\s+mil\b(?!\s+(?:e\s+)?(?:cento|cem|duzent|trezent|quatrocent|quinhent|seiscent|setecent|oitocent|novecent))",
         norm,
         flags=re.IGNORECASE,
     )
@@ -503,9 +581,9 @@ def _parse_money_from_fragment(fragment: str) -> Optional[float]:
 
     word_value = _parse_number_words_pt(norm)
     if word_value is not None and _is_money_like(norm):
-        if len(norm.split()) <= 12 and not numeric_values and "mil" not in norm:
+        if len(norm.split()) <= 12 and not numeric_values:
             return round(float(word_value), 2)
-    if re.search(r"\bmil\b", norm, flags=re.IGNORECASE) and not re.search(r"\d", norm):
+    if re.fullmatch(r"mil", norm, flags=re.IGNORECASE):
         return 1000.0
 
     number_match = re.search(MONEY_TOKEN, norm, flags=re.IGNORECASE)
@@ -518,9 +596,10 @@ def _parse_money_from_fragment(fragment: str) -> Optional[float]:
 
 
 def _mask_id_number_spans(text: str) -> str:
-    """Oculta números que são IDs (cliente id 002, id venda 005) para não virarem valor monetário."""
+    """Oculta números que são IDs (cliente 004, cliente id 002, id venda 005) para não virarem valor monetário."""
     masked = text
     id_patterns = (
+        r"\bcliente\s+\d{1,6}\b",
         r"\bcliente\s*id\s*[:\-]?\s*\d{1,6}\b",
         r"\bid\s*cliente\s*[:\-]?\s*\d{1,6}\b",
         r"\bid\s*(?:de\s*)?venda\s*[:\-]?\s*\d{1,6}\b",
@@ -582,6 +661,66 @@ def _is_service_delivery_finalized(text: str) -> bool:
     )
 
 
+_UPDATE_CONTEXT_TOKENS = (
+    "material",
+    "materia prima",
+    "matéria prima",
+    "fornecedor",
+    "gastar",
+    "gasto",
+    "gastei",
+    "pagou",
+    "pago",
+    "pendente",
+    "entrega",
+    "entregar",
+    "entregue",
+    "finaliz",
+    "id venda",
+    "apagar",
+    "apaga",
+    "excluir",
+    "exclui",
+    "deletar",
+    "remover",
+    "atualiza",
+    "ajusta",
+    "corrige",
+    "altera",
+    "alterar",
+)
+
+
+def _is_update_context(text: str) -> bool:
+    norm = _normalize(text or "")
+    return any(tok in norm for tok in _UPDATE_CONTEXT_TOKENS)
+
+
+def _message_has_explicit_sale_reference(text: str) -> bool:
+    raw = text or ""
+    if _extract_sale_id_from_text(raw) or _extract_delete_sale_id(raw):
+        return True
+    if re.search(r"\bcliente\s+(?:id\s*)?[:\-]?\s*\d{1,6}\b", raw, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\bid\s*cliente\s*[:\-]?\s*\d{1,6}\b", raw, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\b(?:do\s+)?id\s*[:\-]?\s*\d{1,6}\b", raw, flags=re.IGNORECASE):
+        return True
+    return False
+
+
+def _is_preview_field_correction(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    return bool(
+        re.match(
+            r"(?i)^(material|valor|produto|cliente|id|entrada|saldo|restante|entrega|venda)\s*[:\-=]",
+            raw,
+        )
+    )
+
+
 def enrich_with_last_sale_context(text: str, last_sale_id: str | None) -> str:
     """
     Quando o usuário fala 'para ele', 'a entrega foi hoje' etc. logo após outra ação,
@@ -589,6 +728,8 @@ def enrich_with_last_sale_context(text: str, last_sale_id: str | None) -> str:
     """
     raw = (text or "").strip()
     if not raw or not last_sale_id:
+        return raw
+    if _message_has_explicit_sale_reference(raw) or _is_preview_field_correction(raw):
         return raw
     if _extract_target_sale_id_for_updates(raw) or _extract_sale_id_from_text(raw) or _extract_delete_sale_id(raw):
         return raw
@@ -665,7 +806,7 @@ def _currency_candidates(text: str) -> list[float]:
             values.append(combined)
 
     for match in re.finditer(
-        r"\b(" + "|".join(re.escape(word) for word in WORD_UNITS.keys()) + r")\s+mil\b",
+        r"\b(" + "|".join(re.escape(word) for word in WORD_UNITS.keys()) + r")\s+mil\b(?!\s+(?:e\s+)?(?:cento|cem|duzent|trezent|quatrocent|quinhent|seiscent|setecent|oitocent|novecent))",
         norm,
         flags=re.IGNORECASE,
     ):
@@ -673,6 +814,17 @@ def _currency_candidates(text: str) -> list[float]:
         base = WORD_UNITS.get(unit_word)
         if base and base > 0:
             values.append(float(base * 1000))
+
+    for match in re.finditer(
+        r"(?:(?:valor\s+total|no\s+valor(?:\s+total)?|me\s+pagou|pagou|pagaram|recebi|entrada)\s+(?:de\s+)?)"
+        r"((?:\w+\s+){1,14}?)"
+        r"(?=\s+(?:mas|e\s+o|o\s+restante|restante|saldo|amanha|amanhã)|$)",
+        norm,
+        flags=re.IGNORECASE,
+    ):
+        spoken = _parse_spoken_amount_pt(match.group(1))
+        if spoken is not None and spoken > 0:
+            values.append(spoken)
 
     for match in re.finditer(r"(\d+(?:[.,]\d+)?)\s*mil\b", norm, flags=re.IGNORECASE):
         base = _to_float(match.group(1))
@@ -807,6 +959,7 @@ def _parse_pt_date(fragment: str, reference_date: date, *, full_text: str = "") 
 
 
 def _extract_customer(text: str) -> Optional[str]:
+    update_context = _is_update_context(text)
     _cust_stop = (
         r"(?=\s*[,.]"
         r"|\s+(?:ela|ele|adiciona|comprou|pagou|pago|no\s+valor|valor|entrou|saldo|restante|vai)\b"
@@ -855,7 +1008,8 @@ def _extract_customer(text: str) -> Optional[str]:
         # "vendi 5000 para o cliente PC GAMER, ele me pagou a metade" -> captura só "PC GAMER"
         r"\b(?:para|pro|pra)\s+(?:(?:o|a)\s+)?cliente\s+([^,.;\n]+?)(?=\s+(?:ele|ela|me|pagou|deu|vai|paga)\s|,|\.|;|\s*$)",
         r"\b(?:para|pro|pra)\s+(?:(?:o|a)\s+)?cliente\s+([^,.;\n]+)",
-        r"\bcliente\s+([^,.;\n]+)",
+        # fallback amplo — evitar em atualizações onde "cliente 004 gasto..." vira nome errado
+        *([] if update_context else [r"\bcliente\s+([^,.;\n]+)"]),
         # fallback: "Adriel comprou o banner"
         rf"\b({LETTER_RX}[\w'-]{{1,30}}(?:\s+{LETTER_RX}[\w'-]{{1,30}}){{0,3}})\s+comprou\b",
     ]
@@ -902,6 +1056,10 @@ def _extract_customer(text: str) -> Optional[str]:
             if not digits_only:
                 continue
 
+            # Em atualizações (material, pagamento...), "cliente 004" refere-se ao ID VENDA.
+            if update_context and candidate.strip().upper() == digits_only and len(digits_only) <= 6:
+                continue
+
             # Ex.: "004", "0123"
             if candidate.strip().upper() == digits_only and len(digits_only) <= 4:
                 return _humanize_label(candidate)
@@ -918,7 +1076,7 @@ def _extract_customer(text: str) -> Optional[str]:
 def _extract_product(text: str) -> Optional[str]:
     patterns = [
         # "eles compraram uma fachada" / "comprou um banner"
-        rf"\b(?:eles?\s+)?compr(?:ou|aram|amos)\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s*[,.]|\s+(?:adiciona|valor|no\s+valor|pagou|pagaram|vai|vao|vão)\b|\s*$)",
+        rf"\b(?:eles?\s+)?compr(?:ou|aram|amos)\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s*[,.]|\s+(?:eu\s+vendi|vendi\s+ele|adiciona|valor|no\s+valor|pagou|pagaram|vai|vao|vão)\b|\s*$)",
         # "fiz uma venda para P26 de uma fachada ..." -> produto = "fachada"
         rf"\b(?:acabei\s+de\s+fazer\s+)?fiz\s+(?:uma\s+)?venda\s+(?:para|pro|pra)\s+[^,.;\n]+?\s+de\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s+(?:por|no\s+valor|valor|pagou|vai\s+pagar|e\b|,|\.|;)|\s*$)",
         # "fiz uma venda de uma fachada para P26 ..." -> produto = "fachada"
@@ -959,7 +1117,7 @@ def _extract_product(text: str) -> Optional[str]:
             flags=re.IGNORECASE,
         )
         candidate = re.split(
-            r"[,.;]|(?:\b(?:minha|minho|cliente|valor|um valor|pagou|entrada|saldo|restante|vou|vao|vão|quando|no dia|dia|data|mes|por|de|para|pra|e eu|eu vou|no|com esse valor)\b)",
+            r"[,.;]|(?:\b(?:minha|minho|cliente|valor|um valor|pagou|entrada|saldo|restante|vou|vao|vão|quando|no dia|dia|data|mes|por|de|para|pra|e eu|eu vou|no|com esse valor|eu vendi|vendi ele)\b)",
             candidate,
             maxsplit=1,
             flags=re.IGNORECASE,
@@ -968,13 +1126,19 @@ def _extract_product(text: str) -> Optional[str]:
         candidate = re.sub(r"\s+e\s+(?:vao|vão|vai|pag\w+|restante|metade|quando).*$", "", candidate, flags=re.IGNORECASE)
         candidate = re.sub(r"\s+no\s+valor.*$", "", candidate, flags=re.IGNORECASE)
         candidate = re.sub(r"\s+e$", "", candidate, flags=re.IGNORECASE)
-        candidate = _clean_extracted_phrase(candidate)
+        candidate = _trim_product_name(candidate)
         if _normalize(candidate).startswith("com "):
             continue
         candidate = _strip_leading_article(candidate)
         words = [word for word in candidate.split() if word]
         if not words:
             continue
+        trimmed_words: list[str] = []
+        for word in words:
+            if _normalize(word) in {"eu", "ele", "ela", "vendi", "vendemos", "vender"} and trimmed_words:
+                break
+            trimmed_words.append(word)
+        words = trimmed_words or words
         normalized_words = [_normalize(word) for word in words]
         if any(word in BAD_PRODUCT_WORDS for word in normalized_words):
             continue
@@ -1042,13 +1206,15 @@ def _extract_target_sale_id_for_updates(text: str) -> Optional[str]:
     )
     if not update_context:
         return None
-    m = re.search(r"\bcliente\s*id\s*[:\-]?\s*(\d{1,6})\b", raw, flags=re.IGNORECASE)
-    if not m:
-        m = re.search(r"\bid\s*cliente\s*[:\-]?\s*(\d{1,6})\b", raw, flags=re.IGNORECASE)
-    if not m:
-        return None
-    digits = m.group(1)
-    return digits.zfill(3) if len(digits) <= 3 else digits
+    for pattern in (
+        r"\bcliente\s*id\s*[:\-]?\s*(\d{1,6})\b",
+        r"\bid\s*cliente\s*[:\-]?\s*(\d{1,6})\b",
+        r"\bcliente\s+(\d{1,6})\b",
+    ):
+        m = re.search(pattern, raw, flags=re.IGNORECASE)
+        if m:
+            return _format_sale_id_digits(m.group(1))
+    return None
 
 
 def extract_supplemental_sale_id(text: str) -> Optional[str]:
@@ -1075,6 +1241,40 @@ def _format_sale_id_digits(digits: str) -> str:
     return digits.zfill(3) if len(digits) <= 3 else digits
 
 
+def extract_sale_ids_list_for_updates(text: str) -> list[str]:
+    """
+    Extrai um ou mais ID VENDA em mensagens de atualização (pagamento, entrega, etc.).
+    Ex.: "cliente id 004, 005 e 008 foi entregue" ou "ID VENDA 004, 005 pagou".
+    """
+    raw = normalize_spoken_ids_in_text(text or "")
+    lower = raw.lower()
+    collected: list[str] = []
+
+    cluster_patterns = (
+        r"\bid\s*(?:de\s*)?venda\s*[:\-]?\s*([0-9,\seE]+?)(?=\s+(?:foi\s+)?(?:entreg|pagou|pago|finaliz|recebeu|quit)|\s*(?:foi\s+)?(?:entreg|pagou|pago|finaliz|recebeu|quit)|[,.]|$)",
+        r"\bcliente\s*(?:id)?\s*[:\-]?\s*([0-9,\seE]+?)(?=\s+(?:foi\s+)?(?:entreg|pagou|pago|finaliz|recebeu|quit)|\s*(?:foi\s+)?(?:entreg|pagou|pago|finaliz|recebeu|quit)|[,.]|$)",
+        r"(?:atualiz\w*|marca\w*|confirma\w*)\s+(?:a[ií]\s+)?(?:que\s+)?(?:foi\s+)?(?:entreg\w*|pag\w*|quit\w*)\s+(?:cliente\s*)?(?:id\s*)?([0-9,\seE]+)",
+    )
+    for pattern in cluster_patterns:
+        match = re.search(pattern, lower, flags=re.IGNORECASE)
+        if match:
+            collected.extend(re.findall(r"\d{1,6}", match.group(1)))
+            if collected:
+                break
+
+    if not collected:
+        collected = re.findall(r"\bid\s*[:\-]?\s*(\d{1,6})\b", lower)
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw_id in collected:
+        sale_id = _format_sale_id_digits(raw_id)
+        if sale_id not in seen:
+            seen.add(sale_id)
+            ordered.append(sale_id)
+    return ordered
+
+
 def _extract_delete_sale_id(text: str) -> Optional[str]:
     """Extrai ID VENDA em pedidos de exclusão (ex.: 'apagar cliente id 003')."""
     raw = normalize_spoken_ids_in_text(text or "")
@@ -1098,6 +1298,53 @@ def _extract_delete_sale_id(text: str) -> Optional[str]:
         if match:
             return _format_sale_id_digits(match.group(1))
     return None
+
+
+def extract_delete_sale_ids_list(text: str) -> list[str]:
+    """
+    Extrai um ou mais ID VENDA em pedidos de exclusão.
+    Ex.: "apaga id 002, 004 e 005" ou "excluir venda 002 e 004".
+    """
+    raw = normalize_spoken_ids_in_text(text or "")
+    if not _is_sale_delete_request(raw):
+        return []
+
+    lower = raw.lower()
+    collected: list[str] = []
+    cluster_patterns = (
+        r"\b(?:apagar|apaga|excluir|exclui|deletar|remover|cancelar|tirar|limpar)\b[^.\n]*?\bid\s*[:\-]?\s*([0-9,\seE]+)",
+        r"\b(?:apagar|apaga|excluir|exclui|deletar|remover)\s+(?:a\s+)?venda\s*[:\-]?\s*([0-9,\seE]+)",
+        r"\bid\s*(?:de\s*)?venda\s*[:\-]?\s*([0-9,\seE]+?)(?=[,.]|$|\s+(?:e\s+)?(?:id|cliente|venda))",
+        r"\bcliente\s*(?:id)?\s*[:\-]?\s*([0-9,\seE]+?)(?=[,.]|$|\s+(?:e\s+)?(?:id|cliente|venda))",
+    )
+    for pattern in cluster_patterns:
+        match = re.search(pattern, lower, flags=re.IGNORECASE)
+        if match:
+            collected.extend(re.findall(r"\d{1,6}", match.group(1)))
+            if collected:
+                break
+
+    if not collected:
+        single = _extract_delete_sale_id(raw)
+        if single:
+            collected = [single]
+        else:
+            idx = -1
+            for kw in DELETE_KEYWORDS + CANCEL_DELETE_KEYWORDS:
+                pos = lower.find(kw)
+                if pos != -1 and (idx == -1 or pos < idx):
+                    idx = pos
+            if idx >= 0:
+                collected = re.findall(r"\d{1,6}", raw[idx:])
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw_id in collected:
+        sale_id = _format_sale_id_digits(raw_id)
+        if sale_id not in seen:
+            seen.add(sale_id)
+            ordered.append(sale_id)
+    return ordered
 
 
 DELETE_KEYWORDS = (
@@ -1203,7 +1450,10 @@ def _extract_material_allocations(text: str, reference_date: date) -> list[Mater
 
     # Para material, queremos vincular ao ID da venda (linha especifica),
     # nao ao ID do cliente.
-    id_pattern = r"(?:id\s*(?:de\s*)?venda|codigo\s*(?:da\s*)?venda|cliente\s*id|id\s*cliente)\s*([a-zA-Z0-9_-]{1,30})"
+    id_pattern = (
+        r"(?:id\s*(?:de\s*)?venda|codigo\s*(?:da\s*)?venda|cliente\s*id|id\s*cliente|cliente)\s*"
+        r"([a-zA-Z0-9_-]{1,30})"
+    )
     loose_id_pattern = r"\b([a-zA-Z]*\d[a-zA-Z0-9_-]{0,29})\b"
     money_pattern = r"(r\$\s*\d[\d\.,]*|\d{2,}(?:[\.,]\d{1,2})?|\bmil\b|\b(?:um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez)\s+mil\b)"
     # Padroes: aqui so consideramos o ID da venda se vier com algum marcador ("id venda ...").
@@ -1476,7 +1726,11 @@ def _extract_itemized_products_and_total(text: str) -> tuple[list[str], Optional
     """
     products: list[str] = []
     values: list[float] = []
-    product_chunk = r"((?:[A-Za-zÀ-ÖØ-öø-ÿ0-9/-]+\s*){1,4}?)"
+    product_word = (
+        r"(?!pra|para|pro|por|vendi|vendemos|eles|elas|ele|ela|cliente|eu|aqui\b)"
+        r"[A-Za-zÀ-ÖØ-öø-ÿ0-9/-]+"
+    )
+    product_chunk = rf"(({product_word}(?:\s+(?!pra|para|pro|,|vendi|eu\b){product_word}){{0,2}}\s*)?)"
     patterns = [
         re.compile(
             rf"\b(?:o|a)\s+{product_chunk}\s+(?:eu\s+)?vendi\s+(?:no\s+valor\s+de|por)\s*({MONEY_TOKEN})",
@@ -1490,9 +1744,7 @@ def _extract_itemized_products_and_total(text: str) -> tuple[list[str], Optional
     seen_pairs: set[tuple[str, float]] = set()
     for pattern in patterns:
         for m in pattern.finditer(text):
-            prod = _clean_extracted_phrase(m.group(1) or "")
-            prod = _strip_leading_article(prod)
-            prod = re.sub(r"\b(eu|aqui|pra|para)\b\s*$", "", prod, flags=re.IGNORECASE).strip(" ,.-")
+            prod = _trim_product_name(m.group(1) or "")
             if not prod:
                 continue
             norm_words = [_normalize(w) for w in prod.split() if w]
@@ -1543,6 +1795,15 @@ def _extract_material_cost(text: str) -> Optional[float]:
         for v in _currency_candidates(snippet):
             if v > 0:
                 candidates.append(float(v))
+        after_material = re.search(
+            r"\bmaterial\b\s*(?:de\s+)?(.{0,80})",
+            _normalize(text[max(0, idx - 20) : idx + 120]),
+            flags=re.IGNORECASE,
+        )
+        if after_material:
+            word_value = _parse_money_from_fragment(after_material.group(1))
+            if word_value is not None and word_value > 0:
+                candidates.append(float(word_value))
     if candidates:
         return max(candidates)
     return None
@@ -1898,14 +2159,23 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
     )
 
     customer = _extract_customer(raw_text) or ""
+    if sale_id and customer:
+        cust_norm = _normalize(customer)
+        sale_digits = re.sub(r"\D", "", str(sale_id))
+        cust_digits = re.sub(r"\D", "", customer)
+        if sale_digits and cust_digits and sale_digits == cust_digits:
+            customer = ""
+        elif sale_digits and cust_norm.startswith(sale_digits):
+            customer = ""
     product_id = _extract_product(raw_text) or ""
     total_value = _extract_total_value(raw_text, numbers)
     itemized_products, itemized_total = _extract_itemized_products_and_total(raw_text)
     if itemized_total is not None:
         total_value = itemized_total
-    if itemized_products:
-        joined_products = " + ".join(itemized_products)
-        product_id = joined_products
+    if len(itemized_products) >= 2:
+        product_id = " + ".join(itemized_products)
+    elif itemized_products and not product_id:
+        product_id = itemized_products[0]
     # Se a mensagem for claramente "gasto de material" (ex.: "gastei 1000 de material"),
     # nao tratamos como venda/total no caixa: suprimimos total_value e montamos apenas
     # a atualizacao de Compras Matéria-Prima.
@@ -2112,15 +2382,13 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
     material_expense_only = bool((material_allocations or material_cost) and (not sale_creation_context) and not total_value)
     if material_expense_only:
         # Para "gasto de material", precisamos do ID VENDA para vincular a linha correta em "Compras Matéria-Prima".
-        # O ID Cliente é opcional quando a mensagem já traz o ID VENDA (ex.: "material para o cliente id 003").
+        # Gasto de material: só precisa do ID VENDA para vincular na planilha.
         if not sale_id and not material_allocations:
             missing.append("ID VENDA")
-        if (not sale_id) and (not material_allocations) and (not customer):
-            missing.append("ID Cliente")
     else:
-        # Fluxo de venda normal: exige cliente e valor (produto é opcional).
+        # Fluxo de venda normal: exige nome do cliente e valor (produto é opcional).
         if not customer:
-            missing.append("ID Cliente")
+            missing.append("Cliente")
         if not total_value:
             missing.append("Valor total da venda")
     if _has_placeholder_date(raw_text):
@@ -2391,6 +2659,7 @@ _PREVIEW_CORRECTION_FIELD_RE = re.compile(
     r"|restante"
     r"|resto"
     r"|entrega"
+    r"|material(?:\s+estimado)?"
     r"|id\s+venda"
     r"|venda"
     r")\s*[:=]?\s*"
@@ -2444,6 +2713,8 @@ def _preview_correction_label_to_key(label: str) -> Optional[str]:
     label = label.lower().strip()
     if label.startswith("cliente") or label.startswith("nome do cliente") or label == "id cliente":
         return "cliente"
+    if label.startswith("material"):
+        return "material"
     if label == "produto":
         return "produto"
     if label.startswith("valor"):
@@ -2657,6 +2928,10 @@ def apply_multi_field_corrections(
             or re.search(r"\bid\s*[:\-]?\s*\d", lower)
         ):
             fields = {"id_venda": text}
+        elif "material" in lower:
+            rest = _preview_correction_rest(text, "material")
+            if rest:
+                fields = {"material": rest}
         elif "produto" in lower:
             rest = _preview_correction_rest(text, "produto")
             if rest:
@@ -2677,18 +2952,7 @@ def apply_multi_field_corrections(
     touched_payments = "entrada" in fields or "saldo" in fields
 
     if "cliente" in fields:
-        new_name = fields["cliente"]
-        m_id = re.search(r"\d+", new_name)
-        only_digits = bool(re.fullmatch(r"\d+", new_name.strip()))
-        if m_id and (
-            only_digits
-            or re.search(r"\bid\b", text, re.I)
-            or re.search(r"cliente\s+id", text, re.I)
-        ):
-            digits = m_id.group(0)
-            command.customer = digits.zfill(3) if len(digits) <= 3 else digits
-        else:
-            command.customer = new_name
+        command.customer = fields["cliente"].strip()
         updated = True
 
     if "id_venda" in fields:
@@ -2702,6 +2966,27 @@ def apply_multi_field_corrections(
                 digits = m_id.group(0)
                 command.sale_id = digits.zfill(3) if len(digits) <= 3 else digits
                 updated = True
+        if updated and command.sale_id and command.material_allocations:
+            for allocation in command.material_allocations:
+                allocation.sale_id = str(command.sale_id).strip()
+
+    if "material" in fields:
+        parsed_material = _parse_correction_money(fields["material"], text)
+        if parsed_material is not None and parsed_material > 0:
+            command.material_cost = parsed_material
+            command.material_date = command.material_date or command.sale_date or reference_date
+            if command.material_allocations:
+                for allocation in command.material_allocations:
+                    allocation.amount = float(parsed_material)
+            elif command.sale_id:
+                command.material_allocations = [
+                    MaterialAllocation(
+                        sale_id=str(command.sale_id).strip(),
+                        amount=float(parsed_material),
+                        material_date=command.material_date or reference_date,
+                    )
+                ]
+            updated = True
 
     if "produto" in fields:
         new_prod = fields["produto"]
@@ -2747,9 +3032,9 @@ def apply_multi_field_corrections(
                 saldo.value = round(max(total - float(entrada.value or 0), 0), 2)
 
     if updated and parse_result is not None:
-        if (command.customer or "").strip() and "ID Cliente" in parse_result.missing_fields:
+        if (command.customer or "").strip() and "Cliente" in parse_result.missing_fields:
             parse_result.missing_fields = [
-                f for f in parse_result.missing_fields if f != "ID Cliente"
+                f for f in parse_result.missing_fields if f != "Cliente"
             ]
         if getattr(command, "sale_id", None) and "ID VENDA" in parse_result.missing_fields:
             parse_result.missing_fields = [
@@ -2902,7 +3187,7 @@ def parse_message(message: str, reference_date: Optional[date] = None) -> ParseR
             intent="delivery_update",
         )
     if intent == "material_update":
-        # Reaproveita parse_financial_message; apenas sinaliza intent para não exigir ID Cliente em updates por ID VENDA.
+        # Reaproveita parse_financial_message; updates por ID VENDA não exigem nome do Cliente.
         financial_result.intent = "material_update"
         return financial_result
     if intent == "payment_update":

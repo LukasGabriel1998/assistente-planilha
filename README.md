@@ -14,52 +14,24 @@ Projeto para cliente leigo, com foco em simplicidade:
 - `src/parser.py`: interpreta texto livre (cliente, venda, entrada, saldo, material, datas).
 - `src/transcription.py`: transcricao local com `faster-whisper`.
 - `src/excel_store.py`: escrita segura no Excel e historico em `Log_Agente`.
-- `run_project.py`: setup automatico + executar App, Telegram ou API n8n (1 clique no Cursor).
+- `run_project.py`: prepara o ambiente (venv, libs, Whisper, .env) — rode primeiro.
+- `telegram_bot.py`: inicia o bot do Telegram — rode depois do setup.
 - `launcher.py`: interface desktop para cliente leigo.
-- `build_exe.bat`: gera executavel para distribuicao.
-- `empacotar_cliente.bat`: gera arquivo ZIP pronto para envio.
-- `preparar_modelo_audio.bat`: baixa modelo local de transcricao para uso sem depender de download no primeiro audio.
 
 ## Rodar com 1 clique (Cursor / VS Code)
 
-1. Abra `run_project.py`.
-2. Clique em **Run** (▶) ou use Run and Debug (`Ctrl+Shift+D`).
-3. Escolha: **Setup + Telegram**, **Setup + App**, etc.
+1. Abra `run_project.py` e clique em **Run** (▶) — prepara tudo.
+2. Abra `telegram_bot.py` e clique em **Run** (▶) — inicia o bot.
+3. Escolha no menu Run and Debug: App (`launcher.py`) ou API n8n se precisar.
 
 Ou no terminal:
 
 ```powershell
-python run_project.py --telegram   # Telegram
-python run_project.py --app        # App desktop
-python run_project.py --all        # App + Telegram
-python run_project.py --setup-only # so instala bibliotecas
+python run_project.py      # prepara o ambiente
+python telegram_bot.py     # inicia o Telegram
+python launcher.py         # App desktop
+python n8n_api.py          # API n8n
 ```
-
-## Gerar executavel para cliente
-
-1. Execute `build_exe.bat`.
-2. Aguarde o final do build.
-3. Entregue a pasta `dist_novo\AssistentePlanilha` para o cliente.
-4. Opcional: execute `empacotar_cliente.bat` para criar `dist_novo\AssistentePlanilha.zip`.
-
-Para experiencia melhor com audio no cliente:
-
-1. Execute `preparar_modelo_audio.bat` antes do build.
-2. Depois execute `build_exe.bat`.
-3. O build inclui automaticamente a pasta `models` se ela existir.
-
-Arquivos importantes da entrega:
-
-- `dist_novo\AssistentePlanilha\AssistentePlanilha.exe`
-- `dist_novo\AssistentePlanilha\INICIAR_CLIENTE.bat`
-- planilha `.xlsx` (copiada automaticamente se existir no projeto)
-
-Fluxo do cliente:
-
-1. Duplo clique em `INICIAR_CLIENTE.bat` (ou no `.exe`).
-2. Selecionar planilha.
-3. Clicar `Iniciar Sistema`.
-4. Abrir no navegador e usar `Gravar audio`.
 
 ## Rodar manualmente
 
@@ -99,9 +71,9 @@ python -m streamlit run app.py
 ```
 assistente-planilha-1/
 ├── app.py                      # Interface web (Streamlit)
-├── run_project.py              # Setup + executar (1 clique)
+├── run_project.py              # Prepara ambiente (rode primeiro)
 ├── launcher.py                 # Janela desktop (pywebview)
-├── telegram_bot.py             # Bot Telegram
+├── telegram_bot.py             # Bot Telegram (rode depois do setup)
 ├── n8n_api.py                  # API HTTP para n8n
 ├── src/                        # Codigo-fonte principal (parser, planilha, audio)
 │   ├── parser.py               # Interpreta texto em portugues
@@ -125,7 +97,7 @@ Passos:
 
 1. Copiar `.env.example` para `.env`.
 2. Definir `TELEGRAM_BOT_TOKEN` (token do @BotFather).
-3. Rodar `python run_project.py --telegram` (ou Run em `run_project.py` no Cursor).
+3. Rodar `python telegram_bot.py` (depois de `python run_project.py`).
 
 Guia completo: `docs/HOWTO_TELEGRAM.md`
 
@@ -135,7 +107,7 @@ Guia completo: `docs/HOWTO_TELEGRAM.md`
 
 ```powershell
 cd "C:\Users\Usuario\Desktop\DEV - PROJETOS\assistente-planilha-1"
-python run_project.py --app
+python launcher.py
 ```
 
 Ou manualmente:
@@ -155,13 +127,13 @@ Abra `http://127.0.0.1:8501`, digite ou grave um comando e confira a previa ante
 ### 3) Bot Telegram
 
 ```powershell
-python run_project.py --telegram
+python telegram_bot.py
 ```
 
 ### 4) API n8n
 
 ```powershell
-python run_project.py --n8n-api
+python n8n_api.py
 ```
 
 Documentacao interativa: `http://127.0.0.1:8765/docs` — guia em `docs/HOWTO_N8N.md`.

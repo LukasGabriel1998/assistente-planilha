@@ -14,6 +14,7 @@ from .bot_processor import (
     STATUS_KEYWORDS,
     PREVIEW_KEYWORDS,
     apply_parse_result,
+    build_missing_fields_message,
     build_preview,
     get_default_workbook,
     process_command,
@@ -185,7 +186,7 @@ def handle_message(
 
     if parse_result.missing_fields:
         missing_set = set(parse_result.missing_fields)
-        if missing_set <= {"ID Cliente", "ID VENDA"} and parse_result.intent in (
+        if missing_set <= {"Cliente", "ID VENDA"} and parse_result.intent in (
             "sale",
             "mixed_update",
             "refund",
@@ -197,8 +198,8 @@ def handle_message(
         ):
             preview = build_preview(parse_result)
             extra = ""
-            if "ID Cliente" in missing_set:
-                extra = "\n\nFaltou apenas o ID Cliente. Envie ex.: cliente id 004."
+            if "Cliente" in missing_set:
+                extra = "\n\nFaltou apenas o Cliente. Envie ex.: Cliente: Macdonald."
             elif "ID VENDA" in missing_set:
                 extra = "\n\nFaltou apenas o ID VENDA. Envie ex.: id venda 002."
             _sessions[conv] = {
@@ -218,7 +219,10 @@ def handle_message(
         return {
             "ok": False,
             "conversation_id": conv,
-            "reply": "Faltam dados: " + ", ".join(parse_result.missing_fields),
+            "reply": build_missing_fields_message(
+                parse_result.missing_fields,
+                parse_result.intent,
+            ),
             "needs_confirmation": False,
             "applied": False,
             "missing_fields": parse_result.missing_fields,

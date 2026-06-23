@@ -150,6 +150,53 @@ def format_reply(intent: str, actions: list, error: str | None = None) -> str:
     return "✅ *Registrado com sucesso!*\n\n" + "\n".join(parts[:5])
 
 
+def build_missing_fields_message(
+    missing_fields: list[str],
+    intent: str | None = None,
+) -> str:
+    """Resposta amigável quando faltam campos obrigatórios."""
+    unique = list(dict.fromkeys(missing_fields))
+    fields_txt = ", ".join(unique)
+
+    intent_intros = {
+        "sale": (
+            "Ah, legal! Entendi que você fez uma venda. "
+            "Me manda mais algumas informações pra gente registrar na planilha:"
+        ),
+        "mixed_update": (
+            "Beleza! Quase lá — me manda mais alguns detalhes pra atualizar a planilha:"
+        ),
+        "material_update": (
+            "Entendi! Só preciso de mais alguns dados sobre a matéria-prima:"
+        ),
+        "refund": "Ok, vi que é um estorno. Me ajuda com mais algumas informações:",
+        "status_update": (
+            "Beleza! Só faltam alguns dados pra eu atualizar o status na planilha:"
+        ),
+        "delivery_update": (
+            "Entendi que é uma alteração de entrega. Me manda o que ainda falta:"
+        ),
+        "delivery_finalize": (
+            "Beleza! Quase consigo registrar a entrega — me manda o que ainda falta:"
+        ),
+        "payment_update": (
+            "Entendi o pagamento! Me manda o que ainda falta pra registrar:"
+        ),
+        "sale_delete": (
+            "Entendi que você quer excluir uma venda. Me manda o que ainda falta:"
+        ),
+    }
+    intro = intent_intros.get(
+        intent or "",
+        "Beleza! Me manda mais algumas informações pra gente atualizar a planilha:",
+    )
+    return (
+        f"{intro}\n\n"
+        f"*Faltam:* {fields_txt}\n\n"
+        "Pode mandar tudo numa mensagem — quando souber, é só enviar."
+    )
+
+
 def build_preview(parse_result: ParseResult) -> str:
     """Monta texto de prévia do que será salvo na planilha (para o usuário confirmar ou editar)."""
     if parse_result.intent == "delivery_update":
@@ -272,7 +319,8 @@ def build_preview(parse_result: ParseResult) -> str:
                 "_Depois, se já entregou, basta dizer: `entrega foi hoje` ou `para ele, entrega hoje`._"
             )
             lines.append(
-                f"_Lembrete automático será enviado na data de entrega ({delivery}) enquanto não for finalizado._"
+                f"_No dia da entrega ({delivery}), lembretes automáticos às 6h e a cada 2h "
+                f"(entrega e valor pendente, se houver)._"
             )
         lines.append(f"🔁 Novo status: *{su.status.upper()}*")
         lines.append("\nSe estiver correto, responda *SIM*. Para corrigir, envie por texto. Para cancelar, responda *NÃO*.")
@@ -286,7 +334,7 @@ def build_preview(parse_result: ParseResult) -> str:
             return (
                 "📋 *Entendi assim: apagar registro da planilha*\n\n"
                 "Não identifiquei qual venda apagar.\n"
-                "Informe o *ID VENDA*, por exemplo: `id venda 003` ou `cliente id 003`.\n\n"
+                "Informe o *ID VENDA*, por exemplo: `id venda 003`.\n\n"
                 "Para cancelar, responda *NÃO*."
             )
         sale_ctx = _load_sale_context_for_preview(dc.sale_id)
@@ -415,7 +463,7 @@ def apply_parse_result(
     cmd = parse_result.command
     if parse_result.intent == "delivery_finalize":
         if not getattr(cmd, "sale_id", None):
-            return "Faltou o *ID VENDA* para confirmar a entrega. Ex.: `cliente id 002 foi entregue`."
+            return "Faltou o *ID VENDA* para confirmar a entrega. Ex.: `id venda 002 foi entregue`."
         sale_id = str(cmd.sale_id).strip()
         delivery_date = getattr(cmd, "service_due_date", None) or date.today()
         service.update_sale_delivery_date(sale_id, delivery_date)
@@ -595,7 +643,10 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
     cmd = parse_result.command
 
     if parse_result.missing_fields:
-        return "Faltam dados: " + ", ".join(parse_result.missing_fields) + ". Revise e tente de novo."
+        return build_missing_fields_message(
+            parse_result.missing_fields,
+            parse_result.intent,
+        )
 
     workbook_path = get_default_workbook()
     if not workbook_path or not Path(workbook_path).exists():

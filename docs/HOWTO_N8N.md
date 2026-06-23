@@ -5,7 +5,7 @@ O n8n recebe mensagens (WhatsApp, Telegram, etc.) e chama esta API Python, que u
 ## 1. Subir a API
 
 1. Confirme `WORKBOOK_PATH` no `.env` (planilha em `dist_novo\AssistentePlanilha\...`).
-2. Execute **`python run_project.py --n8n-api`** (ou Run no Cursor com a config "Setup + API n8n") ou:
+2. Execute **`python n8n_api.py`** (ou Run no Cursor com a config "API n8n") ou:
 
 ```powershell
 cd "C:\Users\Usuario\Desktop\DEV - PROJETOS\assistente-planilha-1"
@@ -118,9 +118,9 @@ Para cancelar: `text: "NAO"` ou `action: "cancel"`.
 
 | Serviço | Comando | Porta |
 |---------|---------|-------|
-| App | `python run_project.py --app` | 8501 |
-| API n8n | `python run_project.py --n8n-api` | 8765 |
-| Bot Telegram (opcional) | `python run_project.py --telegram` | — |
+| App | `python launcher.py` | 8501 |
+| API n8n | `python n8n_api.py` | 8765 |
+| Bot Telegram (opcional) | `python telegram_bot.py` | — |
 
 Você pode usar **só o n8n** para Telegram/WhatsApp e desligar o `telegram_bot.py`, desde que todos os fluxos passem pela API.
 
