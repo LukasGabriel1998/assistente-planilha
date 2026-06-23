@@ -392,6 +392,46 @@ def _parse_number_words_pt(fragment: str) -> Optional[int]:
     return total + current
 
 
+def _parse_colloquial_short_thousands(fragment: str) -> Optional[float]:
+    """
+    Interpreta formas faladas abreviadas, ex.:
+    'dois e oitocentos' (= 2800), 'tres e quinhentos' (= 3500).
+    """
+    norm = _normalize(fragment)
+    match = re.search(
+        r"\b("
+        + "|".join(re.escape(w) for w in WORD_UNITS if w not in {"zero"})
+        + r"|dez|onze|doze|treze|quatorze|catorze|quinze|dezesseis|dezessete|dezoito|dezenove|"
+        r"vinte|trinta|quarenta|cinquenta)\s+e\s+("
+        + "|".join(
+            sorted(
+                (w for w in WORD_NUMBERS if w.startswith(("duzent", "trezent", "quatrocent", "quinhent", "seiscent", "setecent", "oitocent", "novecent", "cem", "cento"))),
+                key=len,
+                reverse=True,
+            )
+        )
+        + r")\w*\b",
+        norm,
+    )
+    if not match:
+        return None
+    unit_word = match.group(1)
+    hundreds_word = match.group(2)
+    # Recupera palavra completa (ex.: oitocent -> oitocentos)
+    hundreds_full = None
+    for word, val in WORD_NUMBERS.items():
+        if word.startswith(hundreds_word) and val >= 100:
+            hundreds_full = word
+            hundreds_val = val
+            break
+    if hundreds_full is None:
+        return None
+    unit_val = WORD_UNITS.get(unit_word) or WORD_NUMBERS.get(unit_word)
+    if unit_val is None or unit_val <= 0 or unit_val > 50:
+        return None
+    return round(float(unit_val) * 1000 + float(hundreds_val), 2)
+
+
 def _parse_amount_token(token: str) -> Optional[float]:
     if re.search(r"\d", token):
         matches = re.findall(r"(?:r\$\s*)?\d+(?:[.\s]\d{3})*(?:[.,]\d{1,2})?(?:\s*mil)?", token)
@@ -539,8 +579,22 @@ def _parse_spoken_amount_pt(fragment: str) -> Optional[float]:
     return round(float(word_value), 2)
 
 
-def _parse_money_from_fragment(fragment: str) -> Optional[float]:
+def _parse_money_from_fragment(fragment: str, *, prefer_leading: bool = False) -> Optional[float]:
     norm = _normalize(fragment)
+    if prefer_leading:
+        words = norm.split()
+        for n in range(min(len(words), 7), 0, -1):
+            prefix = " ".join(words[:n])
+            if re.search(r"\s(?:o|a)$", prefix) and n < len(words):
+                continue
+            prefix_val = _parse_money_from_fragment(prefix, prefer_leading=False)
+            if prefix_val is not None and prefix_val > 0:
+                return prefix_val
+
+    colloquial = _parse_colloquial_short_thousands(norm)
+    if colloquial is not None:
+        return colloquial
+
     phrase_value = _parse_money_phrase(norm)
     if phrase_value is not None:
         return phrase_value
@@ -962,10 +1016,12 @@ def _extract_customer(text: str) -> Optional[str]:
     update_context = _is_update_context(text)
     _cust_stop = (
         r"(?=\s*[,.]"
-        r"|\s+(?:ela|ele|adiciona|comprou|pagou|pago|no\s+valor|valor|entrou|saldo|restante|vai)\b"
+        r"|\s+(?:ela|ele|eles|elas|adiciona|comprou|compraram|pagou|pago|no\s+valor|valor|entrou|saldo|restante|vai)\b"
         r"|\s*$)"
     )
     patterns = [
+        rf"\bacabei\s+de\s+fazer\s+(?:uma\s+)?venda\s+(?:aqui\s+)?(?:para|pro|pra)\s+(?:o|a)\s+cliente\s+([^,.;\n]+?){_cust_stop}",
+        rf"\b(?:para|pro|pra)\s+(?:o|a)\s+cliente\s+([^,.;\n]+?){_cust_stop}",
         # "fiz outra venda aqui para a Aline" / "fiz venda para João"
         rf"\bfiz\s+(?:outra\s+)?venda\s+(?:aqui\s+)?(?:para|pro|pra)\s+(?:(?:o|a)\s+)?([^,.;\n]+?){_cust_stop}",
         # "acabei de fazer uma venda aqui para o Adriel" / "venda para a Maria"
@@ -1027,11 +1083,12 @@ def _extract_customer(text: str) -> Optional[str]:
             flags=re.IGNORECASE,
         ).strip()
         candidate = re.split(
-            r"[,.;]|(?:\b(?:esse cliente|ele comprou|eles fecharam|fecharam com a gente|comprou|onde|valor|um valor|pagou|paguei|entrada|saldo|restante|vou|no dia|dia|data|mes|gastar|material|porque|por)\b)",
+            r"[,.;]|(?:\b(?:esse cliente|ele comprou|eles fecharam|fecharam com a gente|comprou|onde|valor|um valor|pagou|paguei|entrada|saldo|restante|vou|no dia|dia|data|mes|gastar|material|porque|por)\b)|\s+e\s+(?:ele|ela|eles|elas)\b",
             candidate,
             maxsplit=1,
             flags=re.IGNORECASE,
         )[0].strip(" ,.-")
+        candidate = re.sub(r"\s+\be\s*$", "", candidate, flags=re.IGNORECASE).strip(" ,.-")
         candidate = re.sub(
             r"\s+(?:um|uma|o|a)\s+[^\d,.;]+?(?=\s+(?:por|no\s+valor|valor|pagou|vai\s+pagar|e\b|restante|metade|saldo|entrada|,|\.|;)|$)",
             "",
@@ -1718,26 +1775,81 @@ def _extract_total_value(text: str, numbers: list[float]) -> Optional[float]:
     return big[0] if big else numbers[0]
 
 
-def _extract_itemized_products_and_total(text: str) -> tuple[list[str], Optional[float]]:
+def _parse_money_after_position(text: str, start: int) -> Optional[float]:
+    tail = text[start:].lstrip()
+    tail = re.sub(r"^de\s+", "", tail, flags=re.IGNORECASE)
+    chunk = re.split(
+        r"\s+e\s+(?:o|a)\s+"
+        r"|\s*,|\s*\.\s"
+        r"|\s+(?:no|na|em)\s+(?:o|a)\s+"
+        r"|\s+(?:o|a)\s+(?!restante\b)(?:cliente|vendi|vendemos|um\b|uma\b|banner|fachada|painel|placa|\w+\s+vendi\b)"
+        r"|\s+o\s+restante|\s+restante",
+        tail,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+    direct = _parse_money_from_fragment(chunk, prefer_leading=True)
+    if direct is not None and direct > 0:
+        return direct
+    words = chunk.split()
+    stop_words = frozenset(
+        {
+            "a",
+            "o",
+            "eles",
+            "ele",
+            "ela",
+            "pagou",
+            "pagaram",
+            "paguei",
+            "restante",
+            "saldo",
+            "quando",
+            "cliente",
+            "fachada",
+            "banner",
+            "painel",
+            "placa",
+            "no",
+            "na",
+            "em",
+        }
+    )
+    best: Optional[float] = None
+    for n in range(1, min(len(words), 8) + 1):
+        word_norm = _normalize(words[n - 1])
+        if word_norm in stop_words and best is not None:
+            break
+        if word_norm == "e" and n >= 2 and _normalize(words[n - 2]) in {"mil", "dois", "tres", "três", "quatro", "cinco", "seis", "sete", "oito", "nove", "dez"}:
+            pass
+        elif word_norm in {"a", "o"} and n >= 2 and _normalize(words[n - 2]) in {"mil", "milhao", "milhão"}:
+            break
+        val = _parse_money_from_fragment(" ".join(words[:n]), prefer_leading=True)
+        if val is not None and val > 0:
+            best = val
+        elif best is not None:
+            break
+    return best
+
+
+def _extract_itemized_product_values(text: str) -> list[tuple[str, float]]:
     """
-    Captura casos como:
-    "o painel eu vendi por 3 mil e o banner eu vendi por 5 mil"
-    Retorna (produtos, total_somado) quando detectar itens claros.
+    Captura produtos com valor unitário, ex.:
+    "a fachada vendi por cinco mil e o banner vendi por dois mil".
     """
-    products: list[str] = []
-    values: list[float] = []
+    products: list[tuple[str, float]] = []
     product_word = (
         r"(?!pra|para|pro|por|vendi|vendemos|eles|elas|ele|ela|cliente|eu|aqui\b)"
         r"[A-Za-zÀ-ÖØ-öø-ÿ0-9/-]+"
     )
-    product_chunk = rf"(({product_word}(?:\s+(?!pra|para|pro|,|vendi|eu\b){product_word}){{0,2}}\s*)?)"
+    product_chunk = rf"(({product_word}(?:\s+(?!pra|para|pro|,|vendi|eu\b){product_word}){{0,2}}))"
     patterns = [
         re.compile(
-            rf"\b(?:o|a)\s+{product_chunk}\s+(?:eu\s+)?vendi\s+(?:no\s+valor\s+de|por)\s*({MONEY_TOKEN})",
+            rf"\b(?:o|a)\s+{product_chunk}\s+(?:eu\s+)?vendi\s+(?:no\s+valor\s+de|por)\b",
             flags=re.IGNORECASE,
         ),
         re.compile(
-            rf"\bvendi\s+(?:um|uma|o|a)\s+{product_chunk}\s+(?:por|no\s+valor\s+de)\s*({MONEY_TOKEN})",
+            rf"\bvendi\s+(?:um|uma|o|a)\s+{product_chunk}\s+(?:por|no\s+valor\s+de)\b",
             flags=re.IGNORECASE,
         ),
     ]
@@ -1750,7 +1862,7 @@ def _extract_itemized_products_and_total(text: str) -> tuple[list[str], Optional
             norm_words = [_normalize(w) for w in prod.split() if w]
             if any(w in BAD_PRODUCT_WORDS for w in norm_words):
                 continue
-            val = _parse_money_from_fragment(m.group(2) or "")
+            val = _parse_money_after_position(text, m.end())
             if val is None or val <= 0:
                 continue
             human_prod = _humanize_label(prod)
@@ -1758,16 +1870,217 @@ def _extract_itemized_products_and_total(text: str) -> tuple[list[str], Optional
             if pair in seen_pairs:
                 continue
             seen_pairs.add(pair)
-            products.append(human_prod)
-            values.append(float(val))
-    # Dedup preservando ordem
-    uniq_products: list[str] = []
-    for p in products:
-        if p not in uniq_products:
-            uniq_products.append(p)
+            products.append((human_prod, float(val)))
+    return products
+
+
+def _extract_itemized_products_and_total(text: str) -> tuple[list[str], Optional[float]]:
+    """
+    Captura casos como:
+    "o painel eu vendi por 3 mil e o banner eu vendi por 5 mil"
+    Retorna (produtos, total_somado) quando detectar itens claros.
+    """
+    pairs = _extract_itemized_product_values(text)
+    products = [p for p, _v in pairs]
+    values = [v for _p, v in pairs]
     if len(values) >= 2:
-        return uniq_products, round(sum(values), 2)
-    return uniq_products, None
+        return products, round(sum(values), 2)
+    return products, None
+
+
+def _payment_segment_for_product(text: str, product: str) -> str:
+    """Recorta o trecho de pagamento que menciona um produto específico."""
+    prod_rx = re.escape(_normalize(product))
+    norm = _normalize(text)
+    priority_patterns = (
+        rf"(?:pagou|pagaram|paguei|pagamos)\s+[^.\n]{{0,35}}\s+(?:no|na|em)\s+(?:(?:o|a)\s+)?{prod_rx}\b",
+        rf"(?:o|a)\s+{prod_rx}\b[^.\n]{{0,30}}?(?:ele|ela|eles|elas)?\s*(?:me\s+)?(?:pagou|pagaram|pago|paguei|pagamos)\s+[^.\n]{{0,35}}",
+    )
+    for pattern in priority_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(0).strip()
+
+    pay_start = len(norm)
+    for verb in ("me pagaram", "me pagou", "pagaram", "pagamos", "pagou", "paguei"):
+        idx = norm.find(verb)
+        if idx != -1 and idx < pay_start:
+            pay_start = idx
+    if pay_start >= len(norm):
+        return ""
+    payment_text = text[pay_start:]
+    fallback_patterns = (
+        rf"(?:o|a)\s+{prod_rx}\b[^.\n]{{0,45}}?(?:me\s+)?(?:pagou|pagaram|pago|paguei|pagamos)\s+[^.\n]{{0,35}}",
+        rf"\b{prod_rx}\b[^.\n]{{0,35}}?(?:me\s+)?(?:pagou|pagaram|pago|paguei|pagamos)\s+[^.\n]{{0,35}}",
+    )
+    for pattern in fallback_patterns:
+        match = re.search(pattern, payment_text, flags=re.IGNORECASE)
+        if match:
+            return match.group(0).strip()
+    return ""
+
+
+def _extract_item_payment_for_product(
+    text: str,
+    product: str,
+    total: float,
+    reference_date: date,
+) -> tuple[float, float, date, date]:
+    """Retorna entrada, saldo, data da entrada e data do saldo para um item."""
+    norm = _normalize(text)
+    segment = _payment_segment_for_product(text, product)
+    norm_seg = _normalize(segment) if segment else norm
+    prod = _normalize(product)
+
+    if segment and "a vista" in norm_seg:
+        return total, 0.0, reference_date, reference_date
+
+    if segment:
+        pay_match = re.search(
+            r"(?:me\s+)?(?:pagou|pagaram|pago|paguei|pagamos)\s+",
+            segment,
+            flags=re.IGNORECASE,
+        )
+        if pay_match:
+            entry = _parse_money_after_position(segment, pay_match.end())
+            if entry is not None and entry > 0:
+                entry = min(float(entry), float(total))
+                balance = round(max(float(total) - entry, 0.0), 2)
+                balance_date = reference_date
+                if any(
+                    tok in norm
+                    for tok in (
+                        "restante",
+                        "saldo",
+                        "vai pagar",
+                        "vao pagar",
+                        "vão pagar",
+                        "amanha",
+                        "amanhã",
+                    )
+                ):
+                    balance_date = reference_date + timedelta(days=1)
+                return entry, balance, reference_date, balance_date
+        if re.search(r"(?:me\s+)?(?:pagou|pagaram|pago|paguei|pagamos)", segment, flags=re.IGNORECASE):
+            return 0.0, float(total), reference_date, reference_date + timedelta(days=1)
+        return float(total), 0.0, reference_date, reference_date
+
+    if any(tok in norm for tok in ("restante", "saldo", "vai pagar", "vao pagar", "vão pagar")):
+        return 0.0, float(total), reference_date, reference_date + timedelta(days=1)
+
+    return float(total), 0.0, reference_date, reference_date
+
+
+def _build_sale_parse_result(
+    *,
+    customer: str,
+    product: str,
+    total_value: float,
+    entry_value: float,
+    balance_value: float,
+    sale_date: date,
+    entry_date: date,
+    balance_date: date,
+    service_due_date: date | None,
+    warnings: list[str] | None = None,
+) -> ParseResult:
+    payments: list[Payment] = []
+    if entry_value > 0.01:
+        payments.append(
+            Payment(
+                label="Entrada",
+                value=round(float(entry_value), 2),
+                due_date=entry_date,
+                status="pago",
+            )
+        )
+    if balance_value > 0.01:
+        payments.append(
+            Payment(
+                label="Saldo",
+                value=round(float(balance_value), 2),
+                due_date=balance_date,
+                status="pendente" if balance_date > sale_date else "pago",
+            )
+        )
+    command = FinancialCommand(
+        customer=customer,
+        description=product,
+        sale_date=sale_date,
+        total_value=round(float(total_value), 2),
+        payments=payments,
+        product_id=product,
+        service_due_date=service_due_date,
+        warnings=warnings or [],
+    )
+    missing: list[str] = []
+    if not customer:
+        missing.append("Cliente")
+    if not total_value:
+        missing.append("Valor total da venda")
+    return ParseResult(
+        command=command,
+        missing_fields=missing,
+        detected_values={
+            "cliente": command.customer or "-",
+            "produto": command.product_id or "-",
+            "valor_total": f"{command.total_value:.2f}" if command.total_value else "-",
+            "qtd_pagamentos": str(len(command.payments)),
+        },
+        intent="sale",
+    )
+
+
+def parse_multi_sales_message(
+    message: str,
+    reference_date: Optional[date] = None,
+) -> list[ParseResult] | None:
+    """
+    Várias vendas distintas para o mesmo cliente na mesma mensagem.
+    Ex.: fachada 5 mil + banner 2 mil, cada um com pagamento diferente.
+    """
+    if reference_date is None:
+        reference_date = date.today()
+    raw = normalize_spoken_ids_in_text(message or "")
+    if detect_intent(raw) != "sale":
+        return None
+
+    items = _extract_itemized_product_values(raw)
+    if len(items) < 2:
+        return None
+
+    customer = _extract_customer(raw) or ""
+    norm = _normalize(raw)
+    sale_date = _extract_sale_date(raw, reference_date)
+    service_due_date = _parse_pt_date(raw, reference_date, full_text=raw)
+    if any(tok in norm for tok in ("amanha", "amanhã", "entreg", "entrega")):
+        service_due_date = max(service_due_date or reference_date, reference_date + timedelta(days=1))
+
+    results: list[ParseResult] = []
+    for product, total in items:
+        entry, balance, entry_date, balance_date = _extract_item_payment_for_product(
+            raw, product, total, reference_date
+        )
+        if service_due_date and balance > 0.01:
+            balance_date = max(balance_date, service_due_date)
+        item_due = service_due_date or (balance_date if balance > 0.01 else entry_date)
+        results.append(
+            _build_sale_parse_result(
+                customer=customer,
+                product=product,
+                total_value=total,
+                entry_value=entry,
+                balance_value=balance,
+                sale_date=sale_date,
+                entry_date=entry_date,
+                balance_date=balance_date,
+                service_due_date=item_due,
+                warnings=[
+                    "Venda separada gerada automaticamente a partir de varios produtos na mesma mensagem."
+                ],
+            )
+        )
+    return results if len(results) >= 2 else None
 
 
 def _extract_material_cost(text: str) -> Optional[float]:
@@ -1847,6 +2160,7 @@ def _extract_payment_value(text: str, label: str, total: Optional[float], fallba
         prefixes = [
             r"entrada\s*(?:de|foi)?",
             r"deu\s+(?:uma\s+)?entrada\s*(?:de|foi)?",
+            r"deu\s+",
             r"me\s+deu",
             r"me\s+pagou",
             r"me\s+pagaram",
@@ -2650,7 +2964,7 @@ _PREVIEW_CORRECTION_FIELD_RE = re.compile(
     r"|data\s+(?:da\s+)?venda"
     r"|nome\s+do\s+cliente"
     r"|id\s+cliente"
-    r"|cliente(?:\s+id)?"
+    r"|cliente(?:\s+id)?\s*[:=]"
     r"|produto"
     r"|valor\s+total"
     r"|valor"
@@ -2704,6 +3018,20 @@ _NL_PREVIEW_CORRECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"(?is)\b(?:o\s+)?(?:saldo|restante|resto)\s+"
             r"(?:é|eh|de|foi|sera|será|=|:)\s*"
             r"(.+?)(?=\s*,\s*|\s+entrada\b|$)"
+        ),
+    ),
+    (
+        "valor",
+        re.compile(
+            r"(?is)\bfoi\s+"
+            r"(.+?)(?=\s+mas\b|\s+mas\s+|\s+e\s+|\s+entrada\b|\s+saldo\b|\s+restante\b|\s+cliente\b|$)"
+        ),
+    ),
+    (
+        "entrada",
+        re.compile(
+            r"(?is)\b(?:deu|pagou|pagaram|paguei)\s+"
+            r"(.+?)\s+de\s+entrada\b"
         ),
     ),
 )
@@ -2775,6 +3103,9 @@ def _preview_correction_rest(text: str, keyword: str) -> str:
 
 
 def _parse_correction_money(fragment: str, full_text: str) -> Optional[float]:
+    parsed = _parse_money_from_fragment(fragment.strip())
+    if parsed is not None and parsed > 0:
+        return parsed
     parsed = parse_money_value(fragment)
     if parsed is not None and parsed > 0:
         return parsed
@@ -2833,7 +3164,7 @@ def _upsert_payment(
 
 def _payment_mentioned_in_text(norm: str, label: str) -> bool:
     if label == "entrada":
-        return any(tok in norm for tok in ("entrada", "pagou", "paguei", "metade", "me deu", "recebi"))
+        return any(tok in norm for tok in ("entrada", "pagou", "pagaram", "paguei", "deu", "metade", "me deu", "recebi"))
     return any(tok in norm for tok in ("saldo", "restante", "resto", "receber", "vai me pagar", "vou receber"))
 
 
@@ -2888,6 +3219,88 @@ def _apply_preview_payment_corrections(
     return updated
 
 
+_BATCH_SALE_INDEX_WORDS = {
+    "um": 0,
+    "uma": 0,
+    "1": 0,
+    "primeira": 0,
+    "primeiro": 0,
+    "dois": 1,
+    "duas": 1,
+    "2": 1,
+    "segunda": 1,
+    "segundo": 1,
+    "tres": 2,
+    "três": 2,
+    "3": 2,
+    "terceira": 2,
+    "terceiro": 2,
+}
+
+
+def resolve_batch_sale_index(text: str, batch: list[ParseResult]) -> int | None:
+    """Identifica qual item do lote o usuário quer corrigir (venda 1, venda um, produto...)."""
+    norm = _normalize(text)
+    match = re.search(
+        r"\bvenda\s+(um|uma|dois|duas|tres|tr[eê]s|\d+|primeir[ao]|segund[ao]|terceir[ao])\b",
+        norm,
+    )
+    if match:
+        token = match.group(1)
+        if token.isdigit():
+            idx = int(token) - 1
+        else:
+            idx = _BATCH_SALE_INDEX_WORDS.get(token)
+        if idx is not None and 0 <= idx < len(batch):
+            return idx
+    for i, pr in enumerate(batch):
+        product = _normalize(pr.command.product_id or "")
+        if product and len(product) >= 3 and product in norm:
+            return i
+    return None
+
+
+def _strip_batch_sale_prefix(text: str) -> str:
+    return re.sub(
+        r"(?is)^(?:na\s+)?venda\s+(?:um|uma|dois|duas|tres|tr[eê]s|\d+|primeir[ao]|segund[ao]|terceir[ao])\s*[:\-,]?\s*",
+        "",
+        text.strip(),
+    ).strip()
+
+
+def apply_batch_preview_corrections(
+    text: str,
+    batch: list[ParseResult],
+    reference_date: Optional[date] = None,
+) -> tuple[bool, list[ParseResult]]:
+    """Aplica correção pontual em uma venda dentro de um lote pendente."""
+    if reference_date is None:
+        reference_date = date.today()
+    if not batch:
+        return False, batch
+    idx = resolve_batch_sale_index(text, batch)
+    if idx is None:
+        return False, batch
+    parse_result = batch[idx]
+    correction_text = _strip_batch_sale_prefix(text)
+    updated = apply_multi_field_corrections(
+        correction_text,
+        parse_result.command,
+        parse_result,
+        reference_date=reference_date,
+    )
+    if not updated:
+        updated = apply_preview_corrections(
+            correction_text,
+            parse_result.command,
+            reference_date=reference_date,
+        )
+    if not updated:
+        return False, batch
+    batch[idx] = parse_result
+    return True, batch
+
+
 def apply_multi_field_corrections(
     text: str,
     command: FinancialCommand,
@@ -2916,6 +3329,12 @@ def apply_multi_field_corrections(
             updated = True
 
     fields = _extract_preview_correction_fields(text)
+    if "cliente" in fields and not re.search(
+        r"(?i)\b(?:cliente\s*[:=]|nome\s+do\s+cliente|o\s+nome\s+do\s+cliente|cliente\s+(?:é|eh|e\s+é|sera|será|chama))"
+        ,
+        text,
+    ):
+        fields.pop("cliente", None)
     if not fields:
         lower = text.strip().lower()
         if lower.startswith("cliente"):
@@ -3025,7 +3444,7 @@ def apply_multi_field_corrections(
     if touched_payments and command.total_value and command.payments:
         payment_total = round(sum(float(p.value or 0) for p in command.payments), 2)
         total = round(float(command.total_value), 2)
-        if abs(payment_total - total) >= 0.01 and "valor" not in fields:
+        if abs(payment_total - total) >= 0.01:
             saldo = _find_payment(command, "saldo")
             entrada = _find_payment(command, "entrada")
             if saldo is not None and entrada is not None and "saldo" not in fields:

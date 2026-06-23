@@ -29,7 +29,7 @@ from src.bot_processor import (
     process_command,
     sale_id_from_parse_result,
 )
-from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer, apply_multi_field_corrections, apply_preview_corrections, extract_supplemental_sale_id, _extract_target_sale_id_for_updates, extract_sale_ids_list_for_updates, extract_delete_sale_ids_list, _is_sale_delete_request
+from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer, apply_multi_field_corrections, apply_preview_corrections, apply_batch_preview_corrections, extract_supplemental_sale_id, _extract_target_sale_id_for_updates, extract_sale_ids_list_for_updates, extract_delete_sale_ids_list, _is_sale_delete_request, parse_multi_sales_message, detect_intent
 from src.transcription import TranscriptionError, transcribe_audio
 
 # Carregar .env
@@ -1443,6 +1443,74 @@ def _try_handle_batch_delete(
     return True
 
 
+def _try_handle_multi_sales_same_customer(
+    chat_id: int | str,
+    text: str,
+    pending_preview: dict,
+) -> bool:
+    """Várias vendas (produtos distintos) para o mesmo cliente na mesma mensagem."""
+    if detect_intent(text) != "sale":
+        return False
+
+    batch = parse_multi_sales_message(text, reference_date=date.today())
+    if not batch or len(batch) < 2:
+        return False
+
+    if any(pr.missing_fields for pr in batch):
+        return False
+
+    from src.bot_processor import build_preview
+
+    customer = (batch[0].command.customer or "").strip()
+    intro = (
+        f"📋 *Entendi {len(batch)} vendas para o mesmo cliente"
+        + (f" ({customer})*" if customer else "*")
+        + " — confira cada uma:"
+    )
+    parts: list[str] = [intro, ""]
+    for idx, pr in enumerate(batch, start=1):
+        parts.append(f"*Venda {idx}:*\n{build_preview(pr)}")
+    parts.append("\nResponda *SIM* para registrar todas ou *NÃO* para cancelar.")
+    parts.append(
+        "\n💡 *Para corrigir uma venda:* "
+        "*Venda 1: Entrada: 3000* ou *na venda um deu 3000 de entrada*."
+    )
+    send_message(chat_id, "\n\n".join(parts[:12]), parse_mode="Markdown")
+    pending_preview[chat_id] = {
+        "batch_parse_results": batch,
+        "original_text": text,
+        "origin": "telegram",
+    }
+    return True
+
+
+def _resend_multi_sales_batch_preview(
+    chat_id: int | str,
+    batch: list,
+    pending: dict,
+    pending_preview: dict,
+) -> None:
+    from src.bot_processor import build_preview
+
+    customer = (batch[0].command.customer or "").strip() if batch else ""
+    intro = (
+        f"📋 *Prévia atualizada — {len(batch)} vendas"
+        + (f" para {customer}*" if customer else "*")
+        + ":"
+    )
+    parts: list[str] = [intro, ""]
+    for idx, pr in enumerate(batch, start=1):
+        parts.append(f"*Venda {idx}:*\n{build_preview(pr)}")
+    parts.append("\nResponda *SIM* para registrar todas ou *NÃO* para cancelar.")
+    parts.append(
+        "\n💡 *Para corrigir outra venda:* "
+        "*Venda 2: Entrada: 800* ou *na venda dois valor total 1500*."
+    )
+    send_message(chat_id, "\n\n".join(parts[:12]), parse_mode="Markdown")
+    pending["batch_parse_results"] = batch
+    pending_preview[chat_id] = pending
+
+
 def _process_scheduled_reminders(tracker) -> None:
     """Envia lembretes no dia da entrega: a partir das 6h, a cada 2h."""
     from src.excel_store import SpreadsheetService
@@ -1782,9 +1850,14 @@ def run_polling() -> None:
                         is_delete_batch = all(
                             getattr(pr, "intent", "") == "sale_delete" for pr in batch_results
                         )
+                        is_multi_sale_batch = (
+                            not is_delete_batch
+                            and len(batch_results) >= 2
+                            and all(getattr(pr, "intent", "") == "sale" for pr in batch_results)
+                        )
                         _notify_spreadsheet_saving(
                             chat_id,
-                            "sale_delete" if is_delete_batch else "",
+                            "sale_delete" if is_delete_batch else ("sale" if is_multi_sale_batch else ""),
                             batch=True,
                         )
                         applied = 0
@@ -1804,6 +1877,11 @@ def run_polling() -> None:
                         if is_delete_batch:
                             msg_out = (
                                 f"✅ Exclusão em lote concluída: {applied}/{len(batch_results)} registro(s).\n\n"
+                                + "\n".join(replies[:6])
+                            )
+                        elif is_multi_sale_batch:
+                            msg_out = (
+                                f"✅ {applied}/{len(batch_results)} vendas registradas na planilha!\n\n"
                                 + "\n".join(replies[:6])
                             )
                         else:
@@ -1921,6 +1999,31 @@ def run_polling() -> None:
                         lower = text.strip().lower()
                         pending = pending_preview.get(chat_id)
                         if pending:
+                            batch_results = pending.get("batch_parse_results")
+                            if batch_results:
+                                updated, batch_results = apply_batch_preview_corrections(
+                                    text,
+                                    batch_results,
+                                    reference_date=date.today(),
+                                )
+                                if updated:
+                                    _resend_multi_sales_batch_preview(
+                                        chat_id,
+                                        batch_results,
+                                        pending,
+                                        pending_preview,
+                                    )
+                                    continue
+                                send_message(
+                                    chat_id,
+                                    "Não entendi o ajuste no lote.\n\n"
+                                    "Diga por exemplo:\n"
+                                    "• *Venda 1: Entrada: 3000*\n"
+                                    "• *na venda um deu 3000 de entrada*\n"
+                                    "• *Venda 2: Valor total: 1500*",
+                                    parse_mode="Markdown",
+                                )
+                                continue
                             repl = parse_message(text, reference_date=date.today())
                             if (
                                 repl.intent == "sale_delete"
@@ -1935,7 +2038,7 @@ def run_polling() -> None:
                                 }
                                 send_message(chat_id, build_preview(repl), parse_mode="Markdown")
                                 continue
-                        if pending:
+                        if pending and pending.get("parse_result"):
                             parse_result = pending["parse_result"]
                             cmd = parse_result.command
                             updated = apply_multi_field_corrections(
@@ -2035,6 +2138,8 @@ def run_polling() -> None:
 
                 # Lote: vários ID VENDA — exclusão, entrega ou pagamento na mesma mensagem
                 if _try_handle_batch_delete(chat_id, text, pending_preview):
+                    continue
+                if _try_handle_multi_sales_same_customer(chat_id, text, pending_preview):
                     continue
                 if _try_handle_batch_sale_updates(chat_id, text, pending_preview):
                     continue
