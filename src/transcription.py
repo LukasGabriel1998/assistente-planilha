@@ -43,10 +43,12 @@ _FINANCIAL_INITIAL_PROMPT = (
 _COMMON_TRANSCRIPTION_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bbochat(?:e|ing)?\b", re.I), "chat"),
     (re.compile(r"\bpuxat(?:e|ing)?\b", re.I), "chat"),
+    (re.compile(r"\bpoxat(?:e|ing)?\b", re.I), "chat"),
     (re.compile(r"\bte\s+apag(?:a|ar)\b", re.I), "apaga"),
     (re.compile(r"\bpucha\b", re.I), "chat"),
     (re.compile(r"\bxat\b", re.I), "chat"),
     (re.compile(r"\bchate\b", re.I), "chat"),
+    (re.compile(r"\bchato\b", re.I), "chat"),
     (re.compile(r"\bchats\b", re.I), "chat"),
     (re.compile(r"\borcamento\b", re.I), "orçamento"),
     (re.compile(r"\bmateria\s+prima\b", re.I), "matéria-prima"),
@@ -283,6 +285,12 @@ def _prepare_audio_for_whisper(audio_path: Path) -> tuple[Path, Path | None]:
 def _cleanup_transcription_text(text: str) -> str:
     cleaned = re.sub(r"\s+", " ", text).strip()
     cleaned = re.sub(r"\s+([,.;!?])", r"\1", cleaned)
+    cleaned = re.sub(
+        r"\blegendas?\s+pel[ao]\s+comunidade\s+de\s+amara(?:\.org)?\b.*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
     return cleaned
 
 

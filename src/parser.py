@@ -106,6 +106,7 @@ BAD_PRODUCT_WORDS = {
     "ontem",
     "dia",
     "data",
+    "que",
 }
 
 WORD_UNITS = {
@@ -402,7 +403,7 @@ def _parse_colloquial_short_thousands(fragment: str) -> Optional[float]:
         r"\b("
         + "|".join(re.escape(w) for w in WORD_UNITS if w not in {"zero"})
         + r"|dez|onze|doze|treze|quatorze|catorze|quinze|dezesseis|dezessete|dezoito|dezenove|"
-        r"vinte|trinta|quarenta|cinquenta)\s+e\s+("
+        r"vinte|trinta|quarenta|cinquenta)\s+(?:e\s+)?("
         + "|".join(
             sorted(
                 (w for w in WORD_NUMBERS if w.startswith(("duzent", "trezent", "quatrocent", "quinhent", "seiscent", "setecent", "oitocent", "novecent", "cem", "cento"))),
@@ -528,7 +529,7 @@ def _word_window_after_prefix(text: str, prefix: str, max_words: int = 16) -> st
         return ""
     fragment = norm_text[match.end() :]
     fragment = re.split(
-        r"[,.;]|\b(?:para|pra|cliente|id venda|id cliente|produto|data|dia|restante|saldo|amanha|amanhã|e o restante|mas)\b",
+        r"[,.;]|\b(?:para|pra|cliente|id venda|id cliente|produto|data|dia|restante|saldo|amanha|amanhã|e o restante|e ela|e ele|mas|pagou|pagaram|entrada)\b",
         fragment,
         maxsplit=1,
     )[0]
@@ -583,13 +584,20 @@ def _parse_money_from_fragment(fragment: str, *, prefer_leading: bool = False) -
     norm = _normalize(fragment)
     if prefer_leading:
         words = norm.split()
-        for n in range(min(len(words), 7), 0, -1):
+        best_val: Optional[float] = None
+        best_n = 0
+        for n in range(1, min(len(words), 12) + 1):
             prefix = " ".join(words[:n])
             if re.search(r"\s(?:o|a)$", prefix) and n < len(words):
                 continue
+            if re.search(r"\se$", prefix) and n < len(words):
+                continue
             prefix_val = _parse_money_from_fragment(prefix, prefer_leading=False)
-            if prefix_val is not None and prefix_val > 0:
-                return prefix_val
+            if prefix_val is not None and prefix_val > 0 and n >= best_n:
+                best_val = prefix_val
+                best_n = n
+        if best_val is not None:
+            return best_val
 
     colloquial = _parse_colloquial_short_thousands(norm)
     if colloquial is not None:
@@ -860,23 +868,34 @@ def _currency_candidates(text: str) -> list[float]:
             values.append(combined)
 
     for match in re.finditer(
-        r"\b(" + "|".join(re.escape(word) for word in WORD_UNITS.keys()) + r")\s+mil\b(?!\s+(?:e\s+)?(?:cento|cem|duzent|trezent|quatrocent|quinhent|seiscent|setecent|oitocent|novecent))",
+        r"\b(" + "|".join(re.escape(word) for word in WORD_UNITS.keys()) + r")\s+mil(?:\s+e\s+\w+)?\b",
         norm,
         flags=re.IGNORECASE,
     ):
-        unit_word = _normalize(match.group(1))
-        base = WORD_UNITS.get(unit_word)
-        if base and base > 0:
-            values.append(float(base * 1000))
+        spoken = _parse_money_from_fragment(match.group(0))
+        if spoken is not None and spoken > 0:
+            values.append(spoken)
 
     for match in re.finditer(
-        r"(?:(?:valor\s+total|no\s+valor(?:\s+total)?|me\s+pagou|pagou|pagaram|recebi|entrada)\s+(?:de\s+)?)"
-        r"((?:\w+\s+){1,14}?)"
-        r"(?=\s+(?:mas|e\s+o|o\s+restante|restante|saldo|amanha|amanhã)|$)",
+        r"\b(dois|tres|tr[eê]s|quatro|cinco|seis|sete|oito|nove|dez)\s+(?:e\s+)?"
+        r"(duzent\w*|trezent\w*|quatrocent\w*|quinhent\w*|seiscent\w*|setecent\w*|oitocent\w*|novecent\w*|cento|cem)\b",
         norm,
         flags=re.IGNORECASE,
     ):
-        spoken = _parse_spoken_amount_pt(match.group(1))
+        colloquial = _parse_colloquial_short_thousands(match.group(0))
+        if colloquial is not None and colloquial > 0:
+            values.append(colloquial)
+
+    for match in re.finditer(
+        r"(?:(?:valor\s+(?:total|ficou|foi)|no\s+valor(?:\s+total)?|me\s+pagou|pagou|pagaram|recebi|entrada)\s+(?:de\s+)?)"
+        r"((?:\w+\s+){1,14}?)"
+        r"(?=\s+(?:mas|e\s+(?:o|ela|ele)|o\s+restante|restante|saldo|amanha|amanhã)|$)",
+        norm,
+        flags=re.IGNORECASE,
+    ):
+        spoken = _parse_spoken_amount_pt(match.group(1).strip())
+        if spoken is None or spoken <= 0:
+            spoken = _parse_money_from_fragment(match.group(1).strip(), prefer_leading=True)
         if spoken is not None and spoken > 0:
             values.append(spoken)
 
@@ -976,6 +995,22 @@ def _parse_pt_date(fragment: str, reference_date: date, *, full_text: str = "") 
         return reference_date + timedelta(days=1)
     if "ontem" in norm:
         return reference_date - timedelta(days=1)
+
+    ordinal_day = re.search(
+        r"\b(?:no\s+)?dia\s+(primeiro|primeira|segundo|segunda|terceiro|terceira)\b",
+        norm,
+    )
+    if ordinal_day:
+        day_map = {"primeiro": 1, "primeira": 1, "segundo": 2, "segunda": 2, "terceiro": 3, "terceira": 3}
+        day = day_map.get(ordinal_day.group(1))
+        if day:
+            inferred = _extract_month_from_text(context)
+            if inferred:
+                return _build_date(day, inferred, reference_date)
+            month = reference_date.month
+            if day < reference_date.day:
+                month = 1 if month == 12 else month + 1
+            return _build_date(day, month, reference_date)
 
     match = re.search(r"\b(?:no\s+)?dia\s+(\d{1,2})(?:\s+de\s+([a-z]+))?\b", norm)
     if match:
@@ -1132,6 +1167,7 @@ def _extract_customer(text: str) -> Optional[str]:
 
 def _extract_product(text: str) -> Optional[str]:
     patterns = [
+        rf"\bproduto\s+que\s+(?:ela|ele|eles)\s+comprou\s+foi\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s+(?:a\s+data|data|valor|no\s+valor|pagou|entrada|saldo|restante)\b|\s*$)",
         # "eles compraram uma fachada" / "comprou um banner"
         rf"\b(?:eles?\s+)?compr(?:ou|aram|amos)\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s*[,.]|\s+(?:eu\s+vendi|vendi\s+ele|adiciona|valor|no\s+valor|pagou|pagaram|vai|vao|vão)\b|\s*$)",
         # "fiz uma venda para P26 de uma fachada ..." -> produto = "fachada"
@@ -1706,7 +1742,7 @@ def _extract_amount_after_prefix(text: str, prefixes: list[str], max_gap_words: 
                     return value
         if re.search(prefix, norm_text, flags=re.IGNORECASE):
             word_fragment = _word_window_after_prefix(text, prefix)
-            word_value = _parse_money_from_fragment(word_fragment)
+            word_value = _parse_money_from_fragment(word_fragment, prefer_leading=True)
             if word_value is not None and word_value > 0:
                 return word_value
     return None
@@ -1754,12 +1790,14 @@ def _extract_total_value(text: str, numbers: list[float]) -> Optional[float]:
     value = _extract_amount_after_prefix(
         text,
         prefixes=[
-            r"valor\s+(?:de\s+)?(?:da\s+)?venda\s*(?:foi|de|por)?",
-            r"valor\s+(?:do\s+)?(?:orcamento|orcamento|total|venda)\s*(?:foi|de|por)?",
+            r"valor\s+total",
+            r"valor\s+(?:de\s+)?(?:da\s+)?venda\s*(?:foi|por)?",
+            r"valor\s+(?:do\s+)?(?:orcamento|orcamento|total|venda)\s*(?:foi|por)?",
             r"fechei(?:\s+\w+){0,6}\s+por",
             r"venda\s+de",
             r"valor\s+fech(?:ei|ou)\s+por",
             r"valor\s+foi\s*",
+            r"valor\s+ficou",
         ],
         max_gap_words=0,
     )
@@ -2337,6 +2375,8 @@ def _contains_explicit_date_hint(text: str) -> bool:
         return True
     if re.search(r"\b(?:no\s+)?dia\s+\d{1,2}\b", norm):
         return True
+    if re.search(r"\b(?:no\s+)?dia\s+(?:primeiro|primeira|segundo|segunda|terceiro|terceira)\b", norm):
+        return True
     if re.search(r"\b\d{1,2}\s+de\s+[a-z]+\b", norm):
         return True
     return False
@@ -2629,14 +2669,15 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
     if total_value and entry_value and entry_value > (total_value + 0.01):
         paid_context = ("entrada" in norm_text) or bool(re.search(r"\b(?:me\s+)?pag(?:ou|aram|amos)\b", norm_text))
         if paid_context and numbers:
-            candidate_total = max(n for n in numbers if n >= entry_value - 0.01)
-            if candidate_total >= entry_value - 0.01:
+            qualifying_totals = [n for n in numbers if n >= entry_value - 0.01]
+            if qualifying_totals:
+                candidate_total = max(qualifying_totals)
                 total_value = candidate_total
                 balance_value = round(max(total_value - entry_value, 0), 2)
                 warnings.append(
                     "Ajuste automático: total alinhado ao valor da venda (ex.: 10 mil) e saldo recalculado."
                 )
-            elif "entrada" in norm_text:
+            elif paid_context:
                 bigger = float(entry_value)
                 smaller = float(total_value)
                 total_value = bigger
