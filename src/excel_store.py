@@ -1441,6 +1441,117 @@ class SpreadsheetService:
         finally:
             wb.close()
 
+    @classmethod
+    def _cell_fill_matches(cls, cell, hex_color: str) -> bool:
+        if cell is None or not cell.fill or cell.fill.fill_type != "solid":
+            return False
+        target = hex_color.upper().lstrip("#")
+        for attr in ("start_color", "fgColor"):
+            color = getattr(cell.fill, attr, None)
+            if color is None:
+                continue
+            rgb = str(getattr(color, "rgb", "") or getattr(color, "value", "") or "").upper()
+            if target in rgb.replace("#", ""):
+                return True
+        return False
+
+    @classmethod
+    def _delivery_date_is_yellow(cls, ws, sales_cols: dict[str, str], row: int) -> bool:
+        """True quando a célula Data de Entrega está amarela (ainda não entregue)."""
+        delivery_col = sales_cols.get("data de entrega")
+        if not delivery_col:
+            return False
+        return cls._cell_fill_matches(ws[f"{delivery_col}{row}"], "FFF59D")
+
+    @classmethod
+    def _delivery_still_pending(
+        cls,
+        ws,
+        sales_cols: dict[str, str],
+        row: int,
+        *,
+        service_status: str = "",
+    ) -> bool:
+        """True se a entrega ainda não foi marcada (amarelo / não finalizado)."""
+        if cls._normalize_name(service_status) == "finalizado":
+            return False
+        delivery_col = sales_cols.get("data de entrega")
+        if delivery_col:
+            cell = ws[f"{delivery_col}{row}"]
+            if cls._cell_fill_matches(cell, "C8E6C9"):
+                return False
+            if cls._cell_fill_matches(cell, "FFF59D"):
+                return True
+        return not cls._is_service_delivered(ws, sales_cols, row)
+
+    def _reminder_meta_by_sale_id(self, wb) -> dict[str, dict[str, str]]:
+        """Mapa sale_id -> {chat_id, status_servico} na aba Lembretes."""
+        meta: dict[str, dict[str, str]] = {}
+        if SHEET_REMINDERS not in wb.sheetnames:
+            return meta
+        ws = wb[SHEET_REMINDERS]
+        headers = self._reminders_header_map(ws)
+        col_sale_id = headers.get(self._normalize_name("ID VENDA"), 1)
+        col_chat = headers.get(self._normalize_name("Chat ID"))
+        col_status = headers.get(self._normalize_name("Status servico"))
+        for row in range(2, ws.max_row + 1):
+            sale_id = str(ws.cell(row=row, column=col_sale_id).value or "").strip()
+            if not sale_id:
+                continue
+            meta[sale_id] = {
+                "chat_id": str(ws.cell(row=row, column=col_chat).value or "").strip() if col_chat else "",
+                "status_servico": str(ws.cell(row=row, column=col_status).value or "").strip() if col_status else "",
+            }
+        return meta
+
+    def list_overdue_deliveries(self, wb, reference_today: date, *, max_rows_scan: int = 500) -> list[dict]:
+        """
+        Vendas com Data de Entrega amarela (não entregue) e data anterior a reference_today.
+        reference_today deve ser sempre date.today() no momento da verificação.
+        """
+        today = reference_today
+        sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
+        ws_sales = wb[sales_name]
+        sales_cols = self._sales_columns(ws_sales)
+        col_sale_id = sales_cols["id venda"]
+        col_delivery = sales_cols.get("data de entrega")
+        col_customer = sales_cols.get("cliente")
+        col_product = sales_cols.get("id produto")
+        if not col_delivery:
+            return []
+
+        reminder_meta = self._reminder_meta_by_sale_id(wb)
+        rows: list[dict] = []
+        scan_until = min(ws_sales.max_row, self.MAX_DATA_ROW, DATA_START_ROW + max_rows_scan)
+        for row in range(DATA_START_ROW, scan_until + 1):
+            sale_id = str(ws_sales[f"{col_sale_id}{row}"].value or "").strip()
+            if not sale_id:
+                continue
+            delivery_dt = self._parse_date_cell(ws_sales[f"{col_delivery}{row}"].value)
+            # Só datas anteriores ao dia de hoje (ex.: hoje 23/06 → cobra 21/06, não 23/06).
+            if delivery_dt is None or delivery_dt >= today:
+                continue
+            if not self._delivery_date_is_yellow(ws_sales, sales_cols, row):
+                continue
+            rem = reminder_meta.get(sale_id, {})
+            customer = str(ws_sales[f"{col_customer}{row}"].value or "").strip() if col_customer else ""
+            product = str(ws_sales[f"{col_product}{row}"].value or "").strip() if col_product else ""
+            days_overdue = (today - delivery_dt).days
+            rows.append(
+                {
+                    "id venda": sale_id,
+                    "cliente": customer,
+                    "descricao": product,
+                    "data entrega": delivery_dt.strftime("%d/%m/%Y"),
+                    "delivery_date": delivery_dt,
+                    "days_overdue": days_overdue,
+                    "reference_today": today.strftime("%d/%m/%Y"),
+                    "chat id": rem.get("chat_id") or "",
+                }
+            )
+        rows.sort(key=lambda item: (item.get("delivery_date") or today, str(item.get("id venda") or "")))
+        return rows
+
     def list_due_reminders(self, wb, today) -> list[dict]:
         """
         Retorna lembretes do dia da entrega com consistência:

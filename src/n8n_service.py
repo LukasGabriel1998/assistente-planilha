@@ -14,6 +14,7 @@ from .bot_processor import (
     STATUS_KEYWORDS,
     PREVIEW_KEYWORDS,
     apply_parse_result,
+    build_missing_fields_message,
     build_preview,
     get_default_workbook,
     process_command,
@@ -218,7 +219,10 @@ def handle_message(
         return {
             "ok": False,
             "conversation_id": conv,
-            "reply": "Faltam dados: " + ", ".join(parse_result.missing_fields),
+            "reply": build_missing_fields_message(
+                parse_result.missing_fields,
+                parse_result.intent,
+            ),
             "needs_confirmation": False,
             "applied": False,
             "missing_fields": parse_result.missing_fields,

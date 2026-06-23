@@ -229,6 +229,65 @@ def _strip_leading_article(text: str) -> str:
     return re.sub(r"^(?:um|uma|o|a)\s+", "", text.strip(), flags=re.IGNORECASE)
 
 
+_PRODUCT_TRAILING_STOP_WORDS = frozenset(
+    {
+        "pra",
+        "para",
+        "pro",
+        "eles",
+        "elas",
+        "ele",
+        "ela",
+        "vendi",
+        "vendemos",
+        "vender",
+        "fechei",
+        "fechamos",
+        "cliente",
+        "por",
+        "valor",
+        "pagou",
+        "pagaram",
+        "restante",
+        "saldo",
+        "entrada",
+        "no",
+        "dia",
+        "data",
+        "mes",
+        "mês",
+        "eu",
+        "aqui",
+    }
+    | BAD_PRODUCT_WORDS
+)
+
+
+def _trim_product_name(candidate: str) -> str:
+    """Recorta ruído comum após o nome do produto em frases faladas."""
+    candidate = _clean_extracted_phrase(candidate)
+    candidate = _strip_leading_article(candidate)
+    if not candidate:
+        return ""
+    candidate = re.split(r"[,.;]", candidate, maxsplit=1)[0].strip()
+    candidate = re.split(
+        r"\s+(?:pra|para|pro)\s+(?:eles|elas|ele|ela|o|a|mim|nos|nós|gente|cliente)\b",
+        candidate,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+    words = candidate.split()
+    trimmed: list[str] = []
+    for word in words:
+        norm = _normalize(word.strip(".,;:"))
+        if norm in _PRODUCT_TRAILING_STOP_WORDS and trimmed:
+            break
+        if norm in {"vendi", "vendemos", "vender", "fechei", "fechamos"}:
+            break
+        trimmed.append(word)
+    return " ".join(trimmed).strip(" ,.-")
+
+
 def _humanize_label(text: str) -> str:
     def _title_fragment(fragment: str) -> str:
         if not fragment:
@@ -429,7 +488,7 @@ def _word_window_after_prefix(text: str, prefix: str, max_words: int = 16) -> st
         return ""
     fragment = norm_text[match.end() :]
     fragment = re.split(
-        r"[,.;]|\b(?:para|pra|cliente|id venda|id cliente|produto|data|dia)\b",
+        r"[,.;]|\b(?:para|pra|cliente|id venda|id cliente|produto|data|dia|restante|saldo|amanha|amanhã|e o restante|mas)\b",
         fragment,
         maxsplit=1,
     )[0]
@@ -465,11 +524,30 @@ def parse_money_value(fragment: str) -> Optional[float]:
     return _parse_money_from_fragment(fragment)
 
 
+def _parse_spoken_amount_pt(fragment: str) -> Optional[float]:
+    """Interpreta valor falado por extenso (ex.: dois mil setecentos e setenta e sete)."""
+    norm = _normalize(fragment)
+    if not re.search(
+        r"\b(mil|cento|cem|reais?|real|centavos?|centavo|" + NUMBER_WORD_PATTERN + r")\b",
+        norm,
+        flags=re.IGNORECASE,
+    ):
+        return None
+    word_value = _parse_number_words_pt(norm)
+    if word_value is None or word_value <= 0:
+        return None
+    return round(float(word_value), 2)
+
+
 def _parse_money_from_fragment(fragment: str) -> Optional[float]:
     norm = _normalize(fragment)
     phrase_value = _parse_money_phrase(norm)
     if phrase_value is not None:
         return phrase_value
+
+    spoken = _parse_spoken_amount_pt(norm)
+    if spoken is not None and _is_money_like(norm):
+        return spoken
 
     mil_match = re.search(r"(\d+(?:[.,]\d+)?)\s*mil\b", norm, flags=re.IGNORECASE)
     if mil_match:
@@ -478,7 +556,7 @@ def _parse_money_from_fragment(fragment: str) -> Optional[float]:
             return round(base * 1000.0, 2)
 
     word_thousand = re.search(
-        r"\b(" + "|".join(re.escape(word) for word in WORD_UNITS.keys()) + r")\s+mil\b",
+        r"\b(" + "|".join(re.escape(word) for word in WORD_UNITS.keys()) + r")\s+mil\b(?!\s+(?:e\s+)?(?:cento|cem|duzent|trezent|quatrocent|quinhent|seiscent|setecent|oitocent|novecent))",
         norm,
         flags=re.IGNORECASE,
     )
@@ -728,7 +806,7 @@ def _currency_candidates(text: str) -> list[float]:
             values.append(combined)
 
     for match in re.finditer(
-        r"\b(" + "|".join(re.escape(word) for word in WORD_UNITS.keys()) + r")\s+mil\b",
+        r"\b(" + "|".join(re.escape(word) for word in WORD_UNITS.keys()) + r")\s+mil\b(?!\s+(?:e\s+)?(?:cento|cem|duzent|trezent|quatrocent|quinhent|seiscent|setecent|oitocent|novecent))",
         norm,
         flags=re.IGNORECASE,
     ):
@@ -736,6 +814,17 @@ def _currency_candidates(text: str) -> list[float]:
         base = WORD_UNITS.get(unit_word)
         if base and base > 0:
             values.append(float(base * 1000))
+
+    for match in re.finditer(
+        r"(?:(?:valor\s+total|no\s+valor(?:\s+total)?|me\s+pagou|pagou|pagaram|recebi|entrada)\s+(?:de\s+)?)"
+        r"((?:\w+\s+){1,14}?)"
+        r"(?=\s+(?:mas|e\s+o|o\s+restante|restante|saldo|amanha|amanhã)|$)",
+        norm,
+        flags=re.IGNORECASE,
+    ):
+        spoken = _parse_spoken_amount_pt(match.group(1))
+        if spoken is not None and spoken > 0:
+            values.append(spoken)
 
     for match in re.finditer(r"(\d+(?:[.,]\d+)?)\s*mil\b", norm, flags=re.IGNORECASE):
         base = _to_float(match.group(1))
@@ -987,7 +1076,7 @@ def _extract_customer(text: str) -> Optional[str]:
 def _extract_product(text: str) -> Optional[str]:
     patterns = [
         # "eles compraram uma fachada" / "comprou um banner"
-        rf"\b(?:eles?\s+)?compr(?:ou|aram|amos)\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s*[,.]|\s+(?:adiciona|valor|no\s+valor|pagou|pagaram|vai|vao|vão)\b|\s*$)",
+        rf"\b(?:eles?\s+)?compr(?:ou|aram|amos)\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s*[,.]|\s+(?:eu\s+vendi|vendi\s+ele|adiciona|valor|no\s+valor|pagou|pagaram|vai|vao|vão)\b|\s*$)",
         # "fiz uma venda para P26 de uma fachada ..." -> produto = "fachada"
         rf"\b(?:acabei\s+de\s+fazer\s+)?fiz\s+(?:uma\s+)?venda\s+(?:para|pro|pra)\s+[^,.;\n]+?\s+de\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s+(?:por|no\s+valor|valor|pagou|vai\s+pagar|e\b|,|\.|;)|\s*$)",
         # "fiz uma venda de uma fachada para P26 ..." -> produto = "fachada"
@@ -1028,7 +1117,7 @@ def _extract_product(text: str) -> Optional[str]:
             flags=re.IGNORECASE,
         )
         candidate = re.split(
-            r"[,.;]|(?:\b(?:minha|minho|cliente|valor|um valor|pagou|entrada|saldo|restante|vou|vao|vão|quando|no dia|dia|data|mes|por|de|para|pra|e eu|eu vou|no|com esse valor)\b)",
+            r"[,.;]|(?:\b(?:minha|minho|cliente|valor|um valor|pagou|entrada|saldo|restante|vou|vao|vão|quando|no dia|dia|data|mes|por|de|para|pra|e eu|eu vou|no|com esse valor|eu vendi|vendi ele)\b)",
             candidate,
             maxsplit=1,
             flags=re.IGNORECASE,
@@ -1037,13 +1126,19 @@ def _extract_product(text: str) -> Optional[str]:
         candidate = re.sub(r"\s+e\s+(?:vao|vão|vai|pag\w+|restante|metade|quando).*$", "", candidate, flags=re.IGNORECASE)
         candidate = re.sub(r"\s+no\s+valor.*$", "", candidate, flags=re.IGNORECASE)
         candidate = re.sub(r"\s+e$", "", candidate, flags=re.IGNORECASE)
-        candidate = _clean_extracted_phrase(candidate)
+        candidate = _trim_product_name(candidate)
         if _normalize(candidate).startswith("com "):
             continue
         candidate = _strip_leading_article(candidate)
         words = [word for word in candidate.split() if word]
         if not words:
             continue
+        trimmed_words: list[str] = []
+        for word in words:
+            if _normalize(word) in {"eu", "ele", "ela", "vendi", "vendemos", "vender"} and trimmed_words:
+                break
+            trimmed_words.append(word)
+        words = trimmed_words or words
         normalized_words = [_normalize(word) for word in words]
         if any(word in BAD_PRODUCT_WORDS for word in normalized_words):
             continue
@@ -1144,6 +1239,40 @@ def extract_supplemental_sale_id(text: str) -> Optional[str]:
 def _format_sale_id_digits(digits: str) -> str:
     digits = str(digits or "").strip()
     return digits.zfill(3) if len(digits) <= 3 else digits
+
+
+def extract_sale_ids_list_for_updates(text: str) -> list[str]:
+    """
+    Extrai um ou mais ID VENDA em mensagens de atualização (pagamento, entrega, etc.).
+    Ex.: "cliente id 004, 005 e 008 foi entregue" ou "ID VENDA 004, 005 pagou".
+    """
+    raw = normalize_spoken_ids_in_text(text or "")
+    lower = raw.lower()
+    collected: list[str] = []
+
+    cluster_patterns = (
+        r"\bid\s*(?:de\s*)?venda\s*[:\-]?\s*([0-9,\seE]+?)(?=\s+(?:foi\s+)?(?:entreg|pagou|pago|finaliz|recebeu|quit)|\s*(?:foi\s+)?(?:entreg|pagou|pago|finaliz|recebeu|quit)|[,.]|$)",
+        r"\bcliente\s*(?:id)?\s*[:\-]?\s*([0-9,\seE]+?)(?=\s+(?:foi\s+)?(?:entreg|pagou|pago|finaliz|recebeu|quit)|\s*(?:foi\s+)?(?:entreg|pagou|pago|finaliz|recebeu|quit)|[,.]|$)",
+        r"(?:atualiz\w*|marca\w*|confirma\w*)\s+(?:a[ií]\s+)?(?:que\s+)?(?:foi\s+)?(?:entreg\w*|pag\w*|quit\w*)\s+(?:cliente\s*)?(?:id\s*)?([0-9,\seE]+)",
+    )
+    for pattern in cluster_patterns:
+        match = re.search(pattern, lower, flags=re.IGNORECASE)
+        if match:
+            collected.extend(re.findall(r"\d{1,6}", match.group(1)))
+            if collected:
+                break
+
+    if not collected:
+        collected = re.findall(r"\bid\s*[:\-]?\s*(\d{1,6})\b", lower)
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw_id in collected:
+        sale_id = _format_sale_id_digits(raw_id)
+        if sale_id not in seen:
+            seen.add(sale_id)
+            ordered.append(sale_id)
+    return ordered
 
 
 def _extract_delete_sale_id(text: str) -> Optional[str]:
@@ -1550,7 +1679,11 @@ def _extract_itemized_products_and_total(text: str) -> tuple[list[str], Optional
     """
     products: list[str] = []
     values: list[float] = []
-    product_chunk = r"((?:[A-Za-zÀ-ÖØ-öø-ÿ0-9/-]+\s*){1,4}?)"
+    product_word = (
+        r"(?!pra|para|pro|por|vendi|vendemos|eles|elas|ele|ela|cliente|eu|aqui\b)"
+        r"[A-Za-zÀ-ÖØ-öø-ÿ0-9/-]+"
+    )
+    product_chunk = rf"(({product_word}(?:\s+(?!pra|para|pro|,|vendi|eu\b){product_word}){{0,2}}\s*)?)"
     patterns = [
         re.compile(
             rf"\b(?:o|a)\s+{product_chunk}\s+(?:eu\s+)?vendi\s+(?:no\s+valor\s+de|por)\s*({MONEY_TOKEN})",
@@ -1564,9 +1697,7 @@ def _extract_itemized_products_and_total(text: str) -> tuple[list[str], Optional
     seen_pairs: set[tuple[str, float]] = set()
     for pattern in patterns:
         for m in pattern.finditer(text):
-            prod = _clean_extracted_phrase(m.group(1) or "")
-            prod = _strip_leading_article(prod)
-            prod = re.sub(r"\b(eu|aqui|pra|para)\b\s*$", "", prod, flags=re.IGNORECASE).strip(" ,.-")
+            prod = _trim_product_name(m.group(1) or "")
             if not prod:
                 continue
             norm_words = [_normalize(w) for w in prod.split() if w]
@@ -1994,9 +2125,10 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
     itemized_products, itemized_total = _extract_itemized_products_and_total(raw_text)
     if itemized_total is not None:
         total_value = itemized_total
-    if itemized_products:
-        joined_products = " + ".join(itemized_products)
-        product_id = joined_products
+    if len(itemized_products) >= 2:
+        product_id = " + ".join(itemized_products)
+    elif itemized_products and not product_id:
+        product_id = itemized_products[0]
     # Se a mensagem for claramente "gasto de material" (ex.: "gastei 1000 de material"),
     # nao tratamos como venda/total no caixa: suprimimos total_value e montamos apenas
     # a atualizacao de Compras Matéria-Prima.

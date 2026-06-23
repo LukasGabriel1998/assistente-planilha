@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Bot do Telegram que atualiza a mesma planilha do aplicativo.
-Use @BotFather no Telegram para criar o bot e obter o token.
-Configure TELEGRAM_BOT_TOKEN no .env e rode: python telegram_bot.py
+Bot do Telegram — arquivo para iniciar o robo (Run ▶).
+
+1. Rode run_project.py antes (prepara ambiente).
+2. Configure TELEGRAM_BOT_TOKEN no .env.
+3. Clique em Run neste arquivo.
 """
 from __future__ import annotations
 
@@ -14,19 +16,20 @@ import re
 import sys
 import tempfile
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import requests
 
 from src.bot_processor import (
     apply_parse_result,
+    build_missing_fields_message,
     build_preview,
     get_default_workbook,
     process_command,
     sale_id_from_parse_result,
 )
-from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer, apply_multi_field_corrections, apply_preview_corrections, extract_supplemental_sale_id
+from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer, apply_multi_field_corrections, apply_preview_corrections, extract_supplemental_sale_id, _extract_target_sale_id_for_updates, extract_sale_ids_list_for_updates
 from src.transcription import TranscriptionError, transcribe_audio
 
 # Carregar .env
@@ -55,17 +58,18 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 
+def _lock_path() -> Path:
+    return Path(__file__).resolve().parent / ".telegram_bot.lock"
+
+
 def _acquire_single_instance_lock() -> None:
-    """Evita rodar duas instâncias do bot ao mesmo tempo (causa prévias/erros duplicados)."""
-    lock_path = Path(__file__).resolve().parent / ".telegram_bot.lock"
-    try:
-        # Criação exclusiva: falha se já existir
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, str(os.getpid()).encode("utf-8"))
-        os.close(fd)
-    except FileExistsError:
-        print("[Telegram] Ja existe uma instancia do bot em execucao. Feche a outra janela e tente novamente.")
-        raise SystemExit(2)
+    """Evita rodar duas instancias do bot ao mesmo tempo (causa previas/erros duplicados)."""
+    from src.bootstrap import stop_old_bot_instances
+
+    stop_old_bot_instances(prefix="Telegram")
+
+    lock_path = _lock_path()
+    lock_path.write_text(str(os.getpid()), encoding="utf-8")
 
     def _cleanup() -> None:
         try:
@@ -132,6 +136,17 @@ _"Gastei 350 de tinta na ID VENDA 012."_
 
 💬 *Mudança na entrega:*
 _"A entrega da ID VENDA 012 ficou para sexta."_
+
+💬 *Vários de uma vez (entrega ou pagamento):*
+_"Foi entregue cliente id 004, 005 e 008"_
+_"ID VENDA 004, 005, 010 pagou"_
+_(mostra prévia do lote → confirme com *SIM*)_
+
+🔹🔹🔹
+
+🚚 *Entrega em atraso (amarelo na planilha)*
+O bot usa sempre a *data de hoje*. Se a entrega era dia 21 e hoje é 23, e ainda está *amarela*, ele cobra:
+✅ *SIM* → verde na planilha | ❌ *NÃO* → continua amarelo
 
 🔹🔹🔹
 
@@ -461,7 +476,7 @@ def _maybe_build_sales_snippet_image(
         own_wb = wb is None
         if own_wb:
             svc = SpreadsheetService(workbook_path)
-            wb = svc._open_workbook(data_only=True)
+            wb = svc._open_workbook(data_only=False)
         try:
             ws = wb[svc._resolve_sheet_name(wb, SHEET_SALES)]
             cols = svc._sales_columns(ws)
@@ -537,10 +552,24 @@ def _maybe_build_sales_snippet_image(
                 return str(v)
 
             rows_txt = [[_cell_txt(c, key, r) for c, _label, key in col_pairs] for r in last_rows]
+            delivery_cell_states: list[bool | None] = []
+            for r in last_rows:
+                delivery_col = cols.get("data de entrega")
+                state: bool | None = None
+                if delivery_col:
+                    cell = ws[f"{delivery_col}{r}"]
+                    if svc._cell_fill_matches(cell, "FFF59D"):
+                        state = True
+                    elif svc._cell_fill_matches(cell, "C8E6C9"):
+                        state = False
+                delivery_cell_states.append(state)
         finally:
             if own_wb:
                 wb.close()
     except Exception:
+        return None
+
+    if not rows_txt:
         return None
 
     # Renderização visual premium
@@ -566,6 +595,7 @@ def _maybe_build_sales_snippet_image(
     highlight_bg = (255, 246, 214)
     status_pago_bg = (220, 252, 231)
     status_pend_bg = (254, 249, 195)
+    delivery_done_bg = (200, 230, 201)
 
     # Medição de texto
     measure_draw = ImageDraw.Draw(Image.new("RGB", (20, 20)))
@@ -670,16 +700,24 @@ def _maybe_build_sales_snippet_image(
         draw.text((x + cell_pad_x, y0 + cell_pad_y), _truncate(h, w - 2 * cell_pad_x, font_header), fill=header_ink, font=font_header)
         x += w
 
-    # Rows (fundo amarelo só com pendência; pago + R$ 0 pendente = zebra branco como as demais)
+    # Rows: Status = pagamento; Data entrega = entrega (amarelo até confirmar entrega).
     for ri, rvals in enumerate(rows_txt, start=1):
         y = y0 + (row_h * ri)
         x = x0
         pending_row = _row_has_pending(rvals)
+        delivery_state = delivery_cell_states[ri - 1] if ri - 1 < len(delivery_cell_states) else None
         for ci, txt in enumerate(rvals):
             w = col_widths[ci]
             is_money_col = headers[ci] in ("Pago", "Pendente")
             base_fill = highlight_bg if pending_row else (zebra if (ri % 2 == 0) else (255, 255, 255))
-            if headers[ci] == "Status":
+            if headers[ci] == "Data entrega":
+                if delivery_state is True:
+                    cell_fill = status_pend_bg
+                elif delivery_state is False:
+                    cell_fill = delivery_done_bg
+                else:
+                    cell_fill = base_fill
+            elif headers[ci] == "Status":
                 sl = (txt or "").strip().lower()
                 if sl == "pago" or (sl.startswith("pago") and "pendente" not in sl):
                     cell_fill = status_pago_bg
@@ -790,19 +828,127 @@ def send_message(
         return False
 
 
-def download_telegram_voice(file_id: str) -> str:
+def _audio_download_read_timeout(*, file_size: int = 0, duration_sec: int = 0) -> int:
+    """Timeout de leitura do download — escala com tamanho e duração do áudio."""
+    try:
+        env_max = int(os.getenv("TELEGRAM_AUDIO_DOWNLOAD_TIMEOUT", "600") or 600)
+    except ValueError:
+        env_max = 600
+    env_max = max(120, min(env_max, 900))
+    by_size = 60 + (max(file_size, 0) // 2048)
+    by_duration = max(duration_sec, 0) * 4
+    return min(env_max, max(180, by_size, by_duration))
+
+
+def _audio_processing_wait_message(duration_sec: int) -> str:
+    if duration_sec >= 120:
+        wait_hint = "cerca de 2 a 4 minutos"
+    elif duration_sec >= 60:
+        wait_hint = "cerca de 1 a 2 minutos"
+    elif duration_sec >= 30:
+        wait_hint = "30 segundos a 1 minuto"
+    else:
+        wait_hint = "alguns segundos"
+    duration_line = f" ({duration_sec}s)" if duration_sec > 0 else ""
+    return (
+        f"⏳ *Processando áudio...*{duration_line}\n"
+        f"Pode levar {wait_hint}. Aguarde — não envie outra mensagem ainda."
+    )
+
+
+def _spreadsheet_saving_wait_message(intent: str = "", *, batch: bool = False) -> str:
+    if batch:
+        return (
+            "⏳ *Salvando na planilha...*\n"
+            "Atualizando vários registros. Aguarde um instante."
+        )
+    intent = (intent or "").strip().lower()
+    action_labels = {
+        "sale": "a venda",
+        "material_update": "o material",
+        "status_update": "o status da venda",
+        "payment_update": "o pagamento",
+        "delivery_update": "a data de entrega",
+        "delivery_finalize": "a entrega",
+        "sale_delete": "a exclusão",
+        "refund": "o estorno",
+        "mixed_update": "a atualização",
+    }
+    action = action_labels.get(intent, "o lançamento")
+    return (
+        "⏳ *Salvando na planilha...*\n"
+        f"Registrando {action}. Aguarde um instante."
+    )
+
+
+def _notify_spreadsheet_saving(chat_id: int | str, intent: str = "", *, batch: bool = False) -> None:
+    send_message(
+        chat_id,
+        _spreadsheet_saving_wait_message(intent, batch=batch),
+        parse_mode="Markdown",
+    )
+    send_chat_action(chat_id, "typing")
+
+
+def _requests_get_with_retry(
+    url: str,
+    *,
+    params: dict | None = None,
+    timeout: float | tuple[float, float] = (15, 120),
+    max_attempts: int = 3,
+    label: str = "requisicao",
+) -> requests.Response:
+    """GET com retentativas em falhas de rede/timeout (comum em áudios longos)."""
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.get(url, params=params, timeout=timeout)
+            response.raise_for_status()
+            return response
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+            if attempt >= max_attempts:
+                break
+            wait_s = min(2 ** attempt, 8)
+            print(f"[Telegram] {label} falhou (tentativa {attempt}/{max_attempts}): {exc}. Retentando em {wait_s}s...")
+            time.sleep(wait_s)
+    raise RuntimeError(
+        f"Falha ao conectar com o Telegram apos {max_attempts} tentativas ({label}). "
+        "Verifique sua internet e tente enviar o audio novamente."
+    ) from last_exc
+
+
+def download_telegram_voice(
+    file_id: str,
+    *,
+    duration_sec: int = 0,
+    hinted_file_size: int = 0,
+) -> str:
     """Baixa o áudio de uma mensagem de voz do Telegram; retorna caminho do arquivo temporário (.ogg)."""
-    r = requests.get(f"{BASE_URL}/getFile", params={"file_id": file_id}, timeout=10)
-    r.raise_for_status()
+    r = _requests_get_with_retry(
+        f"{BASE_URL}/getFile",
+        params={"file_id": file_id},
+        timeout=(15, 60),
+        label="getFile",
+    )
     data = r.json()
     if not data.get("ok"):
         raise RuntimeError("getFile falhou")
-    file_path = data.get("result", {}).get("file_path")
+    result = data.get("result", {}) or {}
+    file_path = result.get("file_path")
     if not file_path:
         raise RuntimeError("file_path nao retornado")
+    file_size = int(result.get("file_size") or hinted_file_size or 0)
+    download_read_timeout = _audio_download_read_timeout(
+        file_size=file_size,
+        duration_sec=duration_sec,
+    )
     url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-    audio_r = requests.get(url, timeout=60)
-    audio_r.raise_for_status()
+    audio_r = _requests_get_with_retry(
+        url,
+        timeout=(20, download_read_timeout),
+        label="download do audio",
+    )
     suffix = ".ogg" if "ogg" in (file_path or "").lower() else ".oga"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.write(audio_r.content)
@@ -880,6 +1026,201 @@ def _build_scheduled_reminder_message(item: dict) -> tuple[str, list[str]]:
     return "\n".join(lines), kinds
 
 
+def _build_overdue_delivery_message(item: dict) -> str:
+    sale_id = item.get("id venda") or ""
+    cliente = item.get("cliente", "") or "-"
+    desc = item.get("descricao", "") or "-"
+    delivery_txt = item.get("data entrega") or "-"
+    today_txt = item.get("reference_today") or date.today().strftime("%d/%m/%Y")
+    days = int(item.get("days_overdue") or 0)
+    if days <= 1:
+        days_txt = "1 dia"
+    else:
+        days_txt = f"{days} dias"
+    return (
+        "🚚 *Confirme a entrega — planilha pendente*\n\n"
+        f"📆 *Hoje:* {today_txt}\n"
+        f"A *Data de Entrega* de *{cliente}* (ID VENDA *{sale_id}*) era *{delivery_txt}* "
+        f"— já passou há {days_txt} — e ainda está *amarela* (não entregue).\n\n"
+        f"📦 Produto: *{desc}*\n\n"
+        "⚠️ *O que aconteceu? Preciso que você confirme:*\n"
+        "✅ *Já entregou?* → responda *SIM* (marco *verde* na planilha)\n"
+        f"   ou envie: `ID VENDA {sale_id} foi entregue`\n"
+        "❌ *Ainda não entregou?* → responda *NÃO*\n\n"
+        "_Enquanto estiver amarelo e a data tiver passado, continuo cobrando._"
+    )
+
+
+def _register_overdue_pending(
+    pending_overdue_delivery: dict,
+    chat_id: int | str,
+    sale_id: str,
+    customer: str,
+) -> None:
+    bucket = pending_overdue_delivery.setdefault(chat_id, {})
+    bucket[str(sale_id).strip()] = {"customer": customer or ""}
+
+
+def _resolve_overdue_sale_id(text: str, bucket: dict[str, dict]) -> str | None:
+    if not bucket:
+        return None
+    hinted = _extract_target_sale_id_for_updates(text or "")
+    if hinted:
+        hint = str(hinted).strip()
+        for key in bucket:
+            if key == hint or key.lstrip("0") == hint.lstrip("0"):
+                return key
+    if len(bucket) == 1:
+        return next(iter(bucket))
+    digits = re.findall(r"\b\d{2,4}\b", text or "")
+    for raw in digits:
+        for candidate in (raw, raw.zfill(3)):
+            if candidate in bucket:
+                return candidate
+    return None
+
+
+def _try_handle_overdue_delivery_reply(
+    chat_id: int | str,
+    text: str,
+    pending_overdue_delivery: dict,
+    pending_preview: dict | None = None,
+) -> bool:
+    bucket = pending_overdue_delivery.get(chat_id)
+    if not bucket or not (text or "").strip():
+        return False
+    lower = text.strip().lower()
+    preview_confirm = ("sim", "confirmar", "ok", "confirmo", "pode salvar", "salvar")
+    if pending_preview is not None and chat_id in pending_preview and lower in preview_confirm:
+        return False
+
+    negative = any(
+        tok in lower
+        for tok in ("nao", "não", "ainda nao", "ainda não", "ainda nao entreg", "ainda não entreg")
+    )
+    positive = any(
+        tok in lower
+        for tok in (
+            "sim",
+            "ok",
+            "confirmo",
+            "pode atualizar",
+            "pode marcar",
+            "foi entregue",
+            "foi entreg",
+            "ja entregue",
+            "já entregue",
+            "entregue",
+            "entregou",
+            "finalizado",
+            "finalizada",
+        )
+    )
+    if not negative and not positive:
+        return False
+
+    if positive:
+        multi_ids = extract_sale_ids_list_for_updates(text)
+        targets = [sid for sid in multi_ids if sid in bucket]
+        if len(targets) > 1:
+            wb_path = _workbook_path_for_bot()
+            if not wb_path:
+                send_message(chat_id, "Planilha não encontrada.")
+                return True
+            try:
+                from src.excel_store import SpreadsheetService
+
+                svc = SpreadsheetService(wb_path)
+                _notify_spreadsheet_saving(chat_id, "delivery_finalize", batch=True)
+                ok_ids: list[str] = []
+                fail_ids: list[str] = []
+                for sid in targets:
+                    if svc.finalize_service(sid):
+                        ok_ids.append(sid)
+                        bucket.pop(sid, None)
+                    else:
+                        fail_ids.append(sid)
+                if not bucket:
+                    pending_overdue_delivery.pop(chat_id, None)
+                lines = []
+                if ok_ids:
+                    lines.append(
+                        f"✅ *Entregas confirmadas:* {', '.join(f'*{s}*' for s in ok_ids)} — verde na planilha."
+                    )
+                if fail_ids:
+                    lines.append(f"⚠️ Não achei na planilha: {', '.join(fail_ids)}")
+                send_message(
+                    chat_id,
+                    "\n".join(lines) or "Nenhuma entrega atualizada.",
+                    parse_mode="Markdown",
+                    reply_markup=MAIN_MENU_KEYBOARD,
+                )
+            except Exception as exc:
+                send_message(chat_id, f"Erro ao atualizar: {exc}", reply_markup=MAIN_MENU_KEYBOARD)
+            return True
+
+    sale_id = _resolve_overdue_sale_id(text, bucket)
+    if not sale_id:
+        lines = [
+            "Você tem *várias entregas* amarelas aguardando confirmação:",
+            "",
+        ]
+        for sid, info in sorted(bucket.items()):
+            nome = info.get("customer") or "-"
+            lines.append(f"• ID VENDA *{sid}* — {nome}")
+        lines.extend(
+            [
+                "",
+                "Responda, por exemplo:",
+                "`SIM ID VENDA 002` — já entregue",
+                "`NÃO ID VENDA 003` — ainda não entregue",
+            ]
+        )
+        send_message(chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+        return True
+
+    if negative and not positive:
+        send_message(
+            chat_id,
+            f"Ok, ID VENDA *{sale_id}* continua *amarelo* (não entregue).\n"
+            f"Quando entregar, responda *SIM* ou `ID VENDA {sale_id} foi entregue`.",
+            parse_mode="Markdown",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+        return True
+
+    wb_path = _workbook_path_for_bot()
+    if not wb_path:
+        send_message(chat_id, "Planilha não encontrada.")
+        return True
+    try:
+        from src.excel_store import SpreadsheetService
+
+        svc = SpreadsheetService(wb_path)
+        _notify_spreadsheet_saving(chat_id, "delivery_finalize")
+        ok = svc.finalize_service(sale_id)
+        bucket.pop(sale_id, None)
+        if not bucket:
+            pending_overdue_delivery.pop(chat_id, None)
+        if ok:
+            send_message(
+                chat_id,
+                f"✅ *Entrega confirmada!*\n\nID VENDA *{sale_id}* marcado como entregue — *verde* na planilha.",
+                parse_mode="Markdown",
+                reply_markup=MAIN_MENU_KEYBOARD,
+            )
+        else:
+            send_message(
+                chat_id,
+                f"Não achei ID VENDA *{sale_id}* na planilha.",
+                parse_mode="Markdown",
+                reply_markup=MAIN_MENU_KEYBOARD,
+            )
+    except Exception as exc:
+        send_message(chat_id, f"Erro ao atualizar: {exc}", reply_markup=MAIN_MENU_KEYBOARD)
+    return True
+
+
 def _workbook_path_for_bot() -> str:
     wb_path = os.getenv("WORKBOOK_PATH", "").strip()
     if not wb_path:
@@ -900,7 +1241,7 @@ def _build_dashboard_reply(cmd_strip: str) -> tuple[str, str | None]:
         return process_command(cmd_strip, origin="telegram"), None
 
     svc = SpreadsheetService(workbook_path)
-    wb = svc._open_workbook(data_only=True)
+    wb = svc._open_workbook(data_only=False)
     img_path: str | None = None
     try:
         if cmd_strip.startswith(("prévia", "previa")):
@@ -925,6 +1266,139 @@ def _build_dashboard_reply(cmd_strip: str) -> tuple[str, str | None]:
         if img_path:
             return "", img_path
     return reply, img_path
+
+
+def _send_batch_update_preview(
+    chat_id: int | str,
+    batch_results: list,
+    *,
+    original_text: str,
+    pending_preview: dict,
+    not_found: list[str] | None = None,
+) -> None:
+    from src.bot_processor import build_preview
+
+    missing = not_found or []
+    if len(batch_results) == 1:
+        parse_result = batch_results[0]
+        preview_text = build_preview(parse_result)
+        if missing:
+            preview_text += f"\n\nIDs não encontrados: {', '.join(missing)}"
+        send_message(chat_id, preview_text, parse_mode="Markdown")
+        pending_preview[chat_id] = {
+            "parse_result": parse_result,
+            "original_text": original_text,
+            "origin": "telegram",
+        }
+        return
+
+    parts: list[str] = []
+    for idx, pr in enumerate(batch_results, start=1):
+        parts.append(f"*Item {idx}:*\n{build_preview(pr)}")
+    if missing:
+        parts.append(f"IDs não encontrados: {', '.join(missing)}")
+    parts.append("\nResponda *SIM* para confirmar o lote ou *NÃO* para cancelar.")
+    send_message(chat_id, "\n\n".join(parts[:8]), parse_mode="Markdown")
+    pending_preview[chat_id] = {
+        "batch_parse_results": batch_results,
+        "original_text": original_text,
+        "origin": "telegram",
+    }
+
+
+def _try_handle_batch_sale_updates(
+    chat_id: int | str,
+    text: str,
+    pending_preview: dict,
+) -> bool:
+    """Vários ID VENDA na mesma mensagem — entrega ou pagamento total."""
+    lower = text.strip().lower()
+    sale_tokens = (
+        "vendi",
+        "fechei",
+        "fechamos",
+        "acabei de fazer uma venda",
+        "fiz uma venda",
+        "fiz um",
+        "comprou",
+    )
+    if any(tok in lower for tok in sale_tokens):
+        return False
+
+    ids = extract_sale_ids_list_for_updates(text)
+    if len(ids) < 2:
+        return False
+
+    nums = [int(n) for n in re.findall(r"\b\d{1,6}\b", lower)]
+    has_amount = any(n >= 100 for n in nums)
+
+    is_payment = ("pagou" in lower or "pago" in lower or "quitou" in lower) and not has_amount
+    is_delivery = (
+        _is_service_delivery_finalized(text)
+        or bool(re.search(r"\b(?:foi\s+)?entreg", lower))
+        or "finaliz" in lower
+        or bool(re.search(r"\batualiz\w+.*entreg", lower))
+    ) and not is_payment
+
+    if not is_payment and not is_delivery:
+        return False
+
+    workbook_path = _workbook_path_for_bot()
+    if not workbook_path or not Path(workbook_path).exists():
+        return False
+
+    batch_results: list = []
+    not_found: list[str] = []
+    today = date.today()
+
+    if is_delivery:
+        for sale_id in ids:
+            pr = parse_message(f"ID VENDA {sale_id} foi entregue hoje", reference_date=today)
+            if pr.missing_fields:
+                not_found.append(sale_id)
+            else:
+                batch_results.append(pr)
+        kind = "entrega"
+    else:
+        from src.excel_store import SpreadsheetService
+
+        svc = SpreadsheetService(workbook_path)
+        for cliente_id in ids:
+            target_sale_id = None
+            sale_rows = svc.get_pending_sale_by_sale_id(
+                cliente_id, max_rows_scan=500, include_paid=True
+            )
+            if sale_rows:
+                target_sale_id = sale_rows[0].get("sale_id")
+            else:
+                pend_rows = svc.get_pending_sales_by_customer(
+                    cliente_id, max_rows_scan=500, include_paid=True
+                )
+                if pend_rows:
+                    target_sale_id = pend_rows[0].get("sale_id")
+            if target_sale_id:
+                pr = parse_message(f"ID VENDA {target_sale_id} pagou", reference_date=today)
+                batch_results.append(pr)
+            else:
+                not_found.append(cliente_id)
+        kind = "pagamento"
+
+    if not batch_results:
+        send_message(
+            chat_id,
+            f"Não consegui montar o lote de {kind} para os IDs: {', '.join(ids)}.",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+        return True
+
+    _send_batch_update_preview(
+        chat_id,
+        batch_results,
+        original_text=text,
+        pending_preview=pending_preview,
+        not_found=not_found,
+    )
+    return True
 
 
 def _process_scheduled_reminders(tracker) -> None:
@@ -995,6 +1469,72 @@ def _process_scheduled_reminders(tracker) -> None:
         )
 
 
+def _process_overdue_deliveries(tracker, pending_overdue_delivery: dict) -> None:
+    """
+    Cobra entregas amarelas cuja data já passou em relação a hoje (date.today()).
+    Roda a cada ~1 min; na subida do bot já verifica na hora.
+    """
+    from src.excel_store import SpreadsheetService
+    from src.reminder_scheduler import overdue_reminder_slot
+
+    now = datetime.now()
+    today, slot_hour = overdue_reminder_slot(now)
+
+    wb_path = _workbook_path_for_bot()
+    if not wb_path or not Path(wb_path).exists():
+        return
+
+    svc = SpreadsheetService(wb_path)
+    wb = svc._open_workbook(data_only=False)
+    try:
+        overdue = svc.list_overdue_deliveries(wb, today)
+    finally:
+        wb.close()
+
+    if not overdue:
+        return
+
+    print(
+        f"[Telegram] {len(overdue)} entrega(s) amarela(s) com data passada "
+        f"(referência hoje: {today.strftime('%d/%m/%Y')})"
+    )
+
+    admin_chat = os.getenv("ADMIN_CHAT_ID", "").strip()
+    for item in overdue[:15]:
+        sale_id = str(item.get("id venda") or "").strip()
+        if not sale_id or tracker.was_sent("atraso", sale_id, today, slot_hour):
+            continue
+
+        msg_txt = _build_overdue_delivery_message(item)
+        chat_target = (item.get("chat id") or "").strip()
+        sent = False
+        if chat_target:
+            if send_message(chat_target, msg_txt, parse_mode="Markdown"):
+                _register_overdue_pending(
+                    pending_overdue_delivery,
+                    chat_target,
+                    sale_id,
+                    str(item.get("cliente") or ""),
+                )
+                sent = True
+        if admin_chat:
+            send_message(admin_chat, msg_txt, parse_mode="Markdown")
+            _register_overdue_pending(
+                pending_overdue_delivery,
+                admin_chat,
+                sale_id,
+                str(item.get("cliente") or ""),
+            )
+            sent = True
+        if not sent:
+            continue
+
+        tracker.mark_sent("atraso", sale_id, today, slot_hour)
+        print(
+            f"[Telegram] Cobrança entrega amarela ID VENDA {sale_id} slot {slot_hour:02d}h"
+        )
+
+
 def run_polling() -> None:
     """Loop principal: processa mensagens e responde."""
     _acquire_single_instance_lock()
@@ -1012,10 +1552,20 @@ def run_polling() -> None:
     # Cache simples por chat: último nome de Cliente informado com sucesso.
     last_customer_by_chat: dict[int | str, str] = {}
     last_sale_id_by_chat: dict[int | str, str] = {}
+    pending_overdue_delivery: dict[int | str, dict] = {}
     last_reminder_check = 0.0
     from src.reminder_scheduler import ReminderSlotTracker
 
     reminder_tracker = ReminderSlotTracker()
+
+    print(
+        f"[Telegram] Verificação inicial de entregas amarelas "
+        f"(data de hoje: {date.today().strftime('%d/%m/%Y')})..."
+    )
+    try:
+        _process_overdue_deliveries(reminder_tracker, pending_overdue_delivery)
+    except Exception as e:
+        print(f"[Telegram] Erro na verificação inicial de entregas: {e}")
 
     while True:
         updates = get_updates(offset=next_offset)
@@ -1048,20 +1598,40 @@ def run_polling() -> None:
             from_voice = False
 
             # Áudio: baixar, transcrever e usar o texto como se fosse mensagem digitada
-            if not text and msg.get("voice"):
-                voice = msg["voice"]
-                file_id = voice.get("file_id")
+            voice_payload = msg.get("voice") or msg.get("audio")
+            if not text and voice_payload:
+                file_id = voice_payload.get("file_id")
                 if file_id:
                     try:
-                        audio_path = download_telegram_voice(file_id)
+                        duration_sec = int(voice_payload.get("duration") or 0)
+                        hinted_size = int(voice_payload.get("file_size") or 0)
+                        send_message(
+                            chat_id,
+                            _audio_processing_wait_message(duration_sec),
+                            parse_mode="Markdown",
+                        )
+                        send_chat_action(chat_id, "typing")
+                        audio_path = download_telegram_voice(
+                            file_id,
+                            duration_sec=duration_sec,
+                            hinted_file_size=hinted_size,
+                        )
                         try:
                             whisper_model = os.getenv("WHISPER_MODEL", "small")
+                            if duration_sec >= 60:
+                                print(
+                                    f"[Telegram] Transcrevendo audio longo ({duration_sec}s) "
+                                    f"com modelo {whisper_model}..."
+                                )
                             text = transcribe_audio(audio_path, model_size=whisper_model)
                             from_voice = True
+                            preview_text = text
+                            if len(preview_text) > 3500:
+                                preview_text = preview_text[:3500] + "\n\n… _(texto truncado na exibição)_"
                             send_message(
                                 chat_id,
                                 "🎤 *Áudio entendido!*\n\n"
-                                f"{text}\n\n"
+                                f"{preview_text}\n\n"
                                 "Agora vou montar a prévia do lançamento. Confira os campos e responda *SIM* para salvar, "
                                 "ou envie a correção por texto.",
                                 parse_mode="Markdown",
@@ -1076,11 +1646,24 @@ def run_polling() -> None:
                         send_message(chat_id, f"Não consegui transcrever o áudio: {e}")
                         continue
                     except Exception as e:
-                        send_message(chat_id, f"Erro ao processar o áudio: {e}")
+                        err = str(e).lower()
+                        if "timeout" in err or "timed out" in err:
+                            hint = (
+                                "A conexão com o Telegram demorou demais para baixar o áudio.\n"
+                                "Tente de novo com internet estável, ou envie um áudio mais curto / digite o texto."
+                            )
+                        else:
+                            hint = str(e)
+                        send_message(chat_id, f"Erro ao processar o áudio: {hint}")
                         print(f"[Telegram] Erro áudio: {e}")
                         continue
 
             if not chat_id:
+                continue
+
+            if text and _try_handle_overdue_delivery_reply(
+                chat_id, text, pending_overdue_delivery, pending_preview
+            ):
                 continue
 
             if not text:
@@ -1106,6 +1689,7 @@ def run_polling() -> None:
             if "reiniciar" in text.strip().lower() and len(text.strip()) <= 15:
                 pending_preview.pop(chat_id, None)
                 pending_delivery.pop(chat_id, None)
+                pending_overdue_delivery.pop(chat_id, None)
                 send_message(
                     chat_id,
                     "Reiniciado. Pode enviar um novo comando, áudio ou tocar em Resumo.",
@@ -1141,6 +1725,7 @@ def run_polling() -> None:
                     # Fluxo em lote: múltiplos updates (ex.: "cliente id 003 e id 002 pagou")
                     batch_results = pending.get("batch_parse_results")
                     if batch_results:
+                        _notify_spreadsheet_saving(chat_id, batch=True)
                         applied = 0
                         replies: list[str] = []
                         for pr in batch_results:
@@ -1211,6 +1796,7 @@ def run_polling() -> None:
                         )
                         continue
 
+                    _notify_spreadsheet_saving(chat_id, getattr(parse_result, "intent", ""))
                     reply = apply_parse_result(
                         parse_result,
                         origin=origin,
@@ -1341,6 +1927,7 @@ def run_polling() -> None:
                         parse_result.command.service_due_date = parsed
                         if _is_service_delivery_finalized(raw):
                             parse_result.command.service_status = "finalizado"
+                        _notify_spreadsheet_saving(chat_id, getattr(parse_result, "intent", "sale"))
                         reply = apply_parse_result(
                             parse_result,
                             origin=pending.get("origin", "telegram"),
@@ -1362,6 +1949,7 @@ def run_polling() -> None:
                         pending = pending_delivery.pop(chat_id, None)
                         if pending:
                             parse_result = pending["parse_result"]
+                            _notify_spreadsheet_saving(chat_id, getattr(parse_result, "intent", "sale"))
                             reply = apply_parse_result(
                                 parse_result,
                                 origin=pending.get("origin", "telegram"),
@@ -1375,119 +1963,9 @@ def run_polling() -> None:
                             send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
                         continue
 
-                # Atualizar status baseado em ID do cliente (ex.: "Cliente ID 002 pagou")
-                # Isso evita depender de "ID VENDA" em mensagens curtas.
-                try:
-                    import re
-                    lower = text.strip().lower()
-                    # Ignora se for criação de venda (para não confundir "cliente ... pagou" dentro de venda).
-                    sale_tokens = ("vendi", "fechei", "fechamos", "acabei de fazer uma venda", "fiz uma venda", "fiz um", "comprou")
-                    # Se tiver valor (ex.: "cliente id 005 pagou 2500"), é pagamento parcial:
-                    # deixa seguir para o parser normal (payment_update) em vez de marcar como pago total.
-                    nums = [int(n) for n in re.findall(r"\b\d{1,6}\b", lower)]
-                    has_amount = any(n >= 100 for n in nums)
-                    if (
-                        "cliente" in lower
-                        and ("pagou" in lower or "pago" in lower)
-                        and not any(tok in lower for tok in sale_tokens)
-                        and not has_amount
-                    ):
-                        # Suporta variações como:
-                        # "Cliente ID 002, 003 e 004 pagou"
-                        # "cliente ID 002,003, 004 pagou"
-                        ids: list[str] = []
-                        m_cluster = re.search(
-                            r"cliente\s*(?:id)?\s*[:\-]?\s*([0-9,\seE]+?)\s*(?:pagou|pago)\b",
-                            lower,
-                        )
-                        if m_cluster:
-                            raw_cluster = m_cluster.group(1)
-                            ids = re.findall(r"\d{1,6}", raw_cluster)
-                        if not ids:
-                            # Fallback: padrões "id 002 e id 003"
-                            ids = re.findall(r"\bid\s*[:\-]?\s*(\d{1,6})\b", lower)
-                        if not ids:
-                            # Fallback final: primeiro número após "cliente"
-                            m = re.search(r"(?:cliente\s*(?:id)?\s*[:\-]?\s*)(\d{1,6})", lower)
-                            if m:
-                                ids = [m.group(1)]
-                        if ids:
-                            normalized_ids: list[str] = []
-                            for raw_id in ids:
-                                cid = raw_id.zfill(3) if len(raw_id) <= 3 else raw_id
-                                if cid not in normalized_ids:
-                                    normalized_ids.append(cid)
-
-                            workbook_path = get_default_workbook()
-
-                            if workbook_path and Path(workbook_path).exists():
-                                from src.excel_store import SpreadsheetService
-                                svc = SpreadsheetService(workbook_path)
-                                batch_results = []
-                                not_found = []
-                                for cliente_id in normalized_ids:
-                                    # Prioridade 1: interpretar os IDs informados como ID VENDA.
-                                    # (Ex.: "Cliente ID 002, 003 e 004 pagou" na prática marca ID VENDA 002/003/004.)
-                                    target_sale_id = None
-                                    sale_rows = svc.get_pending_sale_by_sale_id(
-                                        cliente_id,
-                                        max_rows_scan=500,
-                                        include_paid=True,
-                                    )
-                                    if sale_rows:
-                                        target_sale_id = sale_rows[0].get("sale_id")
-                                    else:
-                                        # Prioridade 2 (fallback): buscar venda pelo nome na coluna Cliente.
-                                        pend_rows = svc.get_pending_sales_by_customer(
-                                            cliente_id,
-                                            max_rows_scan=500,
-                                            include_paid=True,
-                                        )
-                                        if pend_rows:
-                                            target_sale_id = pend_rows[0].get("sale_id")
-                                    if target_sale_id:
-                                        pr = parse_message(
-                                            f"ID VENDA {target_sale_id} pagou",
-                                            reference_date=date.today(),
-                                        )
-                                        batch_results.append(pr)
-                                    else:
-                                        not_found.append(cliente_id)
-
-                                if batch_results:
-                                    if len(batch_results) == 1:
-                                        parse_result = batch_results[0]
-                                        preview_text = build_preview(parse_result)
-                                        if not_found:
-                                            preview_text += (
-                                                f"\n\nIDs sem pendência/não encontrados: {', '.join(not_found)}"
-                                            )
-                                        send_message(chat_id, preview_text, parse_mode="Markdown")
-                                        pending_preview[chat_id] = {
-                                            "parse_result": parse_result,
-                                            "original_text": text,
-                                            "origin": "telegram",
-                                        }
-                                    else:
-                                        parts = []
-                                        for idx, pr in enumerate(batch_results, start=1):
-                                            parts.append(f"Item {idx}:\n{build_preview(pr)}")
-                                        if not_found:
-                                            parts.append("IDs sem pendência: " + ", ".join(not_found))
-                                        parts.append("\nResponda *SIM* para confirmar o lote ou *NÃO* para cancelar.")
-                                        send_message(chat_id, "\n\n".join(parts[:8]), parse_mode="Markdown")
-                                        pending_preview[chat_id] = {
-                                            "batch_parse_results": batch_results,
-                                            "original_text": text,
-                                            "origin": "telegram",
-                                        }
-                                    continue
-
-                                send_message(chat_id, f"Não achei pendência para os IDs informados ({', '.join(normalized_ids)}).")
-                                continue
-                except Exception as e:
-                    # Não interrompe o fluxo normal.
-                    print(f"[Telegram] Erro ao interpretar 'cliente pagou': {e}")
+                # Lote: vários ID VENDA — entrega ou pagamento na mesma mensagem
+                if _try_handle_batch_sale_updates(chat_id, text, pending_preview):
+                    continue
 
                 # Comandos curtos (Resumo/Status/Prévia/Planilha): não usam prévia
                 cmd_lower = text.lower()
@@ -1687,7 +2165,11 @@ def run_polling() -> None:
                     else:
                         send_message(
                             chat_id,
-                            "Faltam dados: " + ", ".join(parse_result.missing_fields) + ". Revise e tente de novo.",
+                            build_missing_fields_message(
+                                parse_result.missing_fields,
+                                parse_result.intent,
+                            ),
+                            parse_mode="Markdown",
                         )
                     continue
 
@@ -1730,6 +2212,7 @@ def run_polling() -> None:
             last_reminder_check = time.time()
             try:
                 _process_scheduled_reminders(reminder_tracker)
+                _process_overdue_deliveries(reminder_tracker, pending_overdue_delivery)
             except Exception as e:
                 print(f"[Telegram] Erro nos lembretes: {e}")
 
@@ -1778,6 +2261,7 @@ def _run_local_test(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    print("[Telegram] Iniciando bot...", flush=True)
     parser = argparse.ArgumentParser(description="Telegram bot (planilha) com modo local de teste.")
     parser.add_argument("--test-message", dest="test_message", default="", help="Texto para simular uma mensagem do Telegram.")
     parser.add_argument("--apply", action="store_true", help="Aplica a escrita na planilha durante o modo de teste.")
@@ -1796,9 +2280,15 @@ def main() -> None:
         run_polling()
     except KeyboardInterrupt:
         # Encerramento amigável no Ctrl+C (sem traceback assustando o usuário).
-        print("\n[Telegram] Bot encerrado por Ctrl+C.")
+        print("\n[Telegram] Bot encerrado por Ctrl+C.", flush=True)
         return
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[Telegram] Bot encerrado por Ctrl+C.", flush=True)
+    except Exception as exc:
+        print(f"\n[Telegram] Erro ao iniciar o bot: {exc}", flush=True)
+        raise SystemExit(1) from exc

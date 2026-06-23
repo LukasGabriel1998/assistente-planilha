@@ -24,9 +24,11 @@ O bot do Telegram usa a **mesma planilha** e a mesma lógica do app (vendas, est
 
 ## 3. Rodar o bot
 
-1. Abra `run_project.py` no Cursor e clique em **Run** (▶), ou execute:
+1. Primeiro prepare o ambiente: abra `run_project.py` e clique em **Run** (▶).
+2. Depois inicie o bot: abra `telegram_bot.py` e clique em **Run** (▶), ou execute:
    ```powershell
-   python run_project.py --telegram
+   python run_project.py
+   python telegram_bot.py
    ```
 2. No Telegram, abra o seu bot (pelo username que você criou) e envie uma mensagem.
 

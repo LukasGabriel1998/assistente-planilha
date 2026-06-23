@@ -19,10 +19,12 @@
    - Salve o arquivo.
 
 3) RODAR O BOT
-   - No Cursor: abra run_project.py e clique em Run (▶)
+   - Primeiro: abra run_project.py e clique em Run (▶)  (prepara o ambiente)
+   - Depois: abra telegram_bot.py e clique em Run (▶)
    - Ou no terminal, na pasta do projeto:
 
-     python run_project.py --telegram
+     python run_project.py
+     python telegram_bot.py
 
    - No Telegram, abra o seu bot (pelo @username que você criou) e envie:
      "Resumo"  ou  "Vendi placa para João por 2000"

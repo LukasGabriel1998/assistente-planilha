@@ -24,6 +24,16 @@ def reminder_interval_hours() -> int:
     return int(os.getenv("REMINDER_INTERVAL_HOURS", str(DEFAULT_INTERVAL_HOURS)))
 
 
+def overdue_reminder_slot(now: datetime | None = None) -> tuple[date, int]:
+    """
+    Slot para cobrança de entrega amarela atrasada.
+    Usa sempre a data local de hoje e repete a cada N horas (24h, sem janela 6h–22h).
+    """
+    now = now or datetime.now()
+    interval = max(1, reminder_interval_hours())
+    return now.date(), (now.hour // interval) * interval
+
+
 def current_reminder_slot(now: datetime | None = None) -> tuple[date, int] | None:
     """
     Retorna (dia, hora_do_slot) se estivermos em uma janela de lembrete.
@@ -84,8 +94,16 @@ class ReminderSlotTracker:
     def was_sent(self, kind: str, sale_id: str, day: date, slot_hour: int) -> bool:
         return self._key(kind, sale_id, day, slot_hour) in self._sent
 
+    def was_sent_daily(self, kind: str, sale_id: str, day: date) -> bool:
+        return f"{kind}:{sale_id}:{day.isoformat()}:daily" in self._sent
+
     def mark_sent(self, kind: str, sale_id: str, day: date, slot_hour: int) -> None:
         self._sent.add(self._key(kind, sale_id, day, slot_hour))
+        self._prune_old(day)
+        self._save()
+
+    def mark_sent_daily(self, kind: str, sale_id: str, day: date) -> None:
+        self._sent.add(f"{kind}:{sale_id}:{day.isoformat()}:daily")
         self._prune_old(day)
         self._save()
 
