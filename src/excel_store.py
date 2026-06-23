@@ -302,11 +302,17 @@ class SpreadsheetService:
 
     @classmethod
     def _is_service_delivered(cls, ws, sales_cols: dict[str, str], row: int) -> bool:
+        delivery_col = sales_cols.get("data de entrega")
+        if delivery_col:
+            cell = ws[f"{delivery_col}{row}"]
+            if cls._cell_fill_matches(cell, "C8E6C9"):
+                return True
         legacy_status_col = sales_cols.get("status")
-        if not legacy_status_col:
-            return False
-        status_txt = cls._normalize_name(str(ws[f"{legacy_status_col}{row}"].value or ""))
-        return status_txt == "finalizado"
+        if legacy_status_col:
+            status_txt = cls._normalize_name(str(ws[f"{legacy_status_col}{row}"].value or ""))
+            if status_txt == "finalizado":
+                return True
+        return False
 
     @classmethod
     def _apply_sales_row_visual_status(

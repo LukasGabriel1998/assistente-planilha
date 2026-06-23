@@ -29,7 +29,7 @@ from src.bot_processor import (
     process_command,
     sale_id_from_parse_result,
 )
-from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer, apply_multi_field_corrections, apply_preview_corrections, extract_supplemental_sale_id, _extract_target_sale_id_for_updates, extract_sale_ids_list_for_updates
+from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer, apply_multi_field_corrections, apply_preview_corrections, extract_supplemental_sale_id, _extract_target_sale_id_for_updates, extract_sale_ids_list_for_updates, extract_delete_sale_ids_list, _is_sale_delete_request
 from src.transcription import TranscriptionError, transcribe_audio
 
 # Carregar .env
@@ -1401,6 +1401,48 @@ def _try_handle_batch_sale_updates(
     return True
 
 
+def _try_handle_batch_delete(
+    chat_id: int | str,
+    text: str,
+    pending_preview: dict,
+) -> bool:
+    """Vários ID VENDA na mesma mensagem — exclusão em lote."""
+    if not _is_sale_delete_request(text):
+        return False
+
+    ids = extract_delete_sale_ids_list(text)
+    if len(ids) < 2:
+        return False
+
+    today = date.today()
+    batch_results: list = []
+    not_found: list[str] = []
+
+    for sale_id in ids:
+        pr = parse_message(f"apagar id venda {sale_id}", reference_date=today)
+        if pr.missing_fields or pr.intent != "sale_delete":
+            not_found.append(sale_id)
+            continue
+        batch_results.append(pr)
+
+    if not batch_results:
+        send_message(
+            chat_id,
+            f"Não consegui montar a exclusão em lote para os IDs: {', '.join(ids)}.",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+        return True
+
+    _send_batch_update_preview(
+        chat_id,
+        batch_results,
+        original_text=text,
+        pending_preview=pending_preview,
+        not_found=not_found,
+    )
+    return True
+
+
 def _process_scheduled_reminders(tracker) -> None:
     """Envia lembretes no dia da entrega: a partir das 6h, a cada 2h."""
     from src.excel_store import SpreadsheetService
@@ -1715,7 +1757,19 @@ def run_polling() -> None:
                             workbook_path = default_workbook_path([Path.cwd(), Path.cwd().parent])
                         svc = SpreadsheetService(workbook_path)
                         ok = svc.finalize_service(sale_id)
-                        send_message(chat_id, "Finalizado e marcado na planilha." if ok else "Não achei esse ID VENDA na planilha.")
+                        if ok:
+                            send_message(
+                                chat_id,
+                                f"✅ *Entrega confirmada!*\n\nID VENDA *{sale_id}* salvo na planilha — marcado como *entregue* (verde).",
+                                parse_mode="Markdown",
+                                reply_markup=MAIN_MENU_KEYBOARD,
+                            )
+                        else:
+                            send_message(
+                                chat_id,
+                                f"❌ Não achei ID VENDA *{sale_id}* na planilha.",
+                                parse_mode="Markdown",
+                            )
                         continue
 
                 # Confirmação da prévia: salvar na planilha
@@ -1725,7 +1779,14 @@ def run_polling() -> None:
                     # Fluxo em lote: múltiplos updates (ex.: "cliente id 003 e id 002 pagou")
                     batch_results = pending.get("batch_parse_results")
                     if batch_results:
-                        _notify_spreadsheet_saving(chat_id, batch=True)
+                        is_delete_batch = all(
+                            getattr(pr, "intent", "") == "sale_delete" for pr in batch_results
+                        )
+                        _notify_spreadsheet_saving(
+                            chat_id,
+                            "sale_delete" if is_delete_batch else "",
+                            batch=True,
+                        )
                         applied = 0
                         replies: list[str] = []
                         for pr in batch_results:
@@ -1740,8 +1801,17 @@ def run_polling() -> None:
                                 applied += 1
                             except Exception as e:
                                 replies.append(f"Falha em um item do lote: {e}")
-                        msg_out = f"Atualização em lote concluída: {applied}/{len(batch_results)} item(ns).\n\n" + "\n".join(replies[:6])
-                        send_message(chat_id, msg_out)
+                        if is_delete_batch:
+                            msg_out = (
+                                f"✅ Exclusão em lote concluída: {applied}/{len(batch_results)} registro(s).\n\n"
+                                + "\n".join(replies[:6])
+                            )
+                        else:
+                            msg_out = (
+                                f"Atualização em lote concluída: {applied}/{len(batch_results)} item(ns).\n\n"
+                                + "\n".join(replies[:6])
+                            )
+                        send_message(chat_id, msg_out, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
                         continue
                     parse_result = pending["parse_result"]
                     original_text = pending.get("original_text", "")
@@ -1963,7 +2033,9 @@ def run_polling() -> None:
                             send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
                         continue
 
-                # Lote: vários ID VENDA — entrega ou pagamento na mesma mensagem
+                # Lote: vários ID VENDA — exclusão, entrega ou pagamento na mesma mensagem
+                if _try_handle_batch_delete(chat_id, text, pending_preview):
+                    continue
                 if _try_handle_batch_sale_updates(chat_id, text, pending_preview):
                     continue
 

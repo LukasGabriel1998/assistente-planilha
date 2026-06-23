@@ -1300,6 +1300,53 @@ def _extract_delete_sale_id(text: str) -> Optional[str]:
     return None
 
 
+def extract_delete_sale_ids_list(text: str) -> list[str]:
+    """
+    Extrai um ou mais ID VENDA em pedidos de exclusão.
+    Ex.: "apaga id 002, 004 e 005" ou "excluir venda 002 e 004".
+    """
+    raw = normalize_spoken_ids_in_text(text or "")
+    if not _is_sale_delete_request(raw):
+        return []
+
+    lower = raw.lower()
+    collected: list[str] = []
+    cluster_patterns = (
+        r"\b(?:apagar|apaga|excluir|exclui|deletar|remover|cancelar|tirar|limpar)\b[^.\n]*?\bid\s*[:\-]?\s*([0-9,\seE]+)",
+        r"\b(?:apagar|apaga|excluir|exclui|deletar|remover)\s+(?:a\s+)?venda\s*[:\-]?\s*([0-9,\seE]+)",
+        r"\bid\s*(?:de\s*)?venda\s*[:\-]?\s*([0-9,\seE]+?)(?=[,.]|$|\s+(?:e\s+)?(?:id|cliente|venda))",
+        r"\bcliente\s*(?:id)?\s*[:\-]?\s*([0-9,\seE]+?)(?=[,.]|$|\s+(?:e\s+)?(?:id|cliente|venda))",
+    )
+    for pattern in cluster_patterns:
+        match = re.search(pattern, lower, flags=re.IGNORECASE)
+        if match:
+            collected.extend(re.findall(r"\d{1,6}", match.group(1)))
+            if collected:
+                break
+
+    if not collected:
+        single = _extract_delete_sale_id(raw)
+        if single:
+            collected = [single]
+        else:
+            idx = -1
+            for kw in DELETE_KEYWORDS + CANCEL_DELETE_KEYWORDS:
+                pos = lower.find(kw)
+                if pos != -1 and (idx == -1 or pos < idx):
+                    idx = pos
+            if idx >= 0:
+                collected = re.findall(r"\d{1,6}", raw[idx:])
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw_id in collected:
+        sale_id = _format_sale_id_digits(raw_id)
+        if sale_id not in seen:
+            seen.add(sale_id)
+            ordered.append(sale_id)
+    return ordered
+
+
 DELETE_KEYWORDS = (
     "apagar",
     "apaga",
