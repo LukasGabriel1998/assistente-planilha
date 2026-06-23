@@ -503,9 +503,9 @@ def _parse_money_from_fragment(fragment: str) -> Optional[float]:
 
     word_value = _parse_number_words_pt(norm)
     if word_value is not None and _is_money_like(norm):
-        if len(norm.split()) <= 12 and not numeric_values and "mil" not in norm:
+        if len(norm.split()) <= 12 and not numeric_values:
             return round(float(word_value), 2)
-    if re.search(r"\bmil\b", norm, flags=re.IGNORECASE) and not re.search(r"\d", norm):
+    if re.fullmatch(r"mil", norm, flags=re.IGNORECASE):
         return 1000.0
 
     number_match = re.search(MONEY_TOKEN, norm, flags=re.IGNORECASE)
@@ -518,9 +518,10 @@ def _parse_money_from_fragment(fragment: str) -> Optional[float]:
 
 
 def _mask_id_number_spans(text: str) -> str:
-    """Oculta números que são IDs (cliente id 002, id venda 005) para não virarem valor monetário."""
+    """Oculta números que são IDs (cliente 004, cliente id 002, id venda 005) para não virarem valor monetário."""
     masked = text
     id_patterns = (
+        r"\bcliente\s+\d{1,6}\b",
         r"\bcliente\s*id\s*[:\-]?\s*\d{1,6}\b",
         r"\bid\s*cliente\s*[:\-]?\s*\d{1,6}\b",
         r"\bid\s*(?:de\s*)?venda\s*[:\-]?\s*\d{1,6}\b",
@@ -582,6 +583,66 @@ def _is_service_delivery_finalized(text: str) -> bool:
     )
 
 
+_UPDATE_CONTEXT_TOKENS = (
+    "material",
+    "materia prima",
+    "matéria prima",
+    "fornecedor",
+    "gastar",
+    "gasto",
+    "gastei",
+    "pagou",
+    "pago",
+    "pendente",
+    "entrega",
+    "entregar",
+    "entregue",
+    "finaliz",
+    "id venda",
+    "apagar",
+    "apaga",
+    "excluir",
+    "exclui",
+    "deletar",
+    "remover",
+    "atualiza",
+    "ajusta",
+    "corrige",
+    "altera",
+    "alterar",
+)
+
+
+def _is_update_context(text: str) -> bool:
+    norm = _normalize(text or "")
+    return any(tok in norm for tok in _UPDATE_CONTEXT_TOKENS)
+
+
+def _message_has_explicit_sale_reference(text: str) -> bool:
+    raw = text or ""
+    if _extract_sale_id_from_text(raw) or _extract_delete_sale_id(raw):
+        return True
+    if re.search(r"\bcliente\s+(?:id\s*)?[:\-]?\s*\d{1,6}\b", raw, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\bid\s*cliente\s*[:\-]?\s*\d{1,6}\b", raw, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\b(?:do\s+)?id\s*[:\-]?\s*\d{1,6}\b", raw, flags=re.IGNORECASE):
+        return True
+    return False
+
+
+def _is_preview_field_correction(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    return bool(
+        re.match(
+            r"(?i)^(material|valor|produto|cliente|id|entrada|saldo|restante|entrega|venda)\s*[:\-=]",
+            raw,
+        )
+    )
+
+
 def enrich_with_last_sale_context(text: str, last_sale_id: str | None) -> str:
     """
     Quando o usuário fala 'para ele', 'a entrega foi hoje' etc. logo após outra ação,
@@ -589,6 +650,8 @@ def enrich_with_last_sale_context(text: str, last_sale_id: str | None) -> str:
     """
     raw = (text or "").strip()
     if not raw or not last_sale_id:
+        return raw
+    if _message_has_explicit_sale_reference(raw) or _is_preview_field_correction(raw):
         return raw
     if _extract_target_sale_id_for_updates(raw) or _extract_sale_id_from_text(raw) or _extract_delete_sale_id(raw):
         return raw
@@ -807,6 +870,7 @@ def _parse_pt_date(fragment: str, reference_date: date, *, full_text: str = "") 
 
 
 def _extract_customer(text: str) -> Optional[str]:
+    update_context = _is_update_context(text)
     _cust_stop = (
         r"(?=\s*[,.]"
         r"|\s+(?:ela|ele|adiciona|comprou|pagou|pago|no\s+valor|valor|entrou|saldo|restante|vai)\b"
@@ -855,7 +919,8 @@ def _extract_customer(text: str) -> Optional[str]:
         # "vendi 5000 para o cliente PC GAMER, ele me pagou a metade" -> captura só "PC GAMER"
         r"\b(?:para|pro|pra)\s+(?:(?:o|a)\s+)?cliente\s+([^,.;\n]+?)(?=\s+(?:ele|ela|me|pagou|deu|vai|paga)\s|,|\.|;|\s*$)",
         r"\b(?:para|pro|pra)\s+(?:(?:o|a)\s+)?cliente\s+([^,.;\n]+)",
-        r"\bcliente\s+([^,.;\n]+)",
+        # fallback amplo — evitar em atualizações onde "cliente 004 gasto..." vira nome errado
+        *([] if update_context else [r"\bcliente\s+([^,.;\n]+)"]),
         # fallback: "Adriel comprou o banner"
         rf"\b({LETTER_RX}[\w'-]{{1,30}}(?:\s+{LETTER_RX}[\w'-]{{1,30}}){{0,3}})\s+comprou\b",
     ]
@@ -900,6 +965,10 @@ def _extract_customer(text: str) -> Optional[str]:
             # Aceita IDs curtos (ex.: "004"), mas rejeita valores monetarios/quantias.
             digits_only = "".join(ch for ch in candidate if ch.isdigit())
             if not digits_only:
+                continue
+
+            # Em atualizações (material, pagamento...), "cliente 004" refere-se ao ID VENDA.
+            if update_context and candidate.strip().upper() == digits_only and len(digits_only) <= 6:
                 continue
 
             # Ex.: "004", "0123"
@@ -1042,13 +1111,15 @@ def _extract_target_sale_id_for_updates(text: str) -> Optional[str]:
     )
     if not update_context:
         return None
-    m = re.search(r"\bcliente\s*id\s*[:\-]?\s*(\d{1,6})\b", raw, flags=re.IGNORECASE)
-    if not m:
-        m = re.search(r"\bid\s*cliente\s*[:\-]?\s*(\d{1,6})\b", raw, flags=re.IGNORECASE)
-    if not m:
-        return None
-    digits = m.group(1)
-    return digits.zfill(3) if len(digits) <= 3 else digits
+    for pattern in (
+        r"\bcliente\s*id\s*[:\-]?\s*(\d{1,6})\b",
+        r"\bid\s*cliente\s*[:\-]?\s*(\d{1,6})\b",
+        r"\bcliente\s+(\d{1,6})\b",
+    ):
+        m = re.search(pattern, raw, flags=re.IGNORECASE)
+        if m:
+            return _format_sale_id_digits(m.group(1))
+    return None
 
 
 def extract_supplemental_sale_id(text: str) -> Optional[str]:
@@ -1203,7 +1274,10 @@ def _extract_material_allocations(text: str, reference_date: date) -> list[Mater
 
     # Para material, queremos vincular ao ID da venda (linha especifica),
     # nao ao ID do cliente.
-    id_pattern = r"(?:id\s*(?:de\s*)?venda|codigo\s*(?:da\s*)?venda|cliente\s*id|id\s*cliente)\s*([a-zA-Z0-9_-]{1,30})"
+    id_pattern = (
+        r"(?:id\s*(?:de\s*)?venda|codigo\s*(?:da\s*)?venda|cliente\s*id|id\s*cliente|cliente)\s*"
+        r"([a-zA-Z0-9_-]{1,30})"
+    )
     loose_id_pattern = r"\b([a-zA-Z]*\d[a-zA-Z0-9_-]{0,29})\b"
     money_pattern = r"(r\$\s*\d[\d\.,]*|\d{2,}(?:[\.,]\d{1,2})?|\bmil\b|\b(?:um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez)\s+mil\b)"
     # Padroes: aqui so consideramos o ID da venda se vier com algum marcador ("id venda ...").
@@ -1543,6 +1617,15 @@ def _extract_material_cost(text: str) -> Optional[float]:
         for v in _currency_candidates(snippet):
             if v > 0:
                 candidates.append(float(v))
+        after_material = re.search(
+            r"\bmaterial\b\s*(?:de\s+)?(.{0,80})",
+            _normalize(text[max(0, idx - 20) : idx + 120]),
+            flags=re.IGNORECASE,
+        )
+        if after_material:
+            word_value = _parse_money_from_fragment(after_material.group(1))
+            if word_value is not None and word_value > 0:
+                candidates.append(float(word_value))
     if candidates:
         return max(candidates)
     return None
@@ -1898,6 +1981,14 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
     )
 
     customer = _extract_customer(raw_text) or ""
+    if sale_id and customer:
+        cust_norm = _normalize(customer)
+        sale_digits = re.sub(r"\D", "", str(sale_id))
+        cust_digits = re.sub(r"\D", "", customer)
+        if sale_digits and cust_digits and sale_digits == cust_digits:
+            customer = ""
+        elif sale_digits and cust_norm.startswith(sale_digits):
+            customer = ""
     product_id = _extract_product(raw_text) or ""
     total_value = _extract_total_value(raw_text, numbers)
     itemized_products, itemized_total = _extract_itemized_products_and_total(raw_text)
@@ -2112,15 +2203,13 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
     material_expense_only = bool((material_allocations or material_cost) and (not sale_creation_context) and not total_value)
     if material_expense_only:
         # Para "gasto de material", precisamos do ID VENDA para vincular a linha correta em "Compras Matéria-Prima".
-        # O ID Cliente é opcional quando a mensagem já traz o ID VENDA (ex.: "material para o cliente id 003").
+        # Gasto de material: só precisa do ID VENDA para vincular na planilha.
         if not sale_id and not material_allocations:
             missing.append("ID VENDA")
-        if (not sale_id) and (not material_allocations) and (not customer):
-            missing.append("ID Cliente")
     else:
-        # Fluxo de venda normal: exige cliente e valor (produto é opcional).
+        # Fluxo de venda normal: exige nome do cliente e valor (produto é opcional).
         if not customer:
-            missing.append("ID Cliente")
+            missing.append("Cliente")
         if not total_value:
             missing.append("Valor total da venda")
     if _has_placeholder_date(raw_text):
@@ -2391,6 +2480,7 @@ _PREVIEW_CORRECTION_FIELD_RE = re.compile(
     r"|restante"
     r"|resto"
     r"|entrega"
+    r"|material(?:\s+estimado)?"
     r"|id\s+venda"
     r"|venda"
     r")\s*[:=]?\s*"
@@ -2444,6 +2534,8 @@ def _preview_correction_label_to_key(label: str) -> Optional[str]:
     label = label.lower().strip()
     if label.startswith("cliente") or label.startswith("nome do cliente") or label == "id cliente":
         return "cliente"
+    if label.startswith("material"):
+        return "material"
     if label == "produto":
         return "produto"
     if label.startswith("valor"):
@@ -2657,6 +2749,10 @@ def apply_multi_field_corrections(
             or re.search(r"\bid\s*[:\-]?\s*\d", lower)
         ):
             fields = {"id_venda": text}
+        elif "material" in lower:
+            rest = _preview_correction_rest(text, "material")
+            if rest:
+                fields = {"material": rest}
         elif "produto" in lower:
             rest = _preview_correction_rest(text, "produto")
             if rest:
@@ -2677,18 +2773,7 @@ def apply_multi_field_corrections(
     touched_payments = "entrada" in fields or "saldo" in fields
 
     if "cliente" in fields:
-        new_name = fields["cliente"]
-        m_id = re.search(r"\d+", new_name)
-        only_digits = bool(re.fullmatch(r"\d+", new_name.strip()))
-        if m_id and (
-            only_digits
-            or re.search(r"\bid\b", text, re.I)
-            or re.search(r"cliente\s+id", text, re.I)
-        ):
-            digits = m_id.group(0)
-            command.customer = digits.zfill(3) if len(digits) <= 3 else digits
-        else:
-            command.customer = new_name
+        command.customer = fields["cliente"].strip()
         updated = True
 
     if "id_venda" in fields:
@@ -2702,6 +2787,27 @@ def apply_multi_field_corrections(
                 digits = m_id.group(0)
                 command.sale_id = digits.zfill(3) if len(digits) <= 3 else digits
                 updated = True
+        if updated and command.sale_id and command.material_allocations:
+            for allocation in command.material_allocations:
+                allocation.sale_id = str(command.sale_id).strip()
+
+    if "material" in fields:
+        parsed_material = _parse_correction_money(fields["material"], text)
+        if parsed_material is not None and parsed_material > 0:
+            command.material_cost = parsed_material
+            command.material_date = command.material_date or command.sale_date or reference_date
+            if command.material_allocations:
+                for allocation in command.material_allocations:
+                    allocation.amount = float(parsed_material)
+            elif command.sale_id:
+                command.material_allocations = [
+                    MaterialAllocation(
+                        sale_id=str(command.sale_id).strip(),
+                        amount=float(parsed_material),
+                        material_date=command.material_date or reference_date,
+                    )
+                ]
+            updated = True
 
     if "produto" in fields:
         new_prod = fields["produto"]
@@ -2747,9 +2853,9 @@ def apply_multi_field_corrections(
                 saldo.value = round(max(total - float(entrada.value or 0), 0), 2)
 
     if updated and parse_result is not None:
-        if (command.customer or "").strip() and "ID Cliente" in parse_result.missing_fields:
+        if (command.customer or "").strip() and "Cliente" in parse_result.missing_fields:
             parse_result.missing_fields = [
-                f for f in parse_result.missing_fields if f != "ID Cliente"
+                f for f in parse_result.missing_fields if f != "Cliente"
             ]
         if getattr(command, "sale_id", None) and "ID VENDA" in parse_result.missing_fields:
             parse_result.missing_fields = [
@@ -2902,7 +3008,7 @@ def parse_message(message: str, reference_date: Optional[date] = None) -> ParseR
             intent="delivery_update",
         )
     if intent == "material_update":
-        # Reaproveita parse_financial_message; apenas sinaliza intent para não exigir ID Cliente em updates por ID VENDA.
+        # Reaproveita parse_financial_message; updates por ID VENDA não exigem nome do Cliente.
         financial_result.intent = "material_update"
         return financial_result
     if intent == "payment_update":

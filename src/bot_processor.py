@@ -287,7 +287,7 @@ def build_preview(parse_result: ParseResult) -> str:
             return (
                 "📋 *Entendi assim: apagar registro da planilha*\n\n"
                 "Não identifiquei qual venda apagar.\n"
-                "Informe o *ID VENDA*, por exemplo: `id venda 003` ou `cliente id 003`.\n\n"
+                "Informe o *ID VENDA*, por exemplo: `id venda 003`.\n\n"
                 "Para cancelar, responda *NÃO*."
             )
         sale_ctx = _load_sale_context_for_preview(dc.sale_id)
@@ -416,7 +416,7 @@ def apply_parse_result(
     cmd = parse_result.command
     if parse_result.intent == "delivery_finalize":
         if not getattr(cmd, "sale_id", None):
-            return "Faltou o *ID VENDA* para confirmar a entrega. Ex.: `cliente id 002 foi entregue`."
+            return "Faltou o *ID VENDA* para confirmar a entrega. Ex.: `id venda 002 foi entregue`."
         sale_id = str(cmd.sale_id).strip()
         delivery_date = getattr(cmd, "service_due_date", None) or date.today()
         service.update_sale_delivery_date(sale_id, delivery_date)

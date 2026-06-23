@@ -37,9 +37,10 @@ SALES_REQUIRED_HEADERS = {
     # A aba TOTAL DE VENDAS DE 2026 agora usa explicitamente:
     # Coluna A: Data de venda
     # Coluna B: Data de Entrega
+    # Coluna C: Cliente (antes "ID Cliente")
     "data de venda": "Data de venda",
     "data de entrega": "Data de Entrega",
-    "id cliente": "ID Cliente",
+    "cliente": "Cliente",
     "id produto": "ID produto",
     "total de vendas (pago)": "Total de vendas (pago)",
     "valor (pendente)": "Valor (pendente)",
@@ -402,7 +403,7 @@ class SpreadsheetService:
         cols = [
             sales_cols["data de venda"],
             sales_cols["data de entrega"],
-            sales_cols["id cliente"],
+            sales_cols["cliente"],
             sales_cols["id produto"],
             sales_cols["total de vendas (pago)"],
             sales_cols["valor (pendente)"],
@@ -462,6 +463,11 @@ class SpreadsheetService:
                 headers["data de entrega"] = headers["data entrega"]
             elif "entrega" in headers:
                 headers["data de entrega"] = headers["entrega"]
+        # Compatibilidade: coluna "Cliente" substituiu "ID Cliente" em planilhas novas.
+        if "cliente" not in headers and "id cliente" in headers:
+            headers["cliente"] = headers["id cliente"]
+        if "id cliente" not in headers and "cliente" in headers:
+            headers["id cliente"] = headers["cliente"]
         missing = [label for key, label in SALES_REQUIRED_HEADERS.items() if key not in headers]
         if missing:
             raise ValueError(
@@ -690,7 +696,7 @@ class SpreadsheetService:
         cols = [
             sales_cols["data de venda"],
             sales_cols["data de entrega"],
-            sales_cols["id cliente"],
+            sales_cols["cliente"],
             sales_cols["id produto"],
             sales_cols["total de vendas (pago)"],
             sales_cols["valor (pendente)"],
@@ -1177,7 +1183,7 @@ class SpreadsheetService:
         legacy_status_col = sales_cols.get("status")
         tracked_cols = (
             sales_cols["data de venda"],
-            sales_cols["id cliente"],
+            sales_cols["cliente"],
             sales_cols["id produto"],
             sales_cols["total de vendas (pago)"],
             sales_cols["valor (pendente)"],
@@ -1195,7 +1201,7 @@ class SpreadsheetService:
         )
         aux_only_cols = (
             sales_cols["data de venda"],
-            sales_cols["id cliente"],
+            sales_cols["cliente"],
             sales_cols["status de valor"],
         )
         if legacy_status_col:
@@ -1479,7 +1485,7 @@ class SpreadsheetService:
             except Exception:
                 continue
 
-            customer = str(ws_sales[f"{sales_cols['id cliente']}{sales_row}"].value or "").strip()
+            customer = str(ws_sales[f"{sales_cols['cliente']}{sales_row}"].value or "").strip()
             product_desc = str(ws_sales[f"{sales_cols['id produto']}{sales_row}"].value or "").strip()
             pending_amount = self._to_float(ws_sales[f"{sales_cols['valor (pendente)']}{sales_row}"].value)
             paid_amount = self._to_float(ws_sales[f"{sales_cols['total de vendas (pago)']}{sales_row}"].value)
@@ -1579,7 +1585,7 @@ class SpreadsheetService:
             return str(ws_sales[f"{col}{row_found}"].value or "").strip()
         return {
             "sale_id": str(sale_id).strip(),
-            "customer": _v("id cliente"),
+            "customer": _v("cliente"),
             "description": _v("id produto"),
             "sale_date": _v("data de venda") or _v("data"),
             "delivery_date": _v("data de entrega"),
@@ -1716,7 +1722,7 @@ class SpreadsheetService:
 
         if delivery_date:
             ws[f"{sales_cols['data de entrega']}{row}"] = self._excel_date_value(delivery_date)
-        ws[f"{sales_cols['id cliente']}{row}"] = cmd.customer
+        ws[f"{sales_cols['cliente']}{row}"] = cmd.customer
         ws[f"{sales_cols['id produto']}{row}"] = cmd.product_id or cmd.description
         ws[f"{sales_cols['total de vendas (pago)']}{row}"] = float(paid_amount)
         ws[f"{sales_cols['valor (pendente)']}{row}"] = float(pending_amount)
@@ -2031,7 +2037,7 @@ class SpreadsheetService:
                 "pago",
             )
             ws_sales[f"{sales_cols['data de venda']}{row}"] = self._excel_date_value(refund.ref_date)
-            ws_sales[f"{sales_cols['id cliente']}{row}"] = refund.customer
+            ws_sales[f"{sales_cols['cliente']}{row}"] = refund.customer
             ws_sales[f"{sales_cols['id produto']}{row}"] = f"Estorno - {refund.reason}"
             ws_sales[f"{sales_cols['total de vendas (pago)']}{row}"] = amount
             ws_sales[f"{sales_cols['valor (pendente)']}{row}"] = 0.0
@@ -2101,7 +2107,7 @@ class SpreadsheetService:
                 ws_sales, sales_cols, row, pending_amount=current_pending
             )
 
-            customer = status_update.customer or str(ws_sales[f"{sales_cols['id cliente']}{row}"].value or "")
+            customer = status_update.customer or str(ws_sales[f"{sales_cols['cliente']}{row}"].value or "")
             product = str(ws_sales[f"{sales_cols['id produto']}{row}"].value or "")
             self._append_log(
                 ws=ws_log,
@@ -2138,7 +2144,7 @@ class SpreadsheetService:
         """Atualiza apenas a coluna 'Data de Entrega' para um ID VENDA existente.
 
         Observação: alguns usuários enviam "cliente id 003" querendo dizer o ID VENDA.
-        Por isso, se não achar por ID VENDA, tentamos também casar pelo ID Cliente.
+        Por isso, se não achar por ID VENDA, tentamos também casar pelo nome na coluna Cliente.
         """
         wb = self._open_workbook()
         try:
@@ -2147,7 +2153,7 @@ class SpreadsheetService:
             sales_cols = self._sales_columns(ws_sales)
             col_sale_id = sales_cols["id venda"]
             col_delivery = sales_cols["data de entrega"]
-            col_customer = sales_cols.get("id cliente")
+            col_customer = sales_cols.get("cliente")
             target_row = None
             needle = str(sale_id).strip()
             # 1) Primeiro tenta por ID VENDA
@@ -2155,7 +2161,7 @@ class SpreadsheetService:
                 if str(ws_sales[f"{col_sale_id}{row}"].value or "").strip() == needle:
                     target_row = row
                     break
-            # 2) Fallback: tenta por ID Cliente (quando o usuário fala "cliente id 003")
+            # 2) Fallback: tenta pelo nome na coluna Cliente
             if target_row is None and col_customer:
                 for row in range(DATA_START_ROW, min(ws_sales.max_row + 1, self.MAX_DATA_ROW)):
                     if str(ws_sales[f"{col_customer}{row}"].value or "").strip() == needle:
@@ -2205,7 +2211,7 @@ class SpreadsheetService:
                 ws_sales, sales_cols, row, pending_amount=current_pending
             )
 
-            customer = str(ws_sales[f"{sales_cols['id cliente']}{row}"].value or "")
+            customer = str(ws_sales[f"{sales_cols['cliente']}{row}"].value or "")
             product = str(ws_sales[f"{sales_cols['id produto']}{row}"].value or "")
             self._append_log(
                 ws=ws_log,
@@ -2300,7 +2306,7 @@ class SpreadsheetService:
                         start_row=TEMPLATE_ROW,
                     )
                     ws[f"{sales_cols['data de venda']}{row}"] = self._excel_date_value(ref_date)
-                    ws[f"{sales_cols['id cliente']}{row}"] = party
+                    ws[f"{sales_cols['cliente']}{row}"] = party
                     ws[f"{sales_cols['id produto']}{row}"] = description
                     ws[f"{sales_cols['total de vendas (pago)']}{row}"] = float(amount)
                     if ws[f"{sales_cols['valor (pendente)']}{row}"].value in (None, ""):
@@ -2422,7 +2428,7 @@ class SpreadsheetService:
                     for key in (
                         "data de venda",
                         "data de entrega",
-                        "id cliente",
+                        "cliente",
                         "id produto",
                         "total de vendas (pago)",
                         "valor (pendente)",
@@ -2543,7 +2549,7 @@ class SpreadsheetService:
             sales_cols = self._sales_columns(ws)
 
             col_id = sales_cols["id venda"]
-            col_customer = sales_cols["id cliente"]
+            col_customer = sales_cols["cliente"]
             col_desc = sales_cols["id produto"]
             col_pending = sales_cols["valor (pendente)"]
             col_status = sales_cols["status de valor"]
@@ -2651,8 +2657,8 @@ class SpreadsheetService:
 
             if example_customer:
                 lines.append(
-                    f"Dica: se o cliente {example_customer} tem pendência, envie `Cliente ID {example_customer} pagou` "
-                    f"para marcar a venda como paga."
+                    f"Dica: se o cliente {example_customer} tem pendência, envie `ID VENDA 001 pagou` "
+                    f"(use o ID VENDA da linha) para marcar a venda como paga."
                 )
             else:
                 lines.append("Dica: envie `ID VENDA 001 pagou` para atualizar o status.")
@@ -2669,33 +2675,22 @@ class SpreadsheetService:
         include_paid: bool = False,
     ) -> list[dict[str, str]]:
         """
-        Retorna vendas pendentes (ou com status pendente) para um ID de cliente.
-        Usado no Telegram para interpretar "Cliente ID XXX pagou".
+        Retorna vendas pendentes (ou com status pendente) pelo nome na coluna Cliente.
+        Usado no Telegram quando o usuário menciona o nome do cliente.
         """
         wb = self._open_workbook(data_only=True)
         try:
             import re
 
-            def _norm_id(v: object) -> str:
-                """
-                Normaliza IDs salvos no Excel.
-                - Se for só dígitos e tiver <= 3, força zfill(3) (ex.: 3 -> 003)
-                - Caso contrário, devolve em string como está (trim/upper).
-                """
-                raw = str(v or "").strip()
-                digits = re.sub(r"\D", "", raw)
-                if digits:
-                    if len(digits) <= 3:
-                        return digits.zfill(3)
-                    return digits
-                return raw.upper()
+            def _norm_name(v: object) -> str:
+                return self._normalize_name(str(v or "").strip())
 
             sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
             ws = wb[sales_name]
             sales_cols = self._sales_columns(ws)
 
             col_id = sales_cols.get("id venda")
-            col_customer = sales_cols.get("id cliente")
+            col_customer = sales_cols.get("cliente")
             col_desc = sales_cols.get("id produto")
             col_pending = sales_cols.get("valor (pendente)")
             col_status = sales_cols.get("status de valor")
@@ -2705,13 +2700,13 @@ class SpreadsheetService:
             if not col_id or not col_customer:
                 return []
 
-            normalized_customer = _norm_id(customer_id)
+            normalized_customer = _norm_name(customer_id)
             rows: list[dict[str, str]] = []
             start_row = min(ws.max_row, self.MAX_DATA_ROW, DATA_START_ROW + max_rows_scan)
             for row in range(start_row, DATA_START_ROW - 1, -1):
                 cust_val_raw = ws[f"{col_customer}{row}"].value
-                cust_val = _norm_id(cust_val_raw)
-                if cust_val != normalized_customer:
+                cust_val = str(cust_val_raw or "").strip()
+                if _norm_name(cust_val) != normalized_customer:
                     continue
 
                 pending = self._to_float(ws[f"{col_pending}{row}"].value) if col_pending else 0.0
@@ -2750,7 +2745,7 @@ class SpreadsheetService:
     ) -> list[dict[str, str]]:
         """
         Retorna uma venda pendente (status pendente/pagamento pendente) por ID VENDA.
-        Usado como fallback quando o usuário manda "Cliente ID X pagou" e X na prática é o ID VENDA.
+        Usado quando o usuário informa o ID VENDA (ex.: "id venda 004 pagou").
         """
         wb = self._open_workbook(data_only=True)
         try:
@@ -2768,7 +2763,7 @@ class SpreadsheetService:
             sales_cols = self._sales_columns(ws)
 
             col_id = sales_cols.get("id venda")
-            col_customer = sales_cols.get("id cliente")
+            col_customer = sales_cols.get("cliente")
             col_desc = sales_cols.get("id produto")
             col_pending = sales_cols.get("valor (pendente)")
             col_status = sales_cols.get("status de valor")

@@ -185,7 +185,7 @@ def handle_message(
 
     if parse_result.missing_fields:
         missing_set = set(parse_result.missing_fields)
-        if missing_set <= {"ID Cliente", "ID VENDA"} and parse_result.intent in (
+        if missing_set <= {"Cliente", "ID VENDA"} and parse_result.intent in (
             "sale",
             "mixed_update",
             "refund",
@@ -197,8 +197,8 @@ def handle_message(
         ):
             preview = build_preview(parse_result)
             extra = ""
-            if "ID Cliente" in missing_set:
-                extra = "\n\nFaltou apenas o ID Cliente. Envie ex.: cliente id 004."
+            if "Cliente" in missing_set:
+                extra = "\n\nFaltou apenas o Cliente. Envie ex.: Cliente: Macdonald."
             elif "ID VENDA" in missing_set:
                 extra = "\n\nFaltou apenas o ID VENDA. Envie ex.: id venda 002."
             _sessions[conv] = {

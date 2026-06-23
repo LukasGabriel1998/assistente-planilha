@@ -901,7 +901,7 @@ def main() -> None:
     
             st.markdown("### Confirmacao rapida")
             c1, c2, c3 = st.columns(3)
-            c1.text_input("ID Cliente", key="customer")
+            c1.text_input("Cliente", key="customer")
             c2.text_input("ID produto", key="product_id")
             c3.date_input("Data da venda", key="sale_date", format="DD/MM/YYYY")
     

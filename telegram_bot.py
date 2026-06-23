@@ -10,6 +10,7 @@ import atexit
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -468,7 +469,7 @@ def _maybe_build_sales_snippet_image(
             display_cols = [
                 ("data de venda", "Data da venda"),
                 ("data de entrega", "Data entrega"),
-                ("id cliente", "ID Cliente"),
+                ("cliente", "Cliente"),
                 ("id produto", "Produto"),
                 ("total de vendas (pago)", "Pago"),
                 ("valor (pendente)", "Pendente"),
@@ -1008,9 +1009,7 @@ def run_polling() -> None:
     # Prévia pendente por chat: só salva na planilha após o usuário confirmar (SIM)
     pending_preview: dict = {}
     pending_delivery: dict[int | str, dict] = {}
-    # Cache simples por chat: se o usuário enviar texto sem "ID Cliente"
-    # (ex.: ele escreve a transcrição mas não repete o id), usamos o último
-    # ID Cliente extraído com sucesso para destravar a prévia.
+    # Cache simples por chat: último nome de Cliente informado com sucesso.
     last_customer_by_chat: dict[int | str, str] = {}
     last_sale_id_by_chat: dict[int | str, str] = {}
     last_reminder_check = 0.0
@@ -1163,14 +1162,21 @@ def run_polling() -> None:
                     original_text = pending.get("original_text", "")
                     origin = pending.get("origin", "telegram")
                     cmd = parse_result.command
-                    # Se ainda faltar ID Cliente, não salva: pede o ID e recoloca a prévia pendente.
-                    # Para atualização de status e atualização de entrega, nao exigimos cmd.customer.
-                    if parse_result.intent not in ("status_update", "delivery_update", "delivery_finalize", "payment_update", "sale_delete"):
-                        if "ID Cliente" in parse_result.missing_fields or not (cmd.customer or "").strip():
+                    # Se ainda faltar Cliente (nome), não salva em fluxos de venda nova.
+                    # Para atualização de status, entrega, material etc., usa-se o ID VENDA.
+                    if parse_result.intent not in (
+                        "status_update",
+                        "delivery_update",
+                        "delivery_finalize",
+                        "payment_update",
+                        "sale_delete",
+                        "material_update",
+                    ):
+                        if "Cliente" in parse_result.missing_fields or not (cmd.customer or "").strip():
                             pending_preview[chat_id] = pending
                             send_message(
                                 chat_id,
-                                "Faltou o *ID Cliente* para salvar.\nEnvie por exemplo: `cliente id 004`.",
+                                "Faltou o *Cliente* para salvar.\nEnvie por exemplo: `Cliente: Macdonald`.",
                                 parse_mode="Markdown",
                             )
                             continue
@@ -1293,10 +1299,9 @@ def run_polling() -> None:
                                     ]
                                     updated = True
                             if updated:
-                                # Se o usuário forneceu o ID Cliente, remover da lista de missing.
-                                if (cmd.customer or "").strip() and "ID Cliente" in parse_result.missing_fields:
+                                if (cmd.customer or "").strip() and "Cliente" in parse_result.missing_fields:
                                     parse_result.missing_fields = [
-                                        f for f in parse_result.missing_fields if f != "ID Cliente"
+                                        f for f in parse_result.missing_fields if f != "Cliente"
                                     ]
                                 # Se o usuário forneceu o ID VENDA, remover da lista de missing.
                                 if getattr(cmd, "sale_id", None) and "ID VENDA" in parse_result.missing_fields:
@@ -1432,7 +1437,7 @@ def run_polling() -> None:
                                     if sale_rows:
                                         target_sale_id = sale_rows[0].get("sale_id")
                                     else:
-                                        # Prioridade 2 (fallback): interpretar como ID de cliente (aba ID Cliente).
+                                        # Prioridade 2 (fallback): buscar venda pelo nome na coluna Cliente.
                                         pend_rows = svc.get_pending_sales_by_customer(
                                             cliente_id,
                                             max_rows_scan=500,
@@ -1530,21 +1535,21 @@ def run_polling() -> None:
                 if explicit_customer:
                     parse_result.command.customer = explicit_customer
                     parse_result.missing_fields = [
-                        f for f in parse_result.missing_fields if f != "ID Cliente"
+                        f for f in parse_result.missing_fields if f != "Cliente"
                     ]
                     parsed_customer = explicit_customer
                 if parsed_customer and parsed_customer != "-":
                     last_customer_by_chat[chat_id] = parsed_customer
 
-                # Fallback: se faltou somente "ID Cliente", tente preencher com o último conhecido.
-                if "ID Cliente" in parse_result.missing_fields:
+                # Fallback: se faltou somente "Cliente", tente preencher com o último nome conhecido.
+                if "Cliente" in parse_result.missing_fields:
                     cached_customer = None if should_replace_pending_preview(text) else last_customer_by_chat.get(chat_id)
                     if cached_customer:
                         parse_result.command.customer = cached_customer
                         parse_result.missing_fields = [
-                            f for f in parse_result.missing_fields if f != "ID Cliente"
+                            f for f in parse_result.missing_fields if f != "Cliente"
                         ]
-                        print(f"[Telegram] Fallback de 'ID Cliente' usado no chat {chat_id}: {cached_customer}")
+                        print(f"[Telegram] Fallback de 'Cliente' usado no chat {chat_id}: {cached_customer}")
 
                 # Fallback: atualização de entrega/status logo após outra ação ("para ele", "entrega hoje").
                 if "ID VENDA" in parse_result.missing_fields and parse_result.intent in (
@@ -1565,11 +1570,7 @@ def run_polling() -> None:
                 if remembered_sale:
                     last_sale_id_by_chat[chat_id] = remembered_sale
 
-                # Inferencia: quando for gasto de material e faltar "ID VENDA",
-                # tente localizar a venda pendente pelo "ID Cliente" informado.
-                # Isso preserva o sentido:
-                # - Você pode falar "cliente id 002" (ID Cliente)
-                # - O robô encontra o ID VENDA correspondente e lança em "Compras Matéria-Prima".
+                # Inferência: gasto de material sem ID VENDA explícito — tenta achar a venda na planilha.
                 cmd = parse_result.command
                 if "ID VENDA" in parse_result.missing_fields:
                     try:
@@ -1585,11 +1586,17 @@ def run_polling() -> None:
                                 if workbook_path and Path(workbook_path).exists():
                                     from src.excel_store import SpreadsheetService
                                     svc = SpreadsheetService(workbook_path)
-                                    sale_rows = svc.get_pending_sales_by_customer(
-                                        customer_id, max_rows_scan=500, include_paid=True
-                                    )
-                                    if not sale_rows:
-                                        # Alguns fluxos podem mandar o numero como "ID VENDA" em vez de "ID Cliente".
+                                    customer_digits = re.sub(r"\D", "", customer_id)
+                                    is_numeric_ref = bool(customer_digits) and customer_id.strip().isdigit()
+                                    if is_numeric_ref:
+                                        sale_rows = svc.get_pending_sale_by_sale_id(
+                                            customer_id, max_rows_scan=500, include_paid=True
+                                        )
+                                    else:
+                                        sale_rows = svc.get_pending_sales_by_customer(
+                                            customer_id, max_rows_scan=500, include_paid=True
+                                        )
+                                    if not sale_rows and customer_digits:
                                         sale_rows = svc.get_pending_sale_by_sale_id(
                                             customer_id, max_rows_scan=500, include_paid=True
                                         )
@@ -1612,15 +1619,15 @@ def run_polling() -> None:
                                             parse_result.missing_fields = [
                                                 f for f in parse_result.missing_fields if f != "ID VENDA"
                                             ]
-                                            print(f"[Telegram] Inferido ID VENDA {inferred_sale_id} a partir do ID Cliente {customer_id} (chat {chat_id}).")
+                                            print(f"[Telegram] Inferido ID VENDA {inferred_sale_id} (chat {chat_id}).")
                     except Exception as e:
                         print(f"[Telegram] Falha na inferencia de ID VENDA: {e}")
 
                 if parse_result.missing_fields:
                     missing_set = set(parse_result.missing_fields)
 
-                    # Mostra prévia mesmo sem ID Cliente, para o usuário validar os demais campos.
-                    if missing_set == {"ID Cliente"} and parse_result.intent in (
+                    # Mostra prévia mesmo sem Cliente, para o usuário validar os demais campos.
+                    if missing_set == {"Cliente"} and parse_result.intent in (
                         "sale",
                         "mixed_update",
                         "refund",
@@ -1634,8 +1641,8 @@ def run_polling() -> None:
                         send_message(
                             chat_id,
                             preview_text
-                            + "\n\nFaltou apenas o *ID Cliente*.\n"
-                            + "Envie por exemplo: `cliente id 004`.",
+                            + "\n\nFaltou apenas o *Cliente* (nome).\n"
+                            + "Envie por exemplo: `Cliente: Macdonald`.",
                             parse_mode="Markdown",
                         )
                         pending_preview[chat_id] = {
