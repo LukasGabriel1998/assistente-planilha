@@ -138,6 +138,7 @@ def format_reply(intent: str, actions: list, error: str | None = None) -> str:
     if not actions:
         return "ℹ️ Nenhuma alteração foi feita na planilha."
     parts = []
+    sale_id_saved = next((str(a.get("sale_id")).strip() for a in actions if a.get("sale_id")), "")
     for a in actions:
         label = a.get("label", "")
         amount = a.get("amount", 0)
@@ -147,7 +148,10 @@ def format_reply(intent: str, actions: list, error: str | None = None) -> str:
             parts.append(f"• {label}: {_format_currency_pt(amount)} (linha {row})")
         else:
             parts.append(f"• Registrado em {sheet} linha {row}")
-    return "✅ *Registrado com sucesso!*\n\n" + "\n".join(parts[:5])
+    header = "✅ *Registrado com sucesso!*"
+    if intent in ("sale", "mixed_update") and sale_id_saved:
+        header += f"\n\n🧾 ID VENDA: *{sale_id_saved}*"
+    return header + "\n\n" + "\n".join(parts[:5])
 
 
 def build_missing_fields_message(
@@ -421,10 +425,9 @@ def build_preview(parse_result: ParseResult) -> str:
     lines = ["📋 *Entendi assim:*", ""]
     lines.append(f"👤 Cliente: *{customer}*")
     lines.append(f"📦 Produto: *{product}*")
-    if getattr(cmd, "sale_id", None):
+    # ID VENDA de venda nova só existe após salvar na planilha — não mostrar na prévia.
+    if parse_result.intent != "sale" and getattr(cmd, "sale_id", None):
         lines.append(f"🧾 ID VENDA: *{cmd.sale_id}*")
-    elif cmd.material_cost:
-        lines.append("🧾 ID VENDA: *-*")
     if getattr(cmd, "sale_date", None):
         if cmd.sale_date == date.today():
             lines.append(f"📅 Data da venda: *hoje ({cmd.sale_date.strftime('%d/%m/%Y')})*")

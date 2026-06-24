@@ -1678,8 +1678,13 @@ def _extract_material_allocations(text: str, reference_date: date) -> list[Mater
 
     fragments = re.split(r"[,;]|\be\b", text, flags=re.IGNORECASE)
     current_sale_id: str | None = None
+    # Não usar "cliente Nome" sozinho — evita confundir código do cliente com ID VENDA.
+    fragment_id_pattern = (
+        r"(?:id\s*(?:de\s*)?venda|codigo\s*(?:da\s*)?venda|cliente\s*id|id\s*cliente)\s*"
+        r"([a-zA-Z0-9_-]{1,30})"
+    )
     for fragment in fragments:
-        id_match = re.search(id_pattern, fragment, flags=re.IGNORECASE)
+        id_match = re.search(fragment_id_pattern, fragment, flags=re.IGNORECASE)
         if id_match:
             possible_id = id_match.group(1).strip().upper()
             if _is_probable_sale_id(possible_id):
@@ -2531,10 +2536,6 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
     raw_text = message.strip()
     norm_text = _normalize(raw_text)
     numbers = _currency_candidates(raw_text)
-    sale_id = _extract_target_sale_id_for_updates(raw_text)
-    material_allocations = _extract_material_allocations(raw_text, reference_date)
-    if not sale_id and material_allocations:
-        sale_id = material_allocations[0].sale_id
     status_value = _extract_status_value(raw_text)
     sale_creation_context = any(
         token in norm_text
@@ -2553,6 +2554,15 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
             "compraram",
         )
     )
+    if sale_creation_context:
+        # Nova venda: ID VENDA só é gerado ao salvar na planilha.
+        material_allocations: list[MaterialAllocation] = []
+        sale_id = _extract_sale_id_from_text(raw_text)
+    else:
+        sale_id = _extract_target_sale_id_for_updates(raw_text)
+        material_allocations = _extract_material_allocations(raw_text, reference_date)
+        if not sale_id and material_allocations:
+            sale_id = material_allocations[0].sale_id
 
     customer = _extract_customer(raw_text) or ""
     if sale_id and customer:

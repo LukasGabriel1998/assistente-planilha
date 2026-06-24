@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -170,6 +171,14 @@ MAIN_MENU_KEYBOARD = {
     "one_time_keyboard": False,
 }
 
+QUICK_DASHBOARD_KEYWORDS = (
+    "resumo",
+    "status",
+    "planilha",
+    "prévia",
+    "previa",
+)
+
 _FONT_CACHE: dict[tuple[int, bool], object] = {}
 
 
@@ -226,6 +235,34 @@ def send_chat_action(chat_id: int | str, action: str = "typing") -> None:
         )
     except Exception:
         pass
+
+
+def _pulse_chat_action(chat_id: int | str, action: str, stop_event: threading.Event) -> None:
+    """Mantém o indicador de digitação/envio ativo enquanto uma operação demorada roda."""
+    send_chat_action(chat_id, action)
+    while not stop_event.wait(4.0):
+        send_chat_action(chat_id, action)
+
+
+def _run_with_chat_action(chat_id: int | str, action: str, func):
+    """Executa `func` renovando o chat action a cada poucos segundos."""
+    stop = threading.Event()
+    worker = threading.Thread(
+        target=_pulse_chat_action,
+        args=(chat_id, action, stop),
+        daemon=True,
+    )
+    worker.start()
+    try:
+        return func()
+    finally:
+        stop.set()
+        worker.join(timeout=1.0)
+
+
+def _is_quick_dashboard_command(text: str) -> bool:
+    cmd_strip = (text or "").strip().lower()
+    return any(cmd_strip == kw or cmd_strip.startswith(kw) for kw in QUICK_DASHBOARD_KEYWORDS)
 
 
 def _maybe_build_text_image_png(text: str) -> str | None:
@@ -890,6 +927,27 @@ def _notify_spreadsheet_saving(chat_id: int | str, intent: str = "", *, batch: b
     send_chat_action(chat_id, "typing")
 
 
+def _dashboard_wait_message(cmd_strip: str) -> str:
+    if cmd_strip.startswith(("prévia", "previa")):
+        title = "a prévia"
+        detail = "pendências e entregas"
+    elif cmd_strip.startswith("status"):
+        title = "o status financeiro"
+        detail = "lucro e totais"
+    else:
+        title = "o resumo"
+        detail = "totais da planilha"
+    return (
+        f"⏳ *Gerando {title}...*\n"
+        f"Lendo a planilha ({detail}). Aguarde — não precisa clicar de novo."
+    )
+
+
+def _notify_dashboard_loading(chat_id: int | str, cmd_strip: str) -> None:
+    send_message(chat_id, _dashboard_wait_message(cmd_strip), parse_mode="Markdown")
+    send_chat_action(chat_id, "upload_photo")
+
+
 def _requests_get_with_retry(
     url: str,
     *,
@@ -1346,6 +1404,67 @@ def _build_dashboard_reply(cmd_strip: str) -> tuple[str, str | None]:
     return reply, img_path
 
 
+def _handle_quick_dashboard_command(
+    chat_id: int | str,
+    text: str,
+    *,
+    pending_preview: dict,
+    quick_menu_processing: set[int | str],
+    quick_menu_cooldown: dict[int | str, float],
+) -> bool:
+    """Prévia / Resumo / Status do menu rápido. Retorna True se tratou o comando."""
+    cmd_strip = (text or "").strip().lower()
+    if not _is_quick_dashboard_command(cmd_strip):
+        return False
+    if not cmd_strip.startswith(("status", "resumo", "planilha", "prévia", "previa")):
+        return False
+
+    now = time.time()
+    if chat_id in quick_menu_processing or now < quick_menu_cooldown.get(chat_id, 0.0):
+        send_message(
+            chat_id,
+            "⏳ *Ainda preparando a resposta anterior...*\n"
+            "Aguarde alguns segundos — não precisa tocar no botão de novo.",
+            parse_mode="Markdown",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+        send_chat_action(chat_id, "typing")
+        return True
+
+    quick_menu_processing.add(chat_id)
+    pending_preview.pop(chat_id, None)
+    _notify_dashboard_loading(chat_id, cmd_strip)
+    img_path: str | None = None
+    try:
+        caption, img_path = _run_with_chat_action(
+            chat_id,
+            "upload_photo",
+            lambda: _build_dashboard_reply(cmd_strip),
+        )
+        send_reply(
+            chat_id,
+            caption,
+            parse_mode="Markdown",
+            reply_markup=MAIN_MENU_KEYBOARD,
+            image_path=img_path,
+        )
+    except Exception as exc:
+        send_message(
+            chat_id,
+            f"Erro ao gerar relatório: {exc}",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+    finally:
+        if img_path:
+            try:
+                Path(img_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        quick_menu_processing.discard(chat_id)
+        quick_menu_cooldown[chat_id] = time.time() + 3.0
+    return True
+
+
 def _send_batch_update_preview(
     chat_id: int | str,
     batch_results: list,
@@ -1747,6 +1866,8 @@ def run_polling() -> None:
     last_customer_by_chat: dict[int | str, str] = {}
     last_sale_id_by_chat: dict[int | str, str] = {}
     pending_overdue_delivery: dict[int | str, dict] = {}
+    quick_menu_processing: set[int | str] = set()
+    quick_menu_cooldown: dict[int | str, float] = {}
     last_reminder_check = 0.0
     last_status_ping = time.time()
     status_interval_s = 120.0
@@ -2077,8 +2198,18 @@ def run_polling() -> None:
                     send_message(chat_id, "❌ Cancelado. Pode enviar os dados de novo quando quiser.", reply_markup=MAIN_MENU_KEYBOARD)
                     continue
 
+                # Menu rápido (Prévia/Resumo/Status): feedback imediato + anti clique duplo
+                if _handle_quick_dashboard_command(
+                    chat_id,
+                    text,
+                    pending_preview=pending_preview,
+                    quick_menu_processing=quick_menu_processing,
+                    quick_menu_cooldown=quick_menu_cooldown,
+                ):
+                    continue
+
                 # Correção pontual da prévia (Cliente/Produto/Valor) antes de confirmar
-                if chat_id in pending_preview and text.strip():
+                if chat_id in pending_preview and text.strip() and not _is_quick_dashboard_command(text):
                     if should_replace_pending_preview(text):
                         pending_preview.pop(chat_id, None)
                     else:
@@ -2231,40 +2362,6 @@ def run_polling() -> None:
                 if _try_handle_multi_sales_same_customer(chat_id, text, pending_preview):
                     continue
                 if _try_handle_batch_sale_updates(chat_id, text, pending_preview):
-                    continue
-
-                # Comandos curtos (Resumo/Status/Prévia/Planilha): não usam prévia
-                cmd_lower = text.lower()
-                short_cmd_keywords = (
-                    "resumo",
-                    "status",
-                    "planilha",
-                    "prévia",
-                    "previa",
-                )
-                cmd_strip = cmd_lower.strip()
-                if any(cmd_strip.startswith(kw) for kw in short_cmd_keywords):
-                    pending_preview.pop(chat_id, None)
-                    if cmd_strip.startswith(("status", "resumo", "planilha", "prévia", "previa")):
-                        send_chat_action(chat_id, "upload_photo")
-                        caption, img_path = _build_dashboard_reply(cmd_strip)
-                    else:
-                        caption = process_command(text, origin="telegram")
-                        img_path = None
-                    try:
-                        send_reply(
-                            chat_id,
-                            caption,
-                            parse_mode="Markdown",
-                            reply_markup=MAIN_MENU_KEYBOARD,
-                            image_path=img_path,
-                        )
-                    finally:
-                        if img_path:
-                            try:
-                                Path(img_path).unlink(missing_ok=True)
-                            except Exception:
-                                pass
                     continue
 
                 # Interpretar mensagem: se tiver dados completos, mostrar prévia; senão, pedir o que falta
