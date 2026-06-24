@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
 
@@ -1032,26 +1033,32 @@ def _spreadsheet_saving_wait_message(
     return body
 
 
-class _SpreadsheetSavingTimer:
-    """Envia mensagem de salvamento e atualiza o cronômetro a cada segundo."""
+class _LiveWaitTimer:
+    """Envia mensagem de aguarde e atualiza o cronômetro a cada segundo."""
 
-    def __init__(self, chat_id: int | str, intent: str = "", *, batch: bool = False) -> None:
+    def __init__(
+        self,
+        chat_id: int | str,
+        build_message: Callable[[float], str],
+        *,
+        chat_action: str = "typing",
+    ) -> None:
         self.chat_id = chat_id
-        self.intent = intent
-        self.batch = batch
+        self.build_message = build_message
+        self.chat_action = chat_action
         self.message_id: int | None = None
         self._stop = threading.Event()
         self._started = 0.0
         self._worker: threading.Thread | None = None
 
-    def __enter__(self) -> "_SpreadsheetSavingTimer":
+    def __enter__(self) -> "_LiveWaitTimer":
         self._started = time.monotonic()
         self.message_id = send_message(
             self.chat_id,
-            _spreadsheet_saving_wait_message(self.intent, batch=self.batch, elapsed_sec=0),
+            self.build_message(0),
             parse_mode="Markdown",
         )
-        send_chat_action(self.chat_id, "typing")
+        send_chat_action(self.chat_id, self.chat_action)
         if self.message_id:
             self._worker = threading.Thread(target=self._run_ticks, daemon=True)
             self._worker.start()
@@ -1072,14 +1079,10 @@ class _SpreadsheetSavingTimer:
             edit_chat_message(
                 self.chat_id,
                 self.message_id,
-                _spreadsheet_saving_wait_message(
-                    self.intent,
-                    batch=self.batch,
-                    elapsed_sec=elapsed,
-                ),
+                self.build_message(elapsed),
                 parse_mode="Markdown",
             )
-            send_chat_action(self.chat_id, "typing")
+            send_chat_action(self.chat_id, self.chat_action)
 
 
 def _spreadsheet_saving_timer(
@@ -1087,8 +1090,11 @@ def _spreadsheet_saving_timer(
     intent: str = "",
     *,
     batch: bool = False,
-) -> _SpreadsheetSavingTimer:
-    return _SpreadsheetSavingTimer(chat_id, intent, batch=batch)
+) -> _LiveWaitTimer:
+    def build_message(elapsed: float) -> str:
+        return _spreadsheet_saving_wait_message(intent, batch=batch, elapsed_sec=elapsed)
+
+    return _LiveWaitTimer(chat_id, build_message)
 
 
 def _notify_spreadsheet_saving(chat_id: int | str, intent: str = "", *, batch: bool = False) -> None:
@@ -1113,7 +1119,7 @@ def _audio_download_read_timeout(*, file_size: int = 0, duration_sec: int = 0) -
     return min(env_max, max(180, by_size, by_duration))
 
 
-def _audio_processing_wait_message(duration_sec: int) -> str:
+def _audio_processing_wait_message(duration_sec: int, *, elapsed_sec: float | None = None) -> str:
     if duration_sec >= 120:
         wait_hint = "cerca de 2 a 4 minutos"
     elif duration_sec >= 60:
@@ -1122,11 +1128,20 @@ def _audio_processing_wait_message(duration_sec: int) -> str:
         wait_hint = "30 segundos a 1 minuto"
     else:
         wait_hint = "alguns segundos"
-    duration_line = f" ({duration_sec}s)" if duration_sec > 0 else ""
-    return (
-        f"⏳ *Processando áudio...*{duration_line}\n"
+    body = (
+        f"⏳ *Processando áudio...*\n"
         f"Pode levar {wait_hint}. Aguarde — não envie outra mensagem ainda."
     )
+    if elapsed_sec is not None:
+        body += f"\n⏱️ Tempo: *{_format_elapsed_timer(elapsed_sec)}*"
+    return body
+
+
+def _audio_processing_timer(chat_id: int | str, duration_sec: int) -> _LiveWaitTimer:
+    def build_message(elapsed: float) -> str:
+        return _audio_processing_wait_message(duration_sec, elapsed_sec=elapsed)
+
+    return _LiveWaitTimer(chat_id, build_message)
 
 
 def _dashboard_wait_message(cmd_strip: str) -> str:
@@ -2137,43 +2152,38 @@ def run_polling() -> None:
                     try:
                         duration_sec = int(voice_payload.get("duration") or 0)
                         hinted_size = int(voice_payload.get("file_size") or 0)
-                        send_message(
-                            chat_id,
-                            _audio_processing_wait_message(duration_sec),
-                            parse_mode="Markdown",
-                        )
-                        send_chat_action(chat_id, "typing")
-                        audio_path = download_telegram_voice(
-                            file_id,
-                            duration_sec=duration_sec,
-                            hinted_file_size=hinted_size,
-                        )
-                        try:
-                            whisper_model = os.getenv("WHISPER_MODEL", "small")
-                            if duration_sec >= 60:
-                                print(
-                                    f"[Telegram] Transcrevendo audio longo ({duration_sec}s) "
-                                    f"com modelo {whisper_model}..."
-                                )
-                            text = transcribe_audio(audio_path, model_size=whisper_model)
-                            from_voice = True
-                            preview_text = text
-                            if len(preview_text) > 3500:
-                                preview_text = preview_text[:3500] + "\n\n… _(texto truncado na exibição)_"
-                            send_message(
-                                chat_id,
-                                "🎤 *Áudio entendido!*\n\n"
-                                f"{preview_text}\n\n"
-                                "Agora vou montar a prévia do lançamento. Confira os campos e responda *SIM* para salvar, "
-                                "ou envie a correção por texto.",
-                                parse_mode="Markdown",
-                                reply_markup=MAIN_MENU_KEYBOARD,
+                        with _audio_processing_timer(chat_id, duration_sec):
+                            audio_path = download_telegram_voice(
+                                file_id,
+                                duration_sec=duration_sec,
+                                hinted_file_size=hinted_size,
                             )
-                        finally:
                             try:
-                                Path(audio_path).unlink(missing_ok=True)
-                            except Exception:
-                                pass
+                                whisper_model = os.getenv("WHISPER_MODEL", "small")
+                                if duration_sec >= 60:
+                                    print(
+                                        f"[Telegram] Transcrevendo audio longo ({duration_sec}s) "
+                                        f"com modelo {whisper_model}..."
+                                    )
+                                text = transcribe_audio(audio_path, model_size=whisper_model)
+                                from_voice = True
+                                preview_text = text
+                                if len(preview_text) > 3500:
+                                    preview_text = preview_text[:3500] + "\n\n… _(texto truncado na exibição)_"
+                                send_message(
+                                    chat_id,
+                                    "🎤 *Áudio entendido!*\n\n"
+                                    f"{preview_text}\n\n"
+                                    "Agora vou montar a prévia do lançamento. Confira os campos e responda *SIM* para salvar, "
+                                    "ou envie a correção por texto.",
+                                    parse_mode="Markdown",
+                                    reply_markup=MAIN_MENU_KEYBOARD,
+                                )
+                            finally:
+                                try:
+                                    Path(audio_path).unlink(missing_ok=True)
+                                except Exception:
+                                    pass
                     except TranscriptionError as e:
                         send_message(chat_id, f"Não consegui transcrever o áudio: {e}")
                         continue
