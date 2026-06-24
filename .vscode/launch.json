@@ -15,6 +15,7 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/telegram_bot.py",
+      "python": "${workspaceFolder}/.venv_native/Scripts/python.exe",
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "justMyCode": true
@@ -24,6 +25,7 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/launcher.py",
+      "python": "${workspaceFolder}/.venv_native/Scripts/python.exe",
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "justMyCode": true
@@ -33,6 +35,7 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/n8n_api.py",
+      "python": "${workspaceFolder}/.venv_native/Scripts/python.exe",
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "justMyCode": true

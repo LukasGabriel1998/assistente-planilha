@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+_PROJECT_DIR = Path(__file__).resolve().parent
+if str(_PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_DIR))
+
+from src.bootstrap import relaunch_in_project_venv
+
+relaunch_in_project_venv()
+
 import argparse
 import ctypes
 import os

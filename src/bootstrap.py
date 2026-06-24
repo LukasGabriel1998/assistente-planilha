@@ -37,8 +37,83 @@ def venv_python() -> Path:
     return VENV_DIR / "bin" / "python"
 
 
+def _is_debug_session() -> bool:
+    if sys.gettrace() is not None:
+        return True
+    if "debugpy" in sys.modules:
+        return True
+    return any("debugpy" in str(arg) for arg in sys.argv)
+
+
+def _venv_site_packages() -> Path | None:
+    if sys.platform == "win32":
+        candidate = VENV_DIR / "Lib" / "site-packages"
+    else:
+        candidate = (
+            VENV_DIR
+            / "lib"
+            / f"python{sys.version_info.major}.{sys.version_info.minor}"
+            / "site-packages"
+        )
+    return candidate if candidate.is_dir() else None
+
+
+def _use_venv_packages_in_place() -> bool:
+    """Permite rodar com debug (F5) mesmo se o interpretador errado estiver selecionado."""
+    site = _venv_site_packages()
+    if site is None:
+        return False
+    site_str = str(site)
+    if site_str not in sys.path:
+        sys.path.insert(0, site_str)
+    return True
+
+
+def relaunch_in_project_venv() -> None:
+    """Garante que scripts de entrada rodem com o Python do .venv_native."""
+    configure_stdio()
+    venv_py = venv_python()
+    if not venv_py.is_file():
+        return
+
+    try:
+        if Path(sys.executable).resolve() == venv_py.resolve():
+            return
+    except Exception:
+        pass
+
+    if _is_debug_session():
+        if _use_venv_packages_in_place():
+            return
+        log(
+            "Ambiente virtual encontrado, mas pacotes ainda nao instalados. "
+            "Rode run_project.py antes de iniciar o bot.",
+        )
+        raise SystemExit(1)
+
+    log(f"Usando ambiente virtual: {venv_py}")
+    proc = subprocess.run([str(venv_py), *sys.argv], cwd=str(PROJECT_DIR))
+    raise SystemExit(proc.returncode)
+
+
+def configure_stdio() -> None:
+    """Evita UnicodeEncodeError no terminal Windows (cp1252)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def log(msg: str, *, prefix: str = "Projeto") -> None:
-    print(f"[{prefix}] {msg}", flush=True)
+    text = f"[{prefix}] {msg}"
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(text.encode(encoding, errors="replace").decode(encoding), flush=True)
 
 
 def python_works(exe: Path) -> bool:
@@ -56,17 +131,120 @@ def python_works(exe: Path) -> bool:
         return False
 
 
-def find_bootstrap_python() -> list[str]:
+def _dedupe_python_candidates(candidates: list[list[str]]) -> list[list[str]]:
+    seen: set[tuple[str, ...]] = set()
+    unique: list[list[str]] = []
+    for cmd in candidates:
+        key = tuple(cmd)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(cmd)
+    return unique
+
+
+def find_bootstrap_python_candidates() -> list[list[str]]:
+    """Lista Pythons do sistema para tentar criar o venv (ordem de preferencia)."""
     candidates: list[list[str]] = []
     if sys.executable:
         candidates.append([sys.executable])
+
     if shutil.which("py"):
         candidates.append(["py", "-3"])
+        for minor in range(14, 11, -1):
+            candidates.append(["py", f"-3.{minor}"])
+        try:
+            proc = subprocess.run(
+                ["py", "-0p"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if proc.returncode == 0:
+                for line in proc.stdout.splitlines():
+                    if "-V:" not in line:
+                        continue
+                    version = line.split("-V:", 1)[1].split()[0].strip()
+                    if version:
+                        candidates.append(["py", f"-{version}"])
+                    parts = line.split()
+                    if parts and (parts[-1].endswith(".exe") or "python" in parts[-1].lower()):
+                        candidates.append([parts[-1]])
+        except Exception:
+            pass
+
     if shutil.which("python3"):
         candidates.append(["python3"])
     if shutil.which("python"):
         candidates.append(["python"])
-    return candidates[0] if candidates else [sys.executable]
+
+    deduped = _dedupe_python_candidates(candidates)
+    return deduped if deduped else ([sys.executable] if sys.executable else [])
+
+
+def bootstrap_python_works(bootstrap: list[str]) -> bool:
+    try:
+        proc = subprocess.run(
+            [*bootstrap, "-c", "import sys; sys.exit(0)"],
+            cwd=str(PROJECT_DIR),
+            capture_output=True,
+            timeout=30,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def python_has_module(bootstrap: list[str], module: str) -> bool:
+    try:
+        proc = subprocess.run(
+            [*bootstrap, "-c", f"import {module}"],
+            cwd=str(PROJECT_DIR),
+            capture_output=True,
+            timeout=30,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _run_bootstrap(
+    bootstrap: list[str], args: list[str], *, capture: bool = False
+) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+    kwargs: dict = {"cwd": str(PROJECT_DIR), "timeout": 300}
+    if capture:
+        kwargs["capture_output"] = True
+        kwargs["text"] = True
+    return subprocess.run([*bootstrap, *args], **kwargs)
+
+
+def create_venv_with(bootstrap: list[str]) -> tuple[bool, str]:
+    """Tenta criar .venv_native com venv ou, em fallback, virtualenv."""
+    last_err = ""
+
+    if python_has_module(bootstrap, "venv"):
+        proc = _run_bootstrap(bootstrap, ["-m", "venv", str(VENV_DIR)], capture=True)
+        if proc.returncode == 0 and python_works(venv_python()):
+            return True, ""
+        last_err = ((proc.stderr or proc.stdout or "").strip()) or f"venv falhou (codigo {proc.returncode})"
+    else:
+        last_err = "modulo venv ausente"
+
+    if not python_has_module(bootstrap, "pip"):
+        _run_bootstrap(bootstrap, ["-m", "ensurepip", "--default-pip"], capture=True)
+
+    if python_has_module(bootstrap, "pip"):
+        _run_bootstrap(bootstrap, ["-m", "pip", "install", "virtualenv"], capture=True)
+        if python_has_module(bootstrap, "virtualenv"):
+            proc = _run_bootstrap(
+                bootstrap, ["-m", "virtualenv", str(VENV_DIR)], capture=True
+            )
+            if proc.returncode == 0 and python_works(venv_python()):
+                return True, ""
+            detail = (proc.stderr or proc.stdout or "").strip()
+            last_err = detail or last_err or f"virtualenv falhou (codigo {proc.returncode})"
+
+    return False, last_err
 
 
 def activate_project_context() -> None:
@@ -87,15 +265,26 @@ def ensure_venv(*, prefix: str = "Projeto") -> Path:
         shutil.rmtree(VENV_DIR, ignore_errors=True)
 
     log("Criando ambiente virtual (.venv_native) ...", prefix=prefix)
-    bootstrap = find_bootstrap_python()
-    proc = subprocess.run([*bootstrap, "-m", "venv", str(VENV_DIR)], cwd=str(PROJECT_DIR))
-    if proc.returncode != 0 or not python_works(py):
-        raise SystemExit(
-            "Nao foi possivel criar .venv_native.\n"
-            "Instale Python 3.12+ em https://www.python.org/downloads/ e tente de novo."
-        )
-    log("Ambiente virtual criado.", prefix=prefix)
-    return py
+    errors: list[str] = []
+    for bootstrap in find_bootstrap_python_candidates():
+        label = " ".join(bootstrap)
+        if not bootstrap_python_works(bootstrap):
+            errors.append(f"{label}: Python nao respondeu")
+            continue
+        ok, detail = create_venv_with(bootstrap)
+        if ok:
+            log(f"Ambiente virtual criado ({label}).", prefix=prefix)
+            return py
+        if detail:
+            errors.append(f"{label}: {detail}")
+
+    detail = "\n".join(f"  - {line}" for line in errors) if errors else "  - nenhum Python utilizavel"
+    raise SystemExit(
+        "Nao foi possivel criar .venv_native.\n"
+        f"Tentativas:\n{detail}\n\n"
+        "Instale Python 3.12+ completo em https://www.python.org/downloads/\n"
+        "(marque 'Add python.exe to PATH' e 'pip') e tente de novo."
+    )
 
 
 def ensure_requirements(py: Path, *, verbose: bool = True, prefix: str = "Projeto") -> None:
@@ -306,14 +495,14 @@ def print_ready_message(*, prefix: str = "Projeto") -> None:
     log("", prefix=prefix)
     if telegram_ready and python_works(py):
         log("Tudo pronto para o Telegram.", prefix=prefix)
-        log("Proximo passo: abra telegram_bot.py e clique em Run (▶).", prefix=prefix)
+        log("Proximo passo: abra telegram_bot.py e clique em Run.", prefix=prefix)
     elif not telegram_ready:
         log("Setup concluido, mas falta configurar o Telegram.", prefix=prefix)
         log(f"1) Abra o .env e cole o TELEGRAM_BOT_TOKEN", prefix=prefix)
-        log("2) Depois abra telegram_bot.py e clique em Run (▶).", prefix=prefix)
+        log("2) Depois abra telegram_bot.py e clique em Run.", prefix=prefix)
     else:
         log("Setup concluido com avisos — revise o resumo acima.", prefix=prefix)
-        log("Depois rode telegram_bot.py (Run ▶).", prefix=prefix)
+        log("Depois rode telegram_bot.py (Run).", prefix=prefix)
 
     log("App desktop (opcional): launcher.py", prefix=prefix)
     log("API n8n (opcional): n8n_api.py", prefix=prefix)
@@ -484,6 +673,7 @@ def stop_old_bot_instances(*, prefix: str = "Projeto") -> None:
 
 def setup_project(*, verbose: bool = True, prefix: str = "Projeto") -> Path:
     """Prepara tudo: Python, venv, pip, .env, planilha, modelo Whisper e Git LFS."""
+    configure_stdio()
     activate_project_context()
     check_python_version(prefix=prefix)
     log(f"Pasta do projeto: {PROJECT_DIR}", prefix=prefix)

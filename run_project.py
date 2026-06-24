@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Prepara o projeto — clique em Run (▶) aqui antes de usar o sistema.
+Prepara o projeto — clique em Run aqui antes de usar o sistema.
 
 Instala/atualiza venv, bibliotecas, modelo Whisper, .env e planilha.
 Nao inicia o Telegram nem o App; depois rode telegram_bot.py (ou launcher.py).
