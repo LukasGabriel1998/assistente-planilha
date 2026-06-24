@@ -1276,9 +1276,9 @@ def _extract_target_sale_id_for_updates(text: str) -> Optional[str]:
     if not update_context:
         return None
     for pattern in (
-        r"\bcliente\s*id\s*[:\-]?\s*(\d{1,6})\b",
+        r"\bclientes?\s*id\s*[:\-]?\s*(\d{1,6})\b",
         r"\bid\s*cliente\s*[:\-]?\s*(\d{1,6})\b",
-        r"\bcliente\s+(\d{1,6})\b",
+        r"\bclientes?\s+(\d{1,6})\b",
     ):
         m = re.search(pattern, raw, flags=re.IGNORECASE)
         if m:
@@ -1321,8 +1321,9 @@ def extract_sale_ids_list_for_updates(text: str) -> list[str]:
 
     cluster_patterns = (
         r"\bid\s*(?:de\s*)?venda\s*[:\-]?\s*([0-9,\seE]+?)(?=\s+(?:foi\s+)?(?:entreg|pagou|pago|finaliz|recebeu|quit)|\s*(?:foi\s+)?(?:entreg|pagou|pago|finaliz|recebeu|quit)|[,.]|$)",
-        r"\bcliente\s*(?:id)?\s*[:\-]?\s*([0-9,\seE]+?)(?=\s+(?:foi\s+)?(?:entreg|pagou|pago|finaliz|recebeu|quit)|\s*(?:foi\s+)?(?:entreg|pagou|pago|finaliz|recebeu|quit)|[,.]|$)",
-        r"(?:atualiz\w*|marca\w*|confirma\w*)\s+(?:a[ií]\s+)?(?:que\s+)?(?:foi\s+)?(?:entreg\w*|pag\w*|quit\w*)\s+(?:cliente\s*)?(?:id\s*)?([0-9,\seE]+)",
+        r"\bclientes?\s*(?:id)?\s*[:\-]?\s*([0-9,\seE]+?)(?=\s+(?:foi\s+)?(?:entreg|pagou|pago|finaliz|recebeu|quit)|\s*(?:foi\s+)?(?:entreg|pagou|pago|finaliz|recebeu|quit)|[,.]|$)",
+        r"(?:atualiz\w*|marca\w*|confirma\w*)\s+(?:a[ií]\s+)?(?:que\s+)?(?:foi\s+)?(?:entreg\w*|pag\w*|quit\w*)\s+(?:clientes?\s*)?(?:id\s*)?([0-9,\seE]+)",
+        r"(?:foi\s+)?entreg\w*[^.\n]{0,80}clientes?\s*(?:id\s*)?([0-9,\seE]+)",
     )
     for pattern in cluster_patterns:
         match = re.search(pattern, lower, flags=re.IGNORECASE)
@@ -1330,6 +1331,11 @@ def extract_sale_ids_list_for_updates(text: str) -> list[str]:
             collected.extend(re.findall(r"\d{1,6}", match.group(1)))
             if collected:
                 break
+
+    if not collected:
+        tail = re.search(r"clientes?\s*id\s*(.+)$", lower, flags=re.IGNORECASE)
+        if tail and re.search(r"entreg|pagou|pago|quit|finaliz", lower, flags=re.IGNORECASE):
+            collected.extend(re.findall(r"\d{1,6}", tail.group(1)))
 
     if not collected:
         collected = re.findall(r"\bid\s*[:\-]?\s*(\d{1,6})\b", lower)
@@ -1720,6 +1726,12 @@ def _extract_amount_after_prefix(text: str, prefixes: list[str], max_gap_words: 
             if _is_money_like(token):
                 value = _parse_money_from_fragment(token)
                 if value is not None and value > 0:
+                    # Transcrição de áudio: "cinco mil" pode ser capturado só como "mil" (1000).
+                    if token.strip().lower() == "mil":
+                        word_fragment = _word_window_after_prefix(text, prefix)
+                        word_value = _parse_money_from_fragment(word_fragment, prefer_leading=True)
+                        if word_value is not None and word_value > value:
+                            return word_value
                     return value
         if re.search(prefix, norm_text, flags=re.IGNORECASE):
             word_fragment = _word_window_after_prefix(text, prefix)
@@ -1864,11 +1876,19 @@ def _extract_itemized_product_values(text: str) -> list[tuple[str, float]]:
     product_chunk = rf"(({product_word}(?:\s+(?!pra|para|pro|,|vendi|eu\b){product_word}){{0,2}}))"
     patterns = [
         re.compile(
+            rf"\b(?:o|a)\s+{product_chunk}\s+(?:ele\s+|eu\s+)?(?:ficou|fica|saiu)\s+(?:no\s+valor\s+de|em|por|a)\b",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
             rf"\b(?:o|a)\s+{product_chunk}\s+(?:eu\s+)?vendi\s+(?:no\s+valor\s+de|por)\b",
             flags=re.IGNORECASE,
         ),
         re.compile(
             rf"\bvendi\s+(?:um|uma|o|a)\s+{product_chunk}\s+(?:por|no\s+valor\s+de)\b",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            rf"\b(?:um|uma)\s+{product_chunk}\s+(?:no\s+valor\s+de|por|de)\s+",
             flags=re.IGNORECASE,
         ),
     ]
@@ -1990,6 +2010,103 @@ def _extract_item_payment_for_product(
     return float(total), 0.0, reference_date, reference_date
 
 
+def _multi_sale_shared_payment_hint(text: str) -> bool:
+    norm = _normalize(text)
+    hints = (
+        "das duas vendas",
+        "das duas",
+        "as duas vendas",
+        "os dois",
+        "entregar os dois",
+        "entrega dos dois",
+        "entrada das",
+        "entrada da",
+        "referente ja entrada",
+        "referente a entrada",
+        "referente à entrada",
+        "para as duas",
+        "dos dois produtos",
+        "dos dois servicos",
+        "dos dois serviços",
+    )
+    if any(h in norm for h in hints):
+        return True
+    return bool(
+        re.search(r"\b(?:pagou|paguei|me\s+pagou|pagaram)\b", norm)
+        and re.search(r"\b(?:um|uma)\s+\w+.*\be\s+(?:um|uma)\s+\w+", norm)
+    )
+
+
+def _extract_shared_entry_for_multi_sale(
+    text: str,
+    grand_total: float,
+    reference_date: date,
+) -> tuple[float, date] | None:
+    """Entrada única citada para várias vendas na mesma mensagem (ex.: pagou 5 mil das duas)."""
+    if grand_total <= 0.01:
+        return None
+    norm = _normalize(text)
+    if not _multi_sale_shared_payment_hint(text):
+        return None
+
+    entry: float | None = None
+    for prefix in (
+        r"me\s+pagou",
+        r"pagou",
+        r"paguei",
+        r"pagaram",
+        r"pagamos",
+        r"entrada\s+(?:de\s+)?",
+        r"deu\s+(?:uma\s+)?entrada",
+    ):
+        entry = _extract_amount_after_prefix(text, prefixes=[prefix], max_gap_words=5)
+        if entry is not None and entry > 0:
+            break
+
+    if entry is None and re.search(r"\b(?:pagou|paguei|me\s+pagou|pagaram)\b", norm):
+        for amount in sorted(_currency_candidates(text), reverse=True):
+            if 0 < amount < grand_total:
+                entry = float(amount)
+                break
+
+    if entry is None or entry <= 0:
+        return None
+
+    balance_date = reference_date
+    if any(tok in norm for tok in ("amanha", "amanhã", "restante", "saldo", "vai me pagar", "vai pagar")):
+        balance_date = max(reference_date + timedelta(days=1), balance_date)
+    balance_date = _extract_first_date_by_keywords(
+        text,
+        reference_date,
+        keywords=("restante", "saldo", "vai me pagar", "vai pagar", "entrega", "entregar"),
+    ) or balance_date
+
+    return min(float(entry), float(grand_total)), balance_date
+
+
+def _allocate_shared_entry_across_items(
+    items: list[tuple[str, float]],
+    entry_total: float,
+) -> list[tuple[float, float]]:
+    """Divide entrada única entre itens proporcionalmente ao valor de cada venda."""
+    grand_total = round(sum(total for _p, total in items), 2)
+    entry_total = round(min(float(entry_total), grand_total), 2)
+    if grand_total <= 0.01:
+        return [(0.0, 0.0) for _ in items]
+
+    allocations: list[tuple[float, float]] = []
+    remaining_entry = entry_total
+    for idx, (_product, total) in enumerate(items):
+        if idx == len(items) - 1:
+            entry = round(remaining_entry, 2)
+        else:
+            entry = round(entry_total * (float(total) / grand_total), 2)
+            remaining_entry = round(remaining_entry - entry, 2)
+        balance = round(max(float(total) - entry, 0.0), 2)
+        allocations.append((entry, balance))
+    return allocations
+
+
 def _build_sale_parse_result(
     *,
     customer: str,
@@ -2075,11 +2192,31 @@ def parse_multi_sales_message(
     if any(tok in norm for tok in ("amanha", "amanhã", "entreg", "entrega")):
         service_due_date = max(service_due_date or reference_date, reference_date + timedelta(days=1))
 
+    grand_total = round(sum(total for _p, total in items), 2)
+    shared_entry = _extract_shared_entry_for_multi_sale(raw, grand_total, reference_date)
+    shared_allocations: list[tuple[float, float]] | None = None
+    shared_balance_date: date | None = None
+    if shared_entry is not None:
+        shared_allocations = _allocate_shared_entry_across_items(items, shared_entry[0])
+        shared_balance_date = shared_entry[1]
+
     results: list[ParseResult] = []
-    for product, total in items:
-        entry, balance, entry_date, balance_date = _extract_item_payment_for_product(
-            raw, product, total, reference_date
-        )
+    for idx, (product, total) in enumerate(items):
+        if shared_allocations is not None:
+            entry, balance = shared_allocations[idx]
+            entry_date = reference_date
+            balance_date = shared_balance_date or reference_date
+            payment_warnings = [
+                "Venda separada gerada automaticamente a partir de varios produtos na mesma mensagem.",
+                f"Entrada total de R$ {shared_entry[0]:.2f} dividida proporcionalmente entre as vendas.",
+            ]
+        else:
+            entry, balance, entry_date, balance_date = _extract_item_payment_for_product(
+                raw, product, total, reference_date
+            )
+            payment_warnings = [
+                "Venda separada gerada automaticamente a partir de varios produtos na mesma mensagem."
+            ]
         if service_due_date and balance > 0.01:
             balance_date = max(balance_date, service_due_date)
         item_due = service_due_date or (balance_date if balance > 0.01 else entry_date)
@@ -2094,9 +2231,7 @@ def parse_multi_sales_message(
                 entry_date=entry_date,
                 balance_date=balance_date,
                 service_due_date=item_due,
-                warnings=[
-                    "Venda separada gerada automaticamente a partir de varios produtos na mesma mensagem."
-                ],
+                warnings=payment_warnings,
             )
         )
     return results if len(results) >= 2 else None
@@ -2982,6 +3117,9 @@ def detect_intent(message: str) -> str:
     if (not sale_creation_context) and _is_sale_delete_request(message):
         return "sale_delete"
     sale_id = _extract_target_sale_id_for_updates(message) or _extract_delete_sale_id(message)
+    multi_ids = extract_sale_ids_list_for_updates(message)
+    if not sale_id and multi_ids:
+        sale_id = multi_ids[0]
     status = _extract_status_value(message)
     material_cost = _extract_material_cost(message)
     if material_cost is None:

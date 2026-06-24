@@ -153,8 +153,7 @@ O bot usa sempre a *data de hoje*. Se a entrega era dia 21 e hoje é 23, e ainda
 
 ⚡ *Botões rápidos*
 📋 *Prévia* — vendas, pendências e entregas
-📊 *Resumo* — totais da planilha
-💹 *Status* — situação financeira
+📊 *Resumo* — totais da planilha, lucro e situação financeira
 🆕 *Nova conversa* — limpa o ID VENDA ativo e começa outro assunto
 
 🔁 *ID VENDA na conversa*
@@ -168,7 +167,7 @@ Depois que você informar um ID (ex.: `cliente id 004`), o bot mantém esse ID p
 # Teclado de menu (botões que aparecem abaixo do campo de digitação)
 MAIN_MENU_KEYBOARD = {
     "keyboard": [
-        ["Prévia", "Resumo", "Status"],
+        ["Prévia", "Resumo"],
         ["Ajuda", "Nova conversa"],
     ],
     "resize_keyboard": True,
@@ -932,10 +931,10 @@ def send_message(
     text: str,
     parse_mode: str | None = None,
     reply_markup: dict | None = None,
-) -> bool:
-    """Envia mensagem de texto para o chat."""
+) -> int | None:
+    """Envia mensagem de texto para o chat. Retorna message_id em caso de sucesso."""
     if not TELEGRAM_BOT_TOKEN:
-        return False
+        return None
     text = (text or "")[:4096]
     payload: dict = {"chat_id": chat_id, "text": text}
     if parse_mode:
@@ -944,10 +943,162 @@ def send_message(
         payload["reply_markup"] = reply_markup
     try:
         r = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=15)
-        return r.status_code == 200
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        result = data.get("result") or {}
+        message_id = result.get("message_id")
+        return int(message_id) if isinstance(message_id, int) else None
     except Exception as e:
         print(f"[Telegram] Erro ao enviar: {e}")
+        return None
+
+
+def delete_chat_message(chat_id: int | str, message_id: int | None) -> None:
+    """Remove mensagem temporária (ex.: aviso de aguarde)."""
+    if not TELEGRAM_BOT_TOKEN or not message_id:
+        return
+    try:
+        requests.post(
+            f"{BASE_URL}/deleteMessage",
+            json={"chat_id": str(chat_id), "message_id": int(message_id)},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def edit_chat_message(
+    chat_id: int | str,
+    message_id: int | None,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+) -> bool:
+    """Atualiza texto de uma mensagem já enviada (ex.: cronômetro de aguarde)."""
+    if not TELEGRAM_BOT_TOKEN or not message_id:
         return False
+    payload: dict = {
+        "chat_id": str(chat_id),
+        "message_id": int(message_id),
+        "text": (text or "")[:4096],
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    try:
+        r = requests.post(f"{BASE_URL}/editMessageText", json=payload, timeout=10)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _format_elapsed_timer(elapsed_sec: float) -> str:
+    total = max(0, int(elapsed_sec))
+    minutes, seconds = divmod(total, 60)
+    return f"{minutes}:{seconds:02d}"
+
+
+def _spreadsheet_saving_wait_message(
+    intent: str = "",
+    *,
+    batch: bool = False,
+    elapsed_sec: float | None = None,
+) -> str:
+    if batch:
+        body = (
+            "⏳ *Salvando na planilha...*\n"
+            "Atualizando vários registros. Aguarde um instante."
+        )
+    else:
+        intent = (intent or "").strip().lower()
+        action_labels = {
+            "sale": "a venda",
+            "material_update": "o material",
+            "status_update": "o status da venda",
+            "payment_update": "o pagamento",
+            "delivery_update": "a data de entrega",
+            "delivery_finalize": "a entrega",
+            "sale_delete": "a exclusão",
+            "refund": "o estorno",
+            "mixed_update": "a atualização",
+        }
+        action = action_labels.get(intent, "o lançamento")
+        body = (
+            "⏳ *Salvando na planilha...*\n"
+            f"Registrando {action}. Aguarde um instante."
+        )
+    if elapsed_sec is not None:
+        body += f"\n⏱️ Tempo: *{_format_elapsed_timer(elapsed_sec)}*"
+    return body
+
+
+class _SpreadsheetSavingTimer:
+    """Envia mensagem de salvamento e atualiza o cronômetro a cada segundo."""
+
+    def __init__(self, chat_id: int | str, intent: str = "", *, batch: bool = False) -> None:
+        self.chat_id = chat_id
+        self.intent = intent
+        self.batch = batch
+        self.message_id: int | None = None
+        self._stop = threading.Event()
+        self._started = 0.0
+        self._worker: threading.Thread | None = None
+
+    def __enter__(self) -> "_SpreadsheetSavingTimer":
+        self._started = time.monotonic()
+        self.message_id = send_message(
+            self.chat_id,
+            _spreadsheet_saving_wait_message(self.intent, batch=self.batch, elapsed_sec=0),
+            parse_mode="Markdown",
+        )
+        send_chat_action(self.chat_id, "typing")
+        if self.message_id:
+            self._worker = threading.Thread(target=self._run_ticks, daemon=True)
+            self._worker.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self._stop.set()
+        if self._worker:
+            self._worker.join(timeout=2.0)
+        delete_chat_message(self.chat_id, self.message_id)
+        return False
+
+    def _run_ticks(self) -> None:
+        while not self._stop.wait(1.0):
+            if not self.message_id:
+                continue
+            elapsed = time.monotonic() - self._started
+            edit_chat_message(
+                self.chat_id,
+                self.message_id,
+                _spreadsheet_saving_wait_message(
+                    self.intent,
+                    batch=self.batch,
+                    elapsed_sec=elapsed,
+                ),
+                parse_mode="Markdown",
+            )
+            send_chat_action(self.chat_id, "typing")
+
+
+def _spreadsheet_saving_timer(
+    chat_id: int | str,
+    intent: str = "",
+    *,
+    batch: bool = False,
+) -> _SpreadsheetSavingTimer:
+    return _SpreadsheetSavingTimer(chat_id, intent, batch=batch)
+
+
+def _notify_spreadsheet_saving(chat_id: int | str, intent: str = "", *, batch: bool = False) -> None:
+    """Compatibilidade: prefira `with _spreadsheet_saving_timer(...):`."""
+    send_message(
+        chat_id,
+        _spreadsheet_saving_wait_message(intent, batch=batch),
+        parse_mode="Markdown",
+    )
+    send_chat_action(chat_id, "typing")
 
 
 def _audio_download_read_timeout(*, file_size: int = 0, duration_sec: int = 0) -> int:
@@ -978,40 +1129,6 @@ def _audio_processing_wait_message(duration_sec: int) -> str:
     )
 
 
-def _spreadsheet_saving_wait_message(intent: str = "", *, batch: bool = False) -> str:
-    if batch:
-        return (
-            "⏳ *Salvando na planilha...*\n"
-            "Atualizando vários registros. Aguarde um instante."
-        )
-    intent = (intent or "").strip().lower()
-    action_labels = {
-        "sale": "a venda",
-        "material_update": "o material",
-        "status_update": "o status da venda",
-        "payment_update": "o pagamento",
-        "delivery_update": "a data de entrega",
-        "delivery_finalize": "a entrega",
-        "sale_delete": "a exclusão",
-        "refund": "o estorno",
-        "mixed_update": "a atualização",
-    }
-    action = action_labels.get(intent, "o lançamento")
-    return (
-        "⏳ *Salvando na planilha...*\n"
-        f"Registrando {action}. Aguarde um instante."
-    )
-
-
-def _notify_spreadsheet_saving(chat_id: int | str, intent: str = "", *, batch: bool = False) -> None:
-    send_message(
-        chat_id,
-        _spreadsheet_saving_wait_message(intent, batch=batch),
-        parse_mode="Markdown",
-    )
-    send_chat_action(chat_id, "typing")
-
-
 def _dashboard_wait_message(cmd_strip: str) -> str:
     if cmd_strip.startswith(("prévia", "previa")):
         title = "a prévia"
@@ -1021,16 +1138,17 @@ def _dashboard_wait_message(cmd_strip: str) -> str:
         detail = "lucro e totais"
     else:
         title = "o resumo"
-        detail = "totais da planilha"
+        detail = "lucro e totais da planilha"
     return (
         f"⏳ *Gerando {title}...*\n"
         f"Lendo a planilha ({detail}). Aguarde — não precisa clicar de novo."
     )
 
 
-def _notify_dashboard_loading(chat_id: int | str, cmd_strip: str) -> None:
-    send_message(chat_id, _dashboard_wait_message(cmd_strip), parse_mode="Markdown")
+def _notify_dashboard_loading(chat_id: int | str, cmd_strip: str) -> int | None:
+    send_chat_action(chat_id, "typing")
     send_chat_action(chat_id, "upload_photo")
+    return send_message(chat_id, _dashboard_wait_message(cmd_strip), parse_mode="Markdown")
 
 
 def _requests_get_with_retry(
@@ -1294,15 +1412,15 @@ def _try_handle_overdue_delivery_reply(
                 from src.excel_store import SpreadsheetService
 
                 svc = SpreadsheetService(wb_path)
-                _notify_spreadsheet_saving(chat_id, "delivery_finalize", batch=True)
-                ok_ids: list[str] = []
-                fail_ids: list[str] = []
-                for sid in targets:
-                    if svc.finalize_service(sid):
-                        ok_ids.append(sid)
-                        bucket.pop(sid, None)
-                    else:
-                        fail_ids.append(sid)
+                with _spreadsheet_saving_timer(chat_id, "delivery_finalize", batch=True):
+                    ok_ids: list[str] = []
+                    fail_ids: list[str] = []
+                    for sid in targets:
+                        if svc.finalize_service(sid):
+                            ok_ids.append(sid)
+                            bucket.pop(sid, None)
+                        else:
+                            fail_ids.append(sid)
                 if not bucket:
                     pending_overdue_delivery.pop(chat_id, None)
                 lines = []
@@ -1360,9 +1478,9 @@ def _try_handle_overdue_delivery_reply(
         from src.excel_store import SpreadsheetService
 
         svc = SpreadsheetService(wb_path)
-        _notify_spreadsheet_saving(chat_id, "delivery_finalize")
-        ok = svc.finalize_service(sale_id)
-        bucket.pop(sale_id, None)
+        with _spreadsheet_saving_timer(chat_id, "delivery_finalize"):
+            ok = svc.finalize_service(sale_id)
+            bucket.pop(sale_id, None)
         if not bucket:
             pending_overdue_delivery.pop(chat_id, None)
         if ok:
@@ -1497,7 +1615,7 @@ def _handle_quick_dashboard_command(
     quick_menu_processing: set[int | str],
     quick_menu_cooldown: dict[int | str, float],
 ) -> bool:
-    """Prévia / Resumo / Status do menu rápido. Retorna True se tratou o comando."""
+    """Prévia / Resumo do menu rápido. Retorna True se tratou o comando."""
     cmd_strip = (text or "").strip().lower()
     if not _is_quick_dashboard_command(cmd_strip):
         return False
@@ -1518,9 +1636,10 @@ def _handle_quick_dashboard_command(
 
     quick_menu_processing.add(chat_id)
     pending_preview.pop(chat_id, None)
-    send_chat_action(chat_id, "upload_photo")
+    wait_message_id: int | None = None
     img_path: str | None = None
     try:
+        wait_message_id = _notify_dashboard_loading(chat_id, cmd_strip)
         caption, img_path = _run_with_chat_action(
             chat_id,
             "upload_photo",
@@ -1540,6 +1659,7 @@ def _handle_quick_dashboard_command(
             reply_markup=MAIN_MENU_KEYBOARD,
         )
     finally:
+        delete_chat_message(chat_id, wait_message_id)
         if img_path:
             try:
                 Path(img_path).unlink(missing_ok=True)
@@ -1618,6 +1738,7 @@ def _try_handle_batch_sale_updates(
     is_delivery = (
         _is_service_delivery_finalized(text)
         or bool(re.search(r"\b(?:foi\s+)?entreg", lower))
+        or bool(re.search(r"\bentregues?\b", lower))
         or "finaliz" in lower
         or bool(re.search(r"\batualiz\w+.*entreg", lower))
     ) and not is_payment
@@ -2169,25 +2290,24 @@ def run_polling() -> None:
                             and len(batch_results) >= 2
                             and all(getattr(pr, "intent", "") == "sale" for pr in batch_results)
                         )
-                        _notify_spreadsheet_saving(
-                            chat_id,
-                            "sale_delete" if is_delete_batch else ("sale" if is_multi_sale_batch else ""),
-                            batch=True,
+                        _notify_intent = (
+                            "sale_delete" if is_delete_batch else ("sale" if is_multi_sale_batch else "")
                         )
-                        applied = 0
-                        replies: list[str] = []
-                        for pr in batch_results:
-                            try:
-                                reply_item = apply_parse_result(
-                                    pr,
-                                    origin=pending.get("origin", "telegram"),
-                                    original_text=pending.get("original_text", ""),
-                                    chat_id=str(chat_id),
-                                )
-                                replies.append(reply_item)
-                                applied += 1
-                            except Exception as e:
-                                replies.append(f"Falha em um item do lote: {e}")
+                        with _spreadsheet_saving_timer(chat_id, _notify_intent, batch=True):
+                            applied = 0
+                            replies: list[str] = []
+                            for pr in batch_results:
+                                try:
+                                    reply_item = apply_parse_result(
+                                        pr,
+                                        origin=pending.get("origin", "telegram"),
+                                        original_text=pending.get("original_text", ""),
+                                        chat_id=str(chat_id),
+                                    )
+                                    replies.append(reply_item)
+                                    applied += 1
+                                except Exception as e:
+                                    replies.append(f"Falha em um item do lote: {e}")
                         if is_delete_batch:
                             msg_out = (
                                 f"✅ Exclusão em lote concluída: {applied}/{len(batch_results)} registro(s).\n\n"
@@ -2254,13 +2374,13 @@ def run_polling() -> None:
                         )
                         continue
 
-                    _notify_spreadsheet_saving(chat_id, getattr(parse_result, "intent", ""))
-                    reply = apply_parse_result(
-                        parse_result,
-                        origin=origin,
-                        original_text=original_text,
-                        chat_id=str(chat_id),
-                    )
+                    with _spreadsheet_saving_timer(chat_id, getattr(parse_result, "intent", "")):
+                        reply = apply_parse_result(
+                            parse_result,
+                            origin=origin,
+                            original_text=original_text,
+                            chat_id=str(chat_id),
+                        )
                     remembered = sale_id_from_parse_result(parse_result)
                     if remembered:
                         last_sale_id_by_chat[chat_id] = remembered
@@ -2301,7 +2421,7 @@ def run_polling() -> None:
                     send_message(chat_id, "❌ Cancelado. Pode enviar os dados de novo quando quiser.", reply_markup=MAIN_MENU_KEYBOARD)
                     continue
 
-                # Menu rápido (Prévia/Resumo/Status): feedback imediato + anti clique duplo
+                # Menu rápido (Prévia/Resumo): feedback imediato + anti clique duplo
                 if _handle_quick_dashboard_command(
                     chat_id,
                     text,
@@ -2441,20 +2561,20 @@ def run_polling() -> None:
                         parse_result.command.service_due_date = parsed
                         if _is_service_delivery_finalized(raw):
                             parse_result.command.service_status = "finalizado"
-                        _notify_spreadsheet_saving(chat_id, getattr(parse_result, "intent", "sale"))
-                        reply = apply_parse_result(
-                            parse_result,
-                            origin=pending.get("origin", "telegram"),
-                            original_text=pending.get("original_text", ""),
-                            chat_id=str(chat_id),
-                        )
-                        if _is_service_delivery_finalized(raw):
-                            sale_id = getattr(parse_result.command, "sale_id", None)
-                            if sale_id:
-                                workbook_path = get_default_workbook()
-                                if workbook_path:
-                                    from src.excel_store import SpreadsheetService
-                                    SpreadsheetService(workbook_path).finalize_service(str(sale_id))
+                        with _spreadsheet_saving_timer(chat_id, getattr(parse_result, "intent", "sale")):
+                            reply = apply_parse_result(
+                                parse_result,
+                                origin=pending.get("origin", "telegram"),
+                                original_text=pending.get("original_text", ""),
+                                chat_id=str(chat_id),
+                            )
+                            if _is_service_delivery_finalized(raw):
+                                sale_id = getattr(parse_result.command, "sale_id", None)
+                                if sale_id:
+                                    workbook_path = get_default_workbook()
+                                    if workbook_path:
+                                        from src.excel_store import SpreadsheetService
+                                        SpreadsheetService(workbook_path).finalize_service(str(sale_id))
                         send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
                         pending_delivery.pop(chat_id, None)
                         continue
@@ -2463,13 +2583,13 @@ def run_polling() -> None:
                         pending = pending_delivery.pop(chat_id, None)
                         if pending:
                             parse_result = pending["parse_result"]
-                            _notify_spreadsheet_saving(chat_id, getattr(parse_result, "intent", "sale"))
-                            reply = apply_parse_result(
-                                parse_result,
-                                origin=pending.get("origin", "telegram"),
-                                original_text=pending.get("original_text", ""),
-                                chat_id=str(chat_id),
-                            )
+                            with _spreadsheet_saving_timer(chat_id, getattr(parse_result, "intent", "sale")):
+                                reply = apply_parse_result(
+                                    parse_result,
+                                    origin=pending.get("origin", "telegram"),
+                                    original_text=pending.get("original_text", ""),
+                                    chat_id=str(chat_id),
+                                )
                             send_message(
                                 chat_id,
                                 "Não entendi a data, então vou salvar sem Data de Entrega.",
