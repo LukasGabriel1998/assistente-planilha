@@ -135,6 +135,13 @@ def format_reply(intent: str, actions: list, error: str | None = None) -> str:
     if intent == "status_update" and actions:
         a = actions[0]
         return f"✅ *Status atualizado!*\n\nID VENDA: {a.get('sale_id', '')}\nPlanilha atualizada com sucesso."
+    if intent == "sale_value_update" and actions:
+        a = actions[0]
+        return (
+            f"✅ *Valor pendente atualizado!*\n\n"
+            f"ID VENDA: {a.get('sale_id', '')}\n"
+            f"Novo pendente: {_format_currency_pt(float(a.get('amount', 0)))}"
+        )
     if not actions:
         return "ℹ️ Nenhuma alteração foi feita na planilha."
     parts = []
@@ -240,6 +247,16 @@ def build_preview(parse_result: ParseResult) -> str:
                 pass
         lines.append(f"📅 Entrega será registrada em: *{due_txt}*")
         lines.append("_A célula de Data de Entrega ficará *verde* (serviço entregue) na planilha._")
+        lines.append("\nSe estiver correto, responda *SIM*. Para cancelar, responda *NÃO*.")
+        return "\n".join(lines)
+    if parse_result.intent == "sale_value_update":
+        cmd = parse_result.command
+        sale_id = getattr(cmd, "sale_id", None) or "-"
+        pending = getattr(cmd, "pending_amount_override", None)
+        lines = ["📋 *Entendi assim: atualizar valor pendente*", ""]
+        lines.append(f"🧾 ID VENDA: *{sale_id}*")
+        if pending is not None:
+            lines.append(f"💰 Novo pendente: *{_format_currency_pt(float(pending))}*")
         lines.append("\nSe estiver correto, responda *SIM*. Para cancelar, responda *NÃO*.")
         return "\n".join(lines)
     if parse_result.intent == "payment_update":
@@ -381,11 +398,9 @@ def build_preview(parse_result: ParseResult) -> str:
 
     # Prévia padrão (venda/estorno/misto/atualização de material)
     cmd = parse_result.command
-    sale_ctx = (
-        _load_sale_context_for_preview(str(cmd.sale_id))
-        if getattr(cmd, "sale_id", None)
-        else None
-    )
+    sale_ctx = None
+    if getattr(cmd, "sale_id", None) and parse_result.intent != "sale":
+        sale_ctx = _load_sale_context_for_preview(str(cmd.sale_id))
     customer = (cmd.customer or (sale_ctx or {}).get("customer") or "-").strip() or "-"
     product = (cmd.product_id or (sale_ctx or {}).get("product") or "-").strip() or "-"
     total_value = cmd.total_value or ((sale_ctx or {}).get("total_value") if sale_ctx else None)
@@ -407,6 +422,10 @@ def build_preview(parse_result: ParseResult) -> str:
             cost_amount = sum(float(a.amount) for a in cmd.material_allocations)
         if cost_amount:
             lines.append(f"🧱 Custo do serviço: *{_format_currency_pt(float(cost_amount))}*")
+        if getattr(cmd, "material_replace", False):
+            lines.append("_O custo anterior deste ID será *substituído* pelo valor acima._")
+        else:
+            lines.append("_Este valor será *somado* ao custo de material já registrado para este ID._")
         lines.append("")
         lines.append(
             "_A venda existente não será alterada — só o custo será registrado em Compras Matéria-Prima._"
@@ -575,6 +594,16 @@ def apply_parse_result(
             parse_result.delete_command, original_text=original_text, origin=origin
         )
         actions = [action]
+    elif parse_result.intent == "sale_value_update":
+        sale_id = str(getattr(cmd, "sale_id", None) or "").strip()
+        pending = getattr(cmd, "pending_amount_override", None)
+        if not sale_id or pending is None:
+            return "Faltou o *ID VENDA* ou o *valor pendente* para atualizar."
+        ok = service.update_sale_pending_amount(sale_id, float(pending))
+        if not ok:
+            return f"Não achei ID VENDA *{sale_id}* na planilha."
+        actions_dict = [{"sale_id": sale_id, "amount": float(pending), "label": "Pendente"}]
+        return format_reply("sale_value_update", actions_dict, error=None)
     else:
         actions = service.apply_command(
             cmd=parse_result.command, original_text=original_text, origin=origin, chat_id=chat_id

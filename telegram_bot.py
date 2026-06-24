@@ -42,7 +42,7 @@ from src.bot_processor import (
     process_command,
     sale_id_from_parse_result,
 )
-from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer, apply_multi_field_corrections, apply_preview_corrections, apply_batch_preview_corrections, extract_supplemental_sale_id, _extract_target_sale_id_for_updates, extract_sale_ids_list_for_updates, extract_delete_sale_ids_list, _is_sale_delete_request, parse_multi_sales_message, detect_intent
+from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer, apply_multi_field_corrections, apply_preview_corrections, apply_batch_preview_corrections, extract_supplemental_sale_id, _extract_target_sale_id_for_updates, extract_sale_ids_list_for_updates, extract_delete_sale_ids_list, _is_sale_delete_request, parse_multi_sales_message, detect_intent, sanitize_new_sale_identity
 from src.transcription import TranscriptionError, transcribe_audio
 
 # Carregar .env
@@ -95,86 +95,78 @@ def _acquire_single_instance_lock() -> None:
 HELP_TEXT = """👋 *Olá! Eu sou o assistente da sua planilha.*
 
 ⚙️ *Como funciona*
-🎙️ Você manda *áudio* ou *texto*
-📋 Eu mostro uma *prévia* com os dados
-✅ Você confirma com *SIM* ou *OK*
-💾 Pronto — salvo na planilha!
+1️⃣ Você manda *áudio*, *texto* ou o *formulário* abaixo
+2️⃣ Eu mostro uma *prévia*
+3️⃣ Você confirma com *SIM* ou *OK*
+4️⃣ Salvo na planilha ✅
 
 🔹🔹🔹
 
-🆕 *Exemplo 1 — registrar uma venda nova*
+🆕 *Exemplo 1 — venda nova (copie e preencha)*
 
-É a primeira vez dessa venda. Fale o *nome do cliente* e siga este roteiro — campo por campo:
+Siga o roteiro — uma linha por campo:
 
-👤 Cliente: _nome do cliente_
-📦 Produto: _o que foi vendido_
-📅 Data da venda: _hoje ou a data_
-💰 Valor total: _valor do pedido_
-   Pago: _entrada_ | Pendente: _o que falta_
-🔎 Status: _pendente ou pago_
-📅 Data de entrega: _quando entrega_
+```
+Cliente: nome do cliente
+Produto: o que foi vendido
+Data da venda: hoje
+Valor total: 3000
+Pago: entrada 1500
+Pendente: 1500
+Data de entrega: 25/06
+```
 
-💬 *Na prática, pode falar assim:*
-_"Vendi um letreiro para a Lucia hoje por 2200. Deu 700 de entrada, falta 1500 pro dia 25. Entrega na quarta."_
+💡 *Pagou tudo?* Troque as duas linhas de pagamento por:
+`Pago: a vista` ou `Status: pago`
 
-💡 Ao salvar, a planilha gera o 🧾 *ID VENDA* (ex.: 012). Guarde esse código para as próximas mensagens.
+💡 *Só material na hora da venda?* Adicione no final:
+`Material: 800`
 
-🔹🔹🔹
+💬 *Ou fale naturalmente:*
+_"Vendi um banner para a Lucia hoje por 2200. Deu 700 de entrada, falta 1500 pro dia 25."_
 
-📂 *Exemplo 2 — venda que já está na planilha*
-
-A venda já foi salva. Agora use o 🧾 *ID VENDA*:
-
-👤 Cliente: _já cadastrado_
-🧾 ID VENDA: _012_
-💰 Valor total: _já na planilha_
-   Pago: _atualizado_ | Pendente: _atualizado_
-🔎 Status: _pendente → pago_
-📅 Data de entrega: _já cadastrada_
-
-💬 *Cliente pagou o que faltava:*
-_"ID VENDA 012 recebeu o saldo de 1500 hoje."_
-
-💬 *Cliente quitou tudo:*
-_"ID VENDA 012 pagou tudo hoje."_
+Ao salvar, a planilha gera o 🧾 *ID VENDA* (ex.: 012). *Guarde esse código.*
 
 🔹🔹🔹
 
-🔧 *Exemplo 3 — algo aconteceu depois da venda*
+📂 *Exemplo 2 — venda já salva (sempre com ID VENDA)*
 
-Com o 🧾 *ID VENDA* em mãos, você também pode avisar:
+💬 *Cliente pagou:*
+`ID VENDA 012 pagou tudo hoje`
+
+💬 *Alterar entrega:*
+`ID 012 data de entrega 06/07`
+
+💬 *Alterar custo de material (substitui o anterior):*
+`ID 012 altera custo material para 897,80`
+
+💬 *Adicionar mais material (soma ao que já tem):*
+`ID 012 adiciona mais 200 de material` ou `Gastei 350 na ID 012`
+
+💬 *Alterar valor pendente:*
+`ID 012 altera pendente para 1500`
+
+🔹🔹🔹
+
+🔧 *Exemplo 3 — outras atualizações*
 
 💬 *Gasto com material:*
-_"Gastei 350 de tinta na ID VENDA 012."_
+`Gastei 350 na ID VENDA 012`
 
-💬 *Mudança na entrega:*
-_"A entrega da ID VENDA 012 ficou para sexta."_
-
-💬 *Vários de uma vez (entrega ou pagamento):*
-_"Foi entregue cliente id 004, 005 e 008"_
-_"ID VENDA 004, 005, 010 pagou"_
-_(mostra prévia do lote → confirme com *SIM*)_
-
-🔹🔹🔹
-
-🚚 *Entrega em atraso (amarelo na planilha)*
-O bot usa sempre a *data de hoje*. Se a entrega era dia 21 e hoje é 23, e ainda está *amarela*, ele cobra:
-✅ *SIM* → verde na planilha | ❌ *NÃO* → continua amarelo
+💬 *Vários de uma vez:*
+`ID 004, 005 pagou` ou `ID 004, 005 foi entregue`
 
 🔹🔹🔹
 
 ⚡ *Botões rápidos*
-📋 *Prévia* — vendas, pendências e entregas
-📊 *Resumo* — totais da planilha, lucro e situação financeira
-🆕 *Nova conversa* — limpa o ID VENDA ativo e começa outro assunto
+📋 *Prévia* | 📊 *Resumo* | 🆕 *Nova conversa*
 
 🔁 *ID VENDA na conversa*
-Depois que você informar um ID (ex.: `cliente id 004`), o bot mantém esse ID para custos, pagamentos e entregas até você tocar em *Nova conversa*.
+Depois que informar um ID, o bot mantém para custos, pagamentos e entregas até *Nova conversa*.
 
 ✅ *Depois da prévia*
-👍 Está certo → responda *SIM* ou *OK*
-✏️ Precisa ajustar → mande só o que mudou:
-`Cliente: Lucia, Valor: 2200, Entrada: 700`"""
+👍 Certo → *SIM* ou *OK*
+✏️ Ajustar → mande só o que mudou: `Entrada: 2000`"""
 
 # Teclado de menu (botões que aparecem abaixo do campo de digitação)
 MAIN_MENU_KEYBOARD = {
@@ -1564,6 +1556,7 @@ def _should_ask_delivery_date(parse_result, cmd) -> bool:
         "delivery_finalize",
         "sale_delete",
         "material_update",
+        "sale_value_update",
         "mixed_update",
     ):
         return False
@@ -1876,6 +1869,7 @@ def _try_handle_multi_sales_same_customer(
     chat_id: int | str,
     text: str,
     pending_preview: dict,
+    last_sale_id_by_chat: dict | None = None,
 ) -> bool:
     """Várias vendas (produtos distintos) para o mesmo cliente na mesma mensagem."""
     if detect_intent(text) != "sale":
@@ -1887,6 +1881,9 @@ def _try_handle_multi_sales_same_customer(
 
     if any(pr.missing_fields for pr in batch):
         return False
+
+    if last_sale_id_by_chat is not None:
+        last_sale_id_by_chat.pop(chat_id, None)
 
     from src.bot_processor import build_preview
 
@@ -1903,6 +1900,9 @@ def _try_handle_multi_sales_same_customer(
     parts.append(
         "\n💡 *Para corrigir uma venda:* "
         "*Venda 1: Entrada: 3000* ou *na venda um deu 3000 de entrada*."
+    )
+    parts.append(
+        "\n🔢 *Cada venda receberá um ID VENDA único* ao confirmar (ex.: 003, 004)."
     )
     send_message(chat_id, "\n\n".join(parts[:12]), parse_mode="Markdown")
     pending_preview[chat_id] = {
@@ -2318,6 +2318,8 @@ def run_polling() -> None:
                             applied = 0
                             replies: list[str] = []
                             for pr in batch_results:
+                                if getattr(pr, "intent", "") == "sale":
+                                    sanitize_new_sale_identity(pr.command)
                                 try:
                                     reply_item = apply_parse_result(
                                         pr,
@@ -2364,6 +2366,7 @@ def run_polling() -> None:
                         "payment_update",
                         "sale_delete",
                         "material_update",
+                        "sale_value_update",
                     ):
                         if "Cliente" in parse_result.missing_fields or not (cmd.customer or "").strip():
                             pending_preview[chat_id] = pending
@@ -2621,7 +2624,7 @@ def run_polling() -> None:
                 # Lote: vários ID VENDA — exclusão, entrega ou pagamento na mesma mensagem
                 if _try_handle_batch_delete(chat_id, text, pending_preview):
                     continue
-                if _try_handle_multi_sales_same_customer(chat_id, text, pending_preview):
+                if _try_handle_multi_sales_same_customer(chat_id, text, pending_preview, last_sale_id_by_chat):
                     continue
                 if _try_handle_batch_sale_updates(chat_id, text, pending_preview):
                     continue
@@ -2743,6 +2746,7 @@ def run_polling() -> None:
                         "delivery_update",
                         "delivery_finalize",
                         "material_update",
+                        "sale_value_update",
                         "sale_delete",
                     ):
                         preview_text = build_preview(parse_result)
@@ -2768,6 +2772,7 @@ def run_polling() -> None:
                         "delivery_update",
                         "delivery_finalize",
                         "material_update",
+                        "sale_value_update",
                         "sale_delete",
                     ):
                         preview_text = build_preview(parse_result)
@@ -2874,6 +2879,7 @@ def _run_local_test(args: argparse.Namespace) -> None:
         "delivery_update",
         "delivery_finalize",
         "material_update",
+        "sale_value_update",
         "sale_delete",
     ):
         preview_text = build_preview(parse_result)

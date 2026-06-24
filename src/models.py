@@ -67,4 +67,6 @@ class FinancialCommand:
     fixed_cost_date: Optional[date] = None
     service_due_date: Optional[date] = None
     service_status: Optional[str] = None
+    material_replace: bool = False
+    pending_amount_override: Optional[float] = None
     warnings: list[str] = field(default_factory=list)

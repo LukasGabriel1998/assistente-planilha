@@ -575,6 +575,15 @@ class SpreadsheetService:
                 return f"{candidate:03d}"
         return str(max_id + 1)
 
+    def _sale_id_exists_in_sales(self, ws, sale_id_col: str, sale_id: str) -> bool:
+        target = str(sale_id or "").strip()
+        if not target:
+            return False
+        for row in range(DATA_START_ROW, min(ws.max_row + 1, self.MAX_DATA_ROW)):
+            if str(ws[f"{sale_id_col}{row}"].value or "").strip() == target:
+                return True
+        return False
+
     @classmethod
     def _material_columns(cls, ws) -> dict[str, str]:
         headers = cls._header_map(ws, header_row=MATERIAL_HEADER_ROW)
@@ -1811,6 +1820,70 @@ class SpreadsheetService:
                 totals[sale_id] = round(totals.get(sale_id, 0.0) + amount, 2)
         return totals
 
+    def _clear_material_rows_for_sale(self, ws, sale_id: str) -> int:
+        """Remove linhas de material vinculadas a um ID VENDA (antes de substituir custo)."""
+        sale_id = str(sale_id or "").strip()
+        if not sale_id:
+            return 0
+        material_cols = self._material_columns(ws)
+        col_sid = material_cols.get("id venda")
+        if not col_sid:
+            return 0
+        mat_cols = (
+            material_cols["data"],
+            material_cols["descricao"],
+            material_cols["valor"],
+        )
+        if material_cols.get("fornecedor"):
+            mat_cols = (material_cols["fornecedor"],) + mat_cols
+        mat_cols = mat_cols + (col_sid,)
+        cleared = 0
+        for mat_row in range(DATA_START_ROW, min(ws.max_row + 1, self.MAX_DATA_ROW)):
+            if str(ws[f"{col_sid}{mat_row}"].value or "").strip() != sale_id:
+                continue
+            self._clear_row_values(ws, mat_row, mat_cols)
+            cleared += 1
+        return cleared
+
+    def update_sale_pending_amount(self, sale_id: str, new_pending: float) -> bool:
+        """Atualiza o valor pendente de uma venda pelo ID VENDA."""
+        sale_id = str(sale_id or "").strip()
+        if not sale_id:
+            return False
+        wb = self._open_workbook()
+        try:
+            sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
+            ws_sales = wb[sales_name]
+            sales_cols = self._sales_columns(ws_sales)
+            try:
+                row = self._find_sale_row(ws_sales, sales_cols["id venda"], sale_id)
+            except ValueError:
+                return False
+            paid = self._to_float(ws_sales[f"{sales_cols['total de vendas (pago)']}{row}"].value)
+            new_pending = round(max(float(new_pending), 0.0), 2)
+            ws_sales[f"{sales_cols['valor (pendente)']}{row}"] = float(new_pending)
+            pending_amount = new_pending
+            value_status = self._status_text(pending_amount)
+            template_ws, template_row = self._apply_anchor_row_style(
+                wb, ws_sales, row, SHEET_SALES, self._sales_style_cols(ws_sales)
+            )
+            value_status_display = self._match_text_case(
+                template_ws[f"{sales_cols['status de valor']}{template_row}"].value,
+                value_status,
+            )
+            ws_sales[f"{sales_cols['status de valor']}{row}"] = value_status_display
+            self._apply_sales_row_visual_status(
+                ws_sales,
+                sales_cols,
+                row,
+                pending_amount=pending_amount,
+                service_delivered=False,
+            )
+            self._save_workbook(wb)
+            return True
+        finally:
+            wb.close()
+
     def delete_sale(
         self,
         delete_cmd: DeleteSaleCommand,
@@ -1894,7 +1967,11 @@ class SpreadsheetService:
         pending_amount = round(sum(p.value for p in cmd.payments if p.status != "pago"), 2)
         if abs((paid_amount + pending_amount) - float(cmd.total_value or 0.0)) >= 0.01:
             pending_amount = round(max(float(cmd.total_value or 0.0) - paid_amount, 0.0), 2)
-        sale_id = (cmd.sale_id or "").strip() or self._generate_sale_id(ws, sales_cols["id venda"])
+        sale_id_col = sales_cols["id venda"]
+        sale_id = (cmd.sale_id or "").strip()
+        if sale_id and self._sale_id_exists_in_sales(ws, sale_id_col, sale_id):
+            sale_id = ""
+        sale_id = sale_id or self._generate_sale_id(ws, sale_id_col)
         value_status = self._status_text(pending_amount)
         value_status_display = self._match_text_case(
             template_ws[f"{sales_cols['status de valor']}{template_row}"].value,
@@ -2101,6 +2178,9 @@ class SpreadsheetService:
 
             if cmd.material_allocations:
                 for idx, allocation in enumerate(cmd.material_allocations, start=1):
+                    alloc_sale_id = str(allocation.sale_id).strip()
+                    if getattr(cmd, "material_replace", False) and alloc_sale_id:
+                        self._clear_material_rows_for_sale(ws_material, alloc_sale_id)
                     material_description = allocation.description or self._sale_product_by_id(ws_sales, allocation.sale_id)
                     if not material_description:
                         material_description = f"Material da venda {allocation.sale_id}"
@@ -2144,6 +2224,9 @@ class SpreadsheetService:
                 material_description = cmd.product_id or cmd.description
                 if created_sale_id and (not material_description or str(material_description).startswith("Material da venda ")):
                     material_description = self._sale_product_by_id(ws_sales, created_sale_id) or material_description
+                mat_sale_id = created_sale_id
+                if getattr(cmd, "material_replace", False) and mat_sale_id:
+                    self._clear_material_rows_for_sale(ws_material, str(mat_sale_id))
                 mat_row = self._append_material(
                     wb,
                     ws_material,

@@ -785,6 +785,152 @@ def _is_preview_field_correction(text: str) -> bool:
     )
 
 
+_STRUCTURED_SALE_LABEL_RE = re.compile(
+    r"(?i)^(?:[👤📦📅💰🔎🚚]\s*)?"
+    r"(cliente|produto|valor\s+total|data\s+(?:da\s+)?venda|data\s+(?:de\s+)?entrega|"
+    r"entrega|pago|entrada|valor\s+pago|pendente|status)\s*:\s*(.+)$"
+)
+
+
+def _looks_like_structured_sale_form(text: str) -> bool:
+    """Detecta mensagens preenchidas no formato do roteiro (Cliente: X, Produto: Y...)."""
+    if not (text or "").strip():
+        return False
+    labeled = 0
+    for line in text.splitlines():
+        if _STRUCTURED_SALE_LABEL_RE.match(line.strip()):
+            labeled += 1
+    return labeled >= 2
+
+
+def _structured_field(text: str, *labels: str) -> str:
+    for line in text.splitlines():
+        ln = line.strip()
+        if not ln:
+            continue
+        for label in labels:
+            pattern = (
+                rf"(?i)^(?:[👤📦📅💰🔎🚚]\s*)?"
+                rf"{re.escape(label)}\s*:\s*(.+)$"
+            )
+            match = re.match(pattern, ln)
+            if match:
+                return match.group(1).strip()
+    return ""
+
+
+def parse_structured_sale_form(
+    message: str,
+    reference_date: Optional[date] = None,
+) -> Optional[ParseResult]:
+    """Interpreta venda nova enviada como formulário (róteiro da Ajuda)."""
+    if reference_date is None:
+        reference_date = date.today()
+    raw = (message or "").strip()
+    if not _looks_like_structured_sale_form(raw):
+        return None
+
+    customer = _structured_field(raw, "cliente") or _extract_customer(raw) or ""
+    product = _structured_field(raw, "produto") or _extract_product(raw) or ""
+    sale_date_txt = _structured_field(raw, "data da venda", "data venda")
+    sale_date = _parse_pt_date(sale_date_txt, reference_date, full_text=sale_date_txt) if sale_date_txt else reference_date
+    if not sale_date:
+        sale_date = reference_date
+
+    total_txt = _structured_field(raw, "valor total")
+    total_value = _parse_correction_money(total_txt, raw) if total_txt else None
+    if total_value is None:
+        total_value = _extract_total_value(raw, _currency_candidates(raw))
+
+    delivery_txt = _structured_field(raw, "data de entrega", "data entrega", "entrega")
+    service_due_date = (
+        _parse_pt_date(delivery_txt, reference_date, full_text=delivery_txt) if delivery_txt else None
+    )
+
+    entrada_txt = _structured_field(raw, "entrada", "valor pago", "pago")
+    pendente_txt = _structured_field(raw, "pendente")
+    status_txt = _normalize(_structured_field(raw, "status"))
+
+    entrada_value = _parse_correction_money(entrada_txt, raw) if entrada_txt else None
+    if entrada_value is None and entrada_txt:
+        entrada_value = _extract_amount_after_prefix(
+            entrada_txt, prefixes=[r"entrada"], max_gap_words=2
+        )
+    pendente_value = _parse_correction_money(pendente_txt, raw) if pendente_txt else None
+
+    payments: list[Payment] = []
+    if entrada_value and entrada_value > 0:
+        payments.append(
+            Payment(label="Entrada", value=round(float(entrada_value), 2), due_date=sale_date, status="pago")
+        )
+    if pendente_value and pendente_value > 0:
+        due = service_due_date or sale_date
+        payments.append(
+            Payment(label="Saldo", value=round(float(pendente_value), 2), due_date=due, status="pendente")
+        )
+    elif total_value and not payments:
+        paid_in_full = any(tok in status_txt for tok in ("pago", "quitado", "a vista", "à vista"))
+        if paid_in_full or re.search(r"(?i)\ba\s+vista\b", raw):
+            payments.append(
+                Payment(label="Entrada", value=round(float(total_value), 2), due_date=sale_date, status="pago")
+            )
+        elif entrada_value is None and pendente_value is None:
+            payments.append(
+                Payment(label="Entrada", value=round(float(total_value), 2), due_date=sale_date, status="pago")
+            )
+
+    if total_value and payments:
+        paid = round(sum(p.value for p in payments if p.status == "pago"), 2)
+        pending = round(sum(p.value for p in payments if p.status != "pago"), 2)
+        if abs((paid + pending) - float(total_value)) >= 0.01 and pending <= 0.01 and paid > 0:
+            saldo = round(max(float(total_value) - paid, 0), 2)
+            if saldo > 0.01:
+                payments.append(
+                    Payment(
+                        label="Saldo",
+                        value=saldo,
+                        due_date=service_due_date or sale_date,
+                        status="pendente",
+                    )
+                )
+
+    material_cost = _extract_material_cost(raw)
+    material_txt = _structured_field(raw, "material")
+    if material_txt:
+        parsed_mat = _parse_correction_money(material_txt, raw)
+        if parsed_mat is not None and parsed_mat > 0:
+            material_cost = parsed_mat
+    missing: list[str] = []
+    if not customer:
+        missing.append("Cliente")
+    if not total_value:
+        missing.append("Valor total da venda")
+
+    command = FinancialCommand(
+        customer=customer,
+        description=product or f"Servico para {customer or 'cliente'}",
+        sale_date=sale_date,
+        total_value=round(float(total_value or 0), 2),
+        payments=payments,
+        product_id=product or None,
+        service_due_date=service_due_date,
+        material_cost=material_cost,
+        material_date=reference_date if material_cost else None,
+        warnings=["Venda interpretada a partir do formulário (roteiro da Ajuda)."],
+    )
+    return ParseResult(
+        command=command,
+        missing_fields=missing,
+        detected_values={
+            "cliente": command.customer or "-",
+            "produto": command.product_id or "-",
+            "valor_total": f"{command.total_value:.2f}" if command.total_value else "-",
+            "qtd_pagamentos": str(len(command.payments)),
+        },
+        intent="sale",
+    )
+
+
 def enrich_with_last_sale_context(text: str, last_sale_id: str | None) -> str:
     """
     Mantém o ID VENDA ativo na conversa: após o usuário informar um ID,
@@ -793,6 +939,8 @@ def enrich_with_last_sale_context(text: str, last_sale_id: str | None) -> str:
     """
     raw = (text or "").strip()
     if not raw or not last_sale_id:
+        return raw
+    if _looks_like_structured_sale_form(raw):
         return raw
     if _extract_target_sale_id_for_updates(raw) or _extract_sale_id_from_text(raw) or _extract_delete_sale_id(raw):
         return raw
@@ -813,7 +961,7 @@ def enrich_with_last_sale_context(text: str, last_sale_id: str | None) -> str:
             "compraram",
         )
     )
-    if sale_creation:
+    if sale_creation or _looks_like_structured_sale_form(raw):
         return raw
     if should_replace_pending_preview(raw):
         return raw
@@ -1064,6 +1212,7 @@ def _extract_customer(text: str) -> Optional[str]:
         r"\bnome\s+da\s+(?:empresa|loja)\s*(?:e|eh|é|:|-)?\s*([^,.;\n]+)",
         r"\bempresa\s+(?:chamad[ao]\s+|com\s+nome\s+|e|eh|é|:|-)?\s*([^,.;\n]+)",
         r"\bacabei\s+de\s+fazer\s+(?:uma\s+)?venda\s+(?:no|na|com)\s+([^,.;\n]+)",
+        r"\bfiz\s+(?:uma\s+)?venda\s+cliente\s+([^,.;\n]+)",
         r"\bfiz\s+(?:uma\s+)?venda\s+(?:para|pro|pra|no|na|com)\s+([^,.;\n]+)",
         r"\bvend(?:i|emos|er)\s+(?:para|pro|pra)\s+(?:(?:o|a)\s+)?([^,.;\n]+)",
         r"\bfechei\s+com\s+([^,.;\n]+)",
@@ -1279,6 +1428,7 @@ def _extract_target_sale_id_for_updates(text: str) -> Optional[str]:
         r"\bclientes?\s*id\s*[:\-]?\s*(\d{1,6})\b",
         r"\bid\s*cliente\s*[:\-]?\s*(\d{1,6})\b",
         r"\bclientes?\s+(\d{1,6})\b",
+        r"\bid\s*[:\-]?\s*(\d{1,6})\b",
     ):
         m = re.search(pattern, raw, flags=re.IGNORECASE)
         if m:
@@ -1863,11 +2013,46 @@ def _parse_money_after_position(text: str, start: int) -> Optional[float]:
     return best
 
 
+def _is_material_product_name(product: str) -> bool:
+    norm = _normalize(product or "")
+    if not norm:
+        return True
+    blocked = (
+        "material",
+        "materia",
+        "fornecedor",
+        "reais",
+        "real",
+        "centavo",
+        "centavos",
+        "uns",
+        "uma",
+        "media",
+    )
+    return any(tok in norm for tok in blocked) or norm.isdigit()
+
+
+def _text_before_material_clause(text: str) -> str:
+    """Remove trecho de compra/gasto de material para não virar segunda venda."""
+    norm = _normalize(text)
+    for marker in (" de material", " material", " fornecedor", " materia prima"):
+        idx = norm.find(marker)
+        if idx <= 0:
+            continue
+        before = norm[max(0, idx - 80):idx]
+        if any(tok in before for tok in ("gastar", "gasto", "gastei", "comprar", "comprei", "fornecedor", "vou")):
+            ratio = max(0, idx) / max(len(norm), 1)
+            cut = int(len(text) * ratio)
+            return text[:cut].strip()
+    return text
+
+
 def _extract_itemized_product_values(text: str) -> list[tuple[str, float]]:
     """
     Captura produtos com valor unitário, ex.:
     "a fachada vendi por cinco mil e o banner vendi por dois mil".
     """
+    text = _text_before_material_clause(text)
     products: list[tuple[str, float]] = []
     product_word = (
         r"(?!pra|para|pro|por|vendi|vendemos|eles|elas|ele|ela|cliente|eu|aqui\b)"
@@ -1904,7 +2089,11 @@ def _extract_itemized_product_values(text: str) -> list[tuple[str, float]]:
             val = _parse_money_after_position(text, m.end())
             if val is None or val <= 0:
                 continue
+            if val < 1.0:
+                continue
             human_prod = _humanize_label(prod)
+            if _is_material_product_name(human_prod):
+                continue
             pair = (_normalize(human_prod), float(val))
             if pair in seen_pairs:
                 continue
@@ -2247,6 +2436,76 @@ _SERVICE_COST_PREFIXES = (
 )
 
 
+def _is_material_replace_request(text: str) -> bool:
+    norm = _normalize(text or "")
+    if any(
+        tok in norm
+        for tok in (
+            "adiciona",
+            "adicionar",
+            "adicione",
+            "acrescenta",
+            "acrescentar",
+            "inclui",
+            "incluir",
+            "mais um gasto",
+            "mais gasto",
+            "outro gasto",
+            "outra compra",
+        )
+    ):
+        if not any(tok in norm for tok in ("substitui", "substituir", "trocar", "troca")):
+            return False
+    if not any(
+        tok in norm
+        for tok in (
+            "altera",
+            "alterar",
+            "ajusta",
+            "ajustar",
+            "corrige",
+            "corrigir",
+            "atualiza",
+            "atualizar",
+            "mudar",
+            "muda",
+            "troca",
+            "trocar",
+            "substitui",
+            "substituir",
+            "acabou ficando",
+            "ficou em",
+            "passou para",
+            "passou pra",
+        )
+    ):
+        return False
+    return any(tok in norm for tok in ("material", "materia prima", "custo", "custos", "fornecedor"))
+
+
+def _extract_pending_amount_override(text: str) -> Optional[float]:
+    """Extrai novo valor pendente/saldo quando o usuário pede alteração por ID."""
+    norm = _normalize(text or "")
+    if not any(tok in norm for tok in ("pendente", "saldo", "restante")):
+        return None
+    if not any(
+        tok in norm
+        for tok in ("altera", "alterar", "ajusta", "corrige", "atualiza", "mudar", "muda", "troca", "ficou", "passou")
+    ):
+        return None
+    value = _extract_amount_after_prefix(
+        text,
+        prefixes=[r"pendente", r"saldo", r"restante", r"valor\s+pendente", r"ficou", r"passou\s+para", r"passou\s+pra"],
+        max_gap_words=6,
+    )
+    if value is not None and value >= 0:
+        return float(value)
+    numbers = _currency_candidates(text)
+    if numbers:
+        return float(numbers[-1])
+    return None
+
+
 def _is_service_cost_update(text: str) -> bool:
     """True quando o usuário informa custo de um serviço/venda já existente (não valor da venda)."""
     return bool(re.search(r"\bcust(?:o|os|ou)\b", _normalize(text), flags=re.IGNORECASE))
@@ -2285,6 +2544,17 @@ def _extract_material_cost(text: str) -> Optional[float]:
         if service_cost:
             return service_cost
     norm = _normalize(text)
+    for pattern in (
+        r"(?:vou\s+)?gast(?:ar|o|ou)\s+(?:uma\s+media\s+de\s+)?(?:uns?\s+)?(.{0,70}?)(?:\s+de\s+)?material\b",
+        r"(?:compr(?:ar|ei)|vou)\s+(?:no\s+)?fornecedor[^.\n]{0,50}?gast(?:ar|o|ou)\s+(.{0,50})",
+        r"(?:compr(?:ar|ei))\s+(?:o\s+)?material[^.\n]{0,40}?(\d[\d\.,]*)",
+    ):
+        match = re.search(pattern, norm, flags=re.IGNORECASE)
+        if not match:
+            continue
+        word_value = _parse_money_from_fragment(match.group(1), prefer_leading=True)
+        if word_value is not None and word_value > 0:
+            return float(word_value)
     keyword_positions: list[int] = []
     material_keywords = (
         r"\bmaterial\b",
@@ -2327,7 +2597,10 @@ def _extract_material_cost(text: str) -> Optional[float]:
     if gasto_value and gasto_value >= 10:
         candidates.append(float(gasto_value))
     if candidates:
-        return max(candidates)
+        if len(candidates) == 1:
+            return candidates[0]
+        # Evita pegar o valor total da venda quando há gasto de material menor no texto.
+        return min(candidates)
     return None
 
 
@@ -3034,6 +3307,9 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
         fixed_cost_date=fixed_cost_date if fixed_cost else None,
         service_due_date=service_due_date,
         service_status=None,
+        material_replace=bool(
+            sale_id and not sale_creation_context and _is_material_replace_request(raw_text)
+        ),
         warnings=warnings,
     )
 
@@ -3095,6 +3371,8 @@ STATUS_UPDATE_KEYWORDS = (
 
 def detect_intent(message: str) -> str:
     norm = _normalize(message)
+    if _looks_like_structured_sale_form(message) and not _is_sale_delete_request(message):
+        return "sale"
     # Se for mensagem de criação de venda, prioriza o fluxo "sale".
     # Isso evita confundir trechos como "cliente id 004 pagou" (entrada) como "ID VENDA ... pagou".
     sale_creation_context = any(
@@ -3139,6 +3417,7 @@ def detect_intent(message: str) -> str:
         )
     material_allocations = _extract_material_allocations(message, date.today())
     delivery_date = _extract_delivery_update_date(message, date.today())
+    pending_override = _extract_pending_amount_override(message)
     payment_amount = _extract_amount_after_prefix(
         message,
         prefixes=[r"pagou", r"paguei", r"recebi", r"recebeu", r"entrada"],
@@ -3149,6 +3428,8 @@ def detect_intent(message: str) -> str:
         return "delivery_finalize"
     if (not sale_creation_context) and sale_id and delivery_date and not status and not (material_allocations or material_cost):
         return "delivery_update"
+    if (not sale_creation_context) and sale_id and pending_override is not None and not status:
+        return "sale_value_update"
     if (not sale_creation_context) and sale_id and (material_allocations or material_cost) and not status:
         return "material_update"
     if (not sale_creation_context) and sale_id and payment_amount and not status and not (material_allocations or material_cost) and not delivery_date:
@@ -3218,7 +3499,6 @@ _PREVIEW_CORRECTION_FIELD_RE = re.compile(
     r"|custo(?:\s+do\s+servi[cç]o)?"
     r"|custos?"
     r"|id\s+venda"
-    r"|venda"
     r")\s*[:=]?\s*"
 )
 
@@ -3302,7 +3582,7 @@ def _preview_correction_label_to_key(label: str) -> Optional[str]:
         return "data_venda"
     if label == "entrega":
         return "data_entrega"
-    if label == "id venda" or label == "venda":
+    if label == "id venda":
         return "id_venda"
     return None
 
@@ -3506,11 +3786,36 @@ def resolve_batch_sale_index(text: str, batch: list[ParseResult]) -> int | None:
 
 
 def _strip_batch_sale_prefix(text: str) -> str:
-    return re.sub(
+    stripped = re.sub(
         r"(?is)^(?:na\s+)?venda\s+(?:um|uma|dois|duas|tres|tr[eê]s|\d+|primeir[ao]|segund[ao]|terceir[ao])\s*[:\-,]?\s*",
         "",
         text.strip(),
     ).strip()
+    if stripped != text.strip():
+        return stripped
+    return re.sub(
+        r"(?is)\s+(?:na\s+)?venda\s+(?:um|uma|dois|duas|tres|tr[eê]s|\d+|primeir[ao]|segund[ao]|terceir[ao])\s*$",
+        "",
+        text.strip(),
+    ).strip()
+
+
+def _is_batch_sale_reference(text: str) -> bool:
+    """True quando o texto refere-se ao índice do lote (venda 1, venda dois), não a um ID VENDA."""
+    norm = _normalize(text or "")
+    return bool(
+        re.search(
+            r"(?i)(?:^|\s)(?:na\s+)?venda\s+"
+            r"(?:um|uma|dois|duas|tres|tr[eê]s|\d+|primeir[ao]|segund[ao]|terceir[ao])\b",
+            norm,
+        )
+    )
+
+
+def sanitize_new_sale_identity(command: FinancialCommand) -> None:
+    """Venda nova: ID e material vinculado só são definidos ao salvar na planilha."""
+    command.sale_id = None
+    command.material_allocations = []
 
 
 def apply_batch_preview_corrections(
@@ -3542,6 +3847,8 @@ def apply_batch_preview_corrections(
         )
     if not updated:
         return False, batch
+    if parse_result.intent == "sale":
+        sanitize_new_sale_identity(parse_result.command)
     batch[idx] = parse_result
     return True, batch
 
@@ -3588,7 +3895,11 @@ def apply_multi_field_corrections(
                 fields = {"cliente": rest}
         elif (
             "id venda" in lower
-            or (lower.startswith("venda") and "data" not in lower)
+            or (
+                lower.startswith("venda")
+                and "data" not in lower
+                and not _is_batch_sale_reference(text)
+            )
             or re.search(r"\bid\s*[:\-]?\s*\d", lower)
         ):
             fields = {"id_venda": text}
@@ -3620,7 +3931,11 @@ def apply_multi_field_corrections(
         command.customer = fields["cliente"].strip()
         updated = True
 
-    if "id_venda" in fields:
+    if "id_venda" in fields and not (
+        parse_result is not None
+        and parse_result.intent == "sale"
+        and _is_batch_sale_reference(fields["id_venda"])
+    ):
         supplemental = extract_supplemental_sale_id(fields["id_venda"])
         if supplemental:
             command.sale_id = supplemental
@@ -3795,6 +4110,9 @@ def apply_preview_corrections(
 
 
 def parse_message(message: str, reference_date: Optional[date] = None) -> ParseResult:
+    structured = parse_structured_sale_form(message, reference_date)
+    if structured is not None:
+        return structured
     message = normalize_spoken_ids_in_text(message)
     financial_result = parse_financial_message(message, reference_date)
     intent = detect_intent(message)
@@ -3852,9 +4170,40 @@ def parse_message(message: str, reference_date: Optional[date] = None) -> ParseR
             intent="delivery_update",
         )
     if intent == "material_update":
-        # Reaproveita parse_financial_message; updates por ID VENDA não exigem nome do Cliente.
         financial_result.intent = "material_update"
+        financial_result.command.material_replace = _is_material_replace_request(message)
+        if financial_result.command.material_replace:
+            financial_result.command.warnings.append(
+                "O custo de material anterior deste ID será substituído pelo novo valor."
+            )
         return financial_result
+    if intent == "sale_value_update":
+        if reference_date is None:
+            reference_date = date.today()
+        target_sale_id = _extract_target_sale_id_for_updates(message) or ""
+        pending_override = _extract_pending_amount_override(message)
+        missing: list[str] = []
+        if not target_sale_id:
+            missing.append("ID VENDA")
+        if pending_override is None:
+            missing.append("Valor pendente")
+        return ParseResult(
+            command=FinancialCommand(
+                customer=_extract_customer(message) or "",
+                description=f"Atualizar valor pendente da venda {target_sale_id or '-'}",
+                sale_date=reference_date,
+                total_value=0.0,
+                payments=[],
+                sale_id=target_sale_id or None,
+                pending_amount_override=pending_override,
+            ),
+            missing_fields=missing,
+            detected_values={
+                "id_venda": target_sale_id or "-",
+                "valor_pendente": f"{float(pending_override):.2f}" if pending_override is not None else "-",
+            },
+            intent="sale_value_update",
+        )
     if intent == "payment_update":
         if reference_date is None:
             reference_date = date.today()
