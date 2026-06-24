@@ -779,7 +779,7 @@ def _is_preview_field_correction(text: str) -> bool:
         return False
     return bool(
         re.match(
-            r"(?i)^(material|valor|produto|cliente|id|entrada|saldo|restante|entrega|venda)\s*[:\-=]",
+            r"(?i)^(material|custo|custos|valor|produto|cliente|id|entrada|saldo|restante|entrega|venda)\s*[:\-=]",
             raw,
         )
     )
@@ -787,13 +787,12 @@ def _is_preview_field_correction(text: str) -> bool:
 
 def enrich_with_last_sale_context(text: str, last_sale_id: str | None) -> str:
     """
-    Quando o usuário fala 'para ele', 'a entrega foi hoje' etc. logo após outra ação,
-    injeta o último ID VENDA conhecido para o parser associar corretamente.
+    Mantém o ID VENDA ativo na conversa: após o usuário informar um ID,
+    mensagens seguintes (custo, pagamento, entrega etc.) vinculam à mesma venda
+    até reiniciar ou iniciar nova conversa.
     """
     raw = (text or "").strip()
     if not raw or not last_sale_id:
-        return raw
-    if _message_has_explicit_sale_reference(raw) or _is_preview_field_correction(raw):
         return raw
     if _extract_target_sale_id_for_updates(raw) or _extract_sale_id_from_text(raw) or _extract_delete_sale_id(raw):
         return raw
@@ -805,45 +804,18 @@ def enrich_with_last_sale_context(text: str, last_sale_id: str | None) -> str:
             "vender",
             "acabei de fazer uma venda",
             "fiz uma venda",
+            "fiz um servico",
+            "fiz uma",
+            "fiz um",
             "fechei",
+            "fechamos",
             "comprou",
             "compraram",
         )
     )
     if sale_creation:
         return raw
-    followup_markers = (
-        "data de entrega",
-        "data entrega",
-        "entrega",
-        "entregue",
-        "entreg",
-        "finaliz",
-        "pagou",
-        "pago",
-        "material",
-        "para ele",
-        "para ela",
-        "dele",
-        "dela",
-        "desse",
-        "dessa",
-        "nesse",
-        "nesta",
-        "mudar",
-        "altera",
-        "alterar",
-        "apagar",
-        "apaga",
-        "excluir",
-        "exclui",
-        "deletar",
-        "remover",
-        "cancelou",
-        "cancelar",
-        "desistiu",
-    )
-    if not any(tok in norm for tok in followup_markers):
+    if should_replace_pending_preview(raw):
         return raw
     sid = str(last_sale_id).strip().zfill(3) if str(last_sale_id).strip().isdigit() and len(str(last_sale_id).strip()) <= 3 else str(last_sale_id).strip()
     return f"cliente id {sid} {raw}"
@@ -2154,6 +2126,13 @@ def _extract_service_cost_amount(text: str) -> Optional[float]:
     )
     if value:
         return value
+    value = _extract_amount_after_prefix(
+        text,
+        prefixes=[r"(?:foi\s+)?gast(?:o|ou)\s+o\s+valor\s+de", r"valor\s+de", r"valor\s+foi\s+de"],
+        max_gap_words=12,
+    )
+    if value:
+        return value
     return _extract_amount_before_prefix(
         text,
         prefixes=[r"custo(?:\s+de)?", r"custos(?:\s+de)?"],
@@ -2189,19 +2168,29 @@ def _extract_material_cost(text: str) -> Optional[float]:
             keyword_positions.append(match.start())
     candidates: list[float] = []
     for idx in keyword_positions:
-        snippet = text[max(0, idx - 90) : idx + 110]
+        snippet = _mask_id_number_spans(text[max(0, idx - 90) : idx + 110])
         for v in _currency_candidates(snippet):
             if v > 0:
                 candidates.append(float(v))
-        after_material = re.search(
+        masked_window = _mask_id_number_spans(text[max(0, idx - 20) : idx + 120])
+        for pattern in (
+            r"(?:foi\s+)?gast(?:o|ou)\s+o\s+valor\s+de\s+(.{0,80})",
+            r"valor\s+de\s+(.{0,80})",
             r"\bmaterial\b\s*(?:de\s+)?(.{0,80})",
-            _normalize(text[max(0, idx - 20) : idx + 120]),
-            flags=re.IGNORECASE,
-        )
-        if after_material:
+        ):
+            after_material = re.search(pattern, _normalize(masked_window), flags=re.IGNORECASE)
+            if not after_material:
+                continue
             word_value = _parse_money_from_fragment(after_material.group(1))
-            if word_value is not None and word_value > 0:
+            if word_value is not None and word_value >= 10:
                 candidates.append(float(word_value))
+    gasto_value = _extract_amount_after_prefix(
+        text,
+        prefixes=[r"(?:foi\s+)?gast(?:o|ou)\s+o\s+valor\s+de", r"valor\s+de"],
+        max_gap_words=12,
+    )
+    if gasto_value and gasto_value >= 10:
+        candidates.append(float(gasto_value))
     if candidates:
         return max(candidates)
     return None
@@ -2796,6 +2785,15 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
 
     warnings: list[str] = []
     missing: list[str] = []
+    if service_due_date is not None and service_due_date < sale_date:
+        bumped = service_due_date.replace(year=sale_date.year + 1)
+        if bumped <= sale_date:
+            bumped = sale_date + timedelta(days=1)
+        service_due_date = bumped
+        warnings.append(
+            f"Data de entrega ajustada para {service_due_date.strftime('%d/%m/%Y')} "
+            "(não pode ser anterior à data da venda)."
+        )
     material_expense_only = bool((material_allocations or material_cost) and (not sale_creation_context) and not total_value)
     if material_expense_only:
         # Para "gasto de material", precisamos do ID VENDA para vincular a linha correta em "Compras Matéria-Prima".
@@ -3079,6 +3077,8 @@ _PREVIEW_CORRECTION_FIELD_RE = re.compile(
     r"|resto"
     r"|entrega"
     r"|material(?:\s+estimado)?"
+    r"|custo(?:\s+do\s+servi[cç]o)?"
+    r"|custos?"
     r"|id\s+venda"
     r"|venda"
     r")\s*[:=]?\s*"
@@ -3147,6 +3147,8 @@ def _preview_correction_label_to_key(label: str) -> Optional[str]:
     if label.startswith("cliente") or label.startswith("nome do cliente") or label == "id cliente":
         return "cliente"
     if label.startswith("material"):
+        return "material"
+    if label.startswith("custo"):
         return "material"
     if label == "produto":
         return "produto"
@@ -3452,8 +3454,9 @@ def apply_multi_field_corrections(
             or re.search(r"\bid\s*[:\-]?\s*\d", lower)
         ):
             fields = {"id_venda": text}
-        elif "material" in lower:
-            rest = _preview_correction_rest(text, "material")
+        elif "material" in lower or "custo" in lower:
+            keyword = "custo" if "custo" in lower else "material"
+            rest = _preview_correction_rest(text, keyword)
             if rest:
                 fields = {"material": rest}
         elif "produto" in lower:

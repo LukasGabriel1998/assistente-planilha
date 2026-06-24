@@ -1541,6 +1541,7 @@ class SpreadsheetService:
         col_delivery = sales_cols.get("data de entrega")
         col_customer = sales_cols.get("cliente")
         col_product = sales_cols.get("id produto")
+        col_sale_date = sales_cols.get("data de venda")
         if not col_delivery:
             return []
 
@@ -1554,6 +1555,14 @@ class SpreadsheetService:
             delivery_dt = self._parse_date_cell(ws_sales[f"{col_delivery}{row}"].value)
             # Só datas anteriores ao dia de hoje (ex.: hoje 23/06 → cobra 21/06, não 23/06).
             if delivery_dt is None or delivery_dt >= today:
+                continue
+            sale_dt = (
+                self._parse_date_cell(ws_sales[f"{col_sale_date}{row}"].value)
+                if col_sale_date
+                else None
+            )
+            # Ignora entrega anterior à data da venda (dado inconsistente na planilha).
+            if sale_dt is not None and delivery_dt < sale_dt:
                 continue
             if not self._delivery_date_is_yellow(ws_sales, sales_cols, row):
                 continue
@@ -1752,6 +1761,55 @@ class SpreadsheetService:
             if str(ws[f"{col_sale_id}{row}"].value or "").strip() == str(sale_id).strip():
                 count += 1
         return count
+
+    def material_costs_by_sale_id(self, wb, *, max_rows_scan: int = 2000) -> dict[str, float]:
+        """Soma custos de material por ID VENDA (sem fornecedor — só o valor)."""
+        try:
+            material_name = self._resolve_sheet_name(wb, SHEET_MATERIAL)
+        except Exception:
+            return {}
+        if material_name not in wb.sheetnames:
+            return {}
+        ws = wb[material_name]
+        try:
+            material_cols = self._material_columns(ws)
+        except Exception:
+            return {}
+        col_sale_id = material_cols.get("id venda")
+        col_valor = material_cols.get("valor")
+        if not col_sale_id or not col_valor:
+            return {}
+        totals: dict[str, float] = {}
+        end_row = min(ws.max_row, self.MAX_DATA_ROW, DATA_START_ROW + max_rows_scan - 1)
+        if getattr(ws, "read_only", False):
+            from openpyxl.utils import column_index_from_string
+
+            sid_idx = column_index_from_string(col_sale_id)
+            val_idx = column_index_from_string(col_valor)
+            for row_cells in ws.iter_rows(
+                min_row=DATA_START_ROW,
+                max_row=end_row,
+                min_col=min(sid_idx, val_idx),
+                max_col=max(sid_idx, val_idx),
+            ):
+                values = {cell.column: cell.value for cell in row_cells}
+                sale_id = str(values.get(sid_idx) or "").strip()
+                if not sale_id:
+                    continue
+                amount = self._to_float(values.get(val_idx))
+                if amount <= 0:
+                    continue
+                totals[sale_id] = round(totals.get(sale_id, 0.0) + amount, 2)
+        else:
+            for row in range(DATA_START_ROW, end_row + 1):
+                sale_id = str(ws[f"{col_sale_id}{row}"].value or "").strip()
+                if not sale_id:
+                    continue
+                amount = self._to_float(ws[f"{col_valor}{row}"].value)
+                if amount <= 0:
+                    continue
+                totals[sale_id] = round(totals.get(sale_id, 0.0) + amount, 2)
+        return totals
 
     def delete_sale(
         self,
@@ -2690,6 +2748,7 @@ class SpreadsheetService:
             col_status = sales_cols["status de valor"]
             col_delivery = sales_cols["data de entrega"]
             col_sale_date = sales_cols.get("data de venda")
+            material_totals = self.material_costs_by_sale_id(wb)
 
             rows: list[dict[str, str]] = []
             end_row = self._effective_data_end_row(ws, col_id)
@@ -2737,6 +2796,7 @@ class SpreadsheetService:
                             "status": str(_val("status") or "").strip(),
                             "entrega": delivery,
                             "data": str(_val("sale_date") or "").strip() if col_sale_date else "",
+                            "material": material_totals.get(sale_id, 0.0),
                         }
                     )
                 rows = list(reversed(collected[-limit:]))
@@ -2763,6 +2823,7 @@ class SpreadsheetService:
                             "status": status,
                             "entrega": delivery,
                             "data": sale_date,
+                            "material": material_totals.get(sale_id, 0.0),
                         }
                     )
                     if len(rows) >= limit:
@@ -2776,9 +2837,14 @@ class SpreadsheetService:
                 pend_txt = f"R$ {item['pendente']:,.2f}" if item["pendente"] > 0.01 else "R$ 0,00"
                 entrega = item["entrega"] or "-"
                 cliente = item["cliente"] or "-"
+                material_val = float(item.get("material") or 0.0)
+                material_txt = (
+                    f" | Material: R$ {material_val:,.2f}" if material_val > 0.01 else ""
+                )
                 lines.append(
                     f"• ID {item['id']} | {cliente}\n"
-                    f"  Venda: {item['data'] or '-'} | Pendente: {pend_txt} ({item['status'] or '-'}) | Entrega: {entrega}"
+                    f"  Venda: {item['data'] or '-'} | Pendente: {pend_txt} ({item['status'] or '-'}) | "
+                    f"Entrega: {entrega}{material_txt}"
                 )
             lines.append("")
             # Dica baseada em um exemplo real de pendência da prévia.

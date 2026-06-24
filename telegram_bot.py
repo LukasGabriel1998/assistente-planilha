@@ -155,6 +155,10 @@ O bot usa sempre a *data de hoje*. Se a entrega era dia 21 e hoje é 23, e ainda
 📋 *Prévia* — vendas, pendências e entregas
 📊 *Resumo* — totais da planilha
 💹 *Status* — situação financeira
+🆕 *Nova conversa* — limpa o ID VENDA ativo e começa outro assunto
+
+🔁 *ID VENDA na conversa*
+Depois que você informar um ID (ex.: `cliente id 004`), o bot mantém esse ID para custos, pagamentos e entregas até você tocar em *Nova conversa*.
 
 ✅ *Depois da prévia*
 👍 Está certo → responda *SIM* ou *OK*
@@ -165,11 +169,72 @@ O bot usa sempre a *data de hoje*. Se a entrega era dia 21 e hoje é 23, e ainda
 MAIN_MENU_KEYBOARD = {
     "keyboard": [
         ["Prévia", "Resumo", "Status"],
-        ["Ajuda", "Reiniciar"],
+        ["Ajuda", "Nova conversa"],
     ],
     "resize_keyboard": True,
     "one_time_keyboard": False,
 }
+
+def _reset_chat_session(
+    chat_id: int | str,
+    *,
+    pending_preview: dict,
+    pending_delivery: dict,
+    pending_overdue_delivery: dict,
+    last_sale_id_by_chat: dict,
+    last_customer_by_chat: dict | None = None,
+) -> None:
+    """Limpa prévias e contexto de ID VENDA do chat."""
+    pending_preview.pop(chat_id, None)
+    pending_delivery.pop(chat_id, None)
+    pending_overdue_delivery.pop(chat_id, None)
+    last_sale_id_by_chat.pop(chat_id, None)
+    if last_customer_by_chat is not None:
+        last_customer_by_chat.pop(chat_id, None)
+
+
+def _remember_sale_id_from_parse(
+    parse_result,
+    last_sale_id_by_chat: dict,
+    chat_id: int | str,
+) -> None:
+    remembered = sale_id_from_parse_result(parse_result)
+    if remembered:
+        last_sale_id_by_chat[chat_id] = remembered
+
+
+def _normalize_material_only_sale(parse_result) -> None:
+    """Prévia de custo/material com ID não deve exigir Cliente como venda nova."""
+    cmd = parse_result.command
+    sale_id = (getattr(cmd, "sale_id", None) or "").strip()
+    material_cost = float(getattr(cmd, "material_cost", None) or 0)
+    total_value = float(getattr(cmd, "total_value", None) or 0)
+    if not sale_id or material_cost <= 0 or total_value > 0.01:
+        return
+    if parse_result.intent in ("sale", "mixed_update"):
+        parse_result.intent = "material_update"
+    parse_result.missing_fields = [
+        f for f in parse_result.missing_fields if f not in ("Cliente", "Valor total da venda")
+    ]
+
+
+def _load_customer_from_workbook(sale_id: str) -> str:
+    sale_id = str(sale_id or "").strip()
+    if not sale_id:
+        return ""
+    workbook_path = get_default_workbook()
+    if not workbook_path or not Path(workbook_path).exists():
+        return ""
+    try:
+        from src.excel_store import SpreadsheetService
+        svc = SpreadsheetService(workbook_path)
+        rows = svc.get_pending_sale_by_sale_id(sale_id, max_rows_scan=500, include_paid=True)
+        if rows:
+            return str(rows[0].get("customer") or "").strip()
+    except Exception:
+        pass
+    return ""
+
 
 QUICK_DASHBOARD_KEYWORDS = (
     "resumo",
@@ -517,19 +582,26 @@ def _maybe_build_sales_snippet_image(
         try:
             ws = wb[svc._resolve_sheet_name(wb, SHEET_SALES)]
             cols = svc._sales_columns(ws)
+            material_totals = svc.material_costs_by_sale_id(wb)
             # Ordem e labels fixos para ficar consistente/legível.
             display_cols = [
                 ("data de venda", "Data da venda"),
                 ("data de entrega", "Data entrega"),
                 ("cliente", "Cliente"),
                 ("id produto", "Produto"),
+                ("__material__", "Custo material"),
                 ("total de vendas (pago)", "Pago"),
                 ("valor (pendente)", "Pendente"),
                 ("id venda", "ID VENDA"),
                 ("status de valor", "Status"),
             ]
-            col_pairs = [(cols.get(key), label, key) for key, label in display_cols if cols.get(key)]
-            col_letters = [c for c, _label, _key in col_pairs]
+            col_pairs: list[tuple[str | None, str, str]] = []
+            for key, label in display_cols:
+                if key == "__material__":
+                    col_pairs.append((None, label, key))
+                elif cols.get(key):
+                    col_pairs.append((cols.get(key), label, key))
+            col_letters = [c for c, _label, _key in col_pairs if c]
             if not col_letters:
                 return None
 
@@ -573,14 +645,24 @@ def _maybe_build_sales_snippet_image(
             # Cabeçalho: normalmente fica na linha anterior ao início dos dados.
             headers = [label for _c, label, _key in col_pairs]
 
-            def _cell_txt(c: str, key: str, r: int) -> str:
+            def _fmt_money(num: float) -> str:
+                txt = f"{float(num):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                return f"R$ {txt}"
+
+            def _cell_txt(c: str | None, key: str, r: int) -> str:
+                if key == "__material__":
+                    if not id_col:
+                        return "-"
+                    sid = str(ws[f"{id_col}{r}"].value or "").strip()
+                    amount = material_totals.get(sid, 0.0)
+                    if amount <= 0.01:
+                        return "-"
+                    return _fmt_money(amount)
                 v = ws[f"{c}{r}"].value
                 if v in (None, ""):
                     return ""
                 if key in ("total de vendas (pago)", "valor (pendente)"):
-                    num = svc._to_float(v)
-                    txt = f"{float(num):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-                    return f"R$ {txt}"
+                    return _fmt_money(svc._to_float(v))
                 if hasattr(v, "strftime"):
                     try:
                         return v.strftime("%d/%m/%Y")
@@ -658,7 +740,10 @@ def _maybe_build_sales_snippet_image(
         for rr in rows_txt:
             maxw = max(maxw, tlen(rr[ci], font_body))
         cap = 360 if ci == 3 else 230
-        floor = 115 if ci in (0, 1, 6, 7) else 140
+        floor = 115 if headers[ci] in ("Data da venda", "Data entrega", "ID VENDA", "Status") else 140
+        if headers[ci] == "Custo material":
+            floor = 130
+            cap = 200
         col_widths.append(max(floor, min(cap, maxw + cell_pad_x * 2)))
 
     row_h = (font_body.getbbox("Ag")[3] - font_body.getbbox("Ag")[1]) + (cell_pad_y * 2) + 2
@@ -745,7 +830,7 @@ def _maybe_build_sales_snippet_image(
         delivery_state = delivery_cell_states[ri - 1] if ri - 1 < len(delivery_cell_states) else None
         for ci, txt in enumerate(rvals):
             w = col_widths[ci]
-            is_money_col = headers[ci] in ("Pago", "Pendente")
+            is_money_col = headers[ci] in ("Pago", "Pendente", "Custo material")
             base_fill = highlight_bg if pending_row else (zebra if (ri % 2 == 0) else (255, 255, 255))
             if headers[ci] == "Data entrega":
                 if delivery_state is True:
@@ -1433,7 +1518,7 @@ def _handle_quick_dashboard_command(
 
     quick_menu_processing.add(chat_id)
     pending_preview.pop(chat_id, None)
-    _notify_dashboard_loading(chat_id, cmd_strip)
+    send_chat_action(chat_id, "upload_photo")
     img_path: str | None = None
     try:
         caption, img_path = _run_with_chat_action(
@@ -2011,16 +2096,29 @@ def run_polling() -> None:
                 )
                 continue
 
-            # Reiniciar: cancela qualquer prévia pendente e volta ao zero
-            if "reiniciar" in text.strip().lower() and len(text.strip()) <= 15:
-                pending_preview.pop(chat_id, None)
-                pending_delivery.pop(chat_id, None)
-                pending_overdue_delivery.pop(chat_id, None)
-                send_message(
+            # Nova conversa: limpa prévia e contexto de ID VENDA
+            lower_cmd = text.strip().lower()
+            if lower_cmd in ("nova conversa", "novo atendimento", "novo chat", "reiniciar"):
+                _reset_chat_session(
                     chat_id,
-                    "Reiniciado. Pode enviar um novo comando, áudio ou tocar em Resumo.",
-                    reply_markup=MAIN_MENU_KEYBOARD,
+                    pending_preview=pending_preview,
+                    pending_delivery=pending_delivery,
+                    pending_overdue_delivery=pending_overdue_delivery,
+                    last_sale_id_by_chat=last_sale_id_by_chat,
+                    last_customer_by_chat=last_customer_by_chat,
                 )
+                if lower_cmd.startswith("nova"):
+                    msg = (
+                        "🆕 *Nova conversa iniciada.*\n\n"
+                        "O contexto do ID VENDA foi limpo. Pode registrar uma venda nova "
+                        "ou informar outro ID quando quiser."
+                    )
+                else:
+                    msg = (
+                        "🆕 *Nova conversa iniciada.*\n\n"
+                        "Contexto limpo. Pode enviar um novo comando ou tocar em *Prévia*."
+                    )
+                send_message(chat_id, msg, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
                 continue
 
             user = msg.get("from", {})
@@ -2110,7 +2208,12 @@ def run_polling() -> None:
                     parse_result = pending["parse_result"]
                     original_text = pending.get("original_text", "")
                     origin = pending.get("origin", "telegram")
+                    _normalize_material_only_sale(parse_result)
                     cmd = parse_result.command
+                    if not (cmd.customer or "").strip() and getattr(cmd, "sale_id", None):
+                        loaded_customer = _load_customer_from_workbook(str(cmd.sale_id))
+                        if loaded_customer:
+                            cmd.customer = loaded_customer
                     # Se ainda faltar Cliente (nome), não salva em fluxos de venda nova.
                     # Para atualização de status, entrega, material etc., usa-se o ID VENDA.
                     if parse_result.intent not in (
@@ -2287,10 +2390,28 @@ def run_polling() -> None:
                                 dc = getattr(parse_result, "delete_command", None)
                                 if dc is not None and getattr(cmd, "sale_id", None):
                                     dc.sale_id = str(cmd.sale_id).strip()
+                                _normalize_material_only_sale(parse_result)
+                                if not (cmd.customer or "").strip() and getattr(cmd, "sale_id", None):
+                                    loaded_customer = _load_customer_from_workbook(str(cmd.sale_id))
+                                    if loaded_customer:
+                                        cmd.customer = loaded_customer
                                 pending["parse_result"] = parse_result
+                                _remember_sale_id_from_parse(parse_result, last_sale_id_by_chat, chat_id)
                                 preview_text = build_preview(parse_result)
                                 send_message(chat_id, preview_text, parse_mode="Markdown")
                                 continue
+                        if pending and pending.get("parse_result"):
+                            send_message(
+                                chat_id,
+                                "Não entendi o ajuste na prévia.\n\n"
+                                "Exemplos:\n"
+                                "• `Custo: 1780`\n"
+                                "• `Cliente: Ana`\n"
+                                "• `id venda 004`\n\n"
+                                "Para *confirmar* responda *SIM*. Para *cancelar* responda *NÃO*.",
+                                parse_mode="Markdown",
+                            )
+                            continue
 
                 # Resposta de data de entrega pendente
                 if chat_id in pending_delivery:
@@ -2369,6 +2490,7 @@ def run_polling() -> None:
                 if parse_text != text:
                     print(f"[Telegram] Contexto: último ID VENDA {last_sale_id_by_chat.get(chat_id)} aplicado no chat {chat_id}")
                 parse_result = parse_message(parse_text, reference_date=date.today())
+                _normalize_material_only_sale(parse_result)
 
                 # Atualiza cache quando conseguir extrair cliente.
                 parsed_customer = (getattr(parse_result.command, "customer", "") or "").strip()
@@ -2410,6 +2532,10 @@ def run_polling() -> None:
                 remembered_sale = sale_id_from_parse_result(parse_result)
                 if remembered_sale:
                     last_sale_id_by_chat[chat_id] = remembered_sale
+                else:
+                    hinted_sale = _extract_target_sale_id_for_updates(text) or extract_supplemental_sale_id(text)
+                    if hinted_sale:
+                        last_sale_id_by_chat[chat_id] = hinted_sale
 
                 # Inferência: gasto de material sem ID VENDA explícito — tenta achar a venda na planilha.
                 cmd = parse_result.command
