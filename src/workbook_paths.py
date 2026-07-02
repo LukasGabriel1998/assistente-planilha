@@ -27,6 +27,43 @@ def is_workbook_candidate(path: Path) -> bool:
     return True
 
 
+def is_git_lfs_pointer(path: Path) -> bool:
+    try:
+        if not path.is_file() or path.stat().st_size > 512:
+            return False
+        head = path.read_text(encoding="utf-8", errors="ignore")
+        return head.startswith("version https://git-lfs.github.com/spec/v1")
+    except OSError:
+        return False
+
+
+def is_valid_workbook_file(path: Path) -> bool:
+    if not is_workbook_candidate(path):
+        return False
+    if is_git_lfs_pointer(path):
+        return False
+    import zipfile
+
+    try:
+        return zipfile.is_zipfile(path)
+    except OSError:
+        return False
+
+
+def workbook_setup_error(path: Path) -> str | None:
+    if not path.is_file():
+        return "arquivo nao encontrado"
+    if is_git_lfs_pointer(path):
+        return (
+            "arquivo ainda e um ponteiro do Git LFS (planilha real nao foi baixada). "
+            "Rode: sudo apt install git-lfs && git lfs install && git lfs pull "
+            "ou copie manualmente o .xlsx para esta pasta."
+        )
+    if not is_valid_workbook_file(path):
+        return "arquivo invalido ou corrompido — abra e salve novamente no Excel como .xlsx/.xlsm"
+    return None
+
+
 def iter_workbook_candidates(root: Path):
     if not root.exists():
         return
@@ -70,7 +107,9 @@ def default_workbook_path(search_roots: list[Path]) -> str:
         if resolved_root in seen or not resolved_root.exists():
             continue
         seen.add(resolved_root)
-        candidates.extend(iter_workbook_candidates(resolved_root))
+        for candidate in iter_workbook_candidates(resolved_root):
+            if is_valid_workbook_file(candidate):
+                candidates.append(candidate)
     if not candidates:
         return ""
     return str(_sorted_unique_candidates(candidates)[0])
@@ -88,10 +127,10 @@ def resolve_workbook_path(path_text: str) -> Path:
     if path.is_dir():
         candidates: list[Path] = []
         for ext in SUPPORTED_WORKBOOK_EXTS:
-            candidates.extend([p for p in path.glob(f"*{ext}") if is_workbook_candidate(p)])
+            candidates.extend([p for p in path.glob(f"*{ext}") if is_valid_workbook_file(p)])
         if not candidates:
             for ext in SUPPORTED_WORKBOOK_EXTS:
-                candidates.extend([p for p in path.rglob(f"*{ext}") if is_workbook_candidate(p)])
+                candidates.extend([p for p in path.rglob(f"*{ext}") if is_valid_workbook_file(p)])
         if not candidates:
             raise FileNotFoundError(
                 "Nenhuma planilha valida encontrada nessa pasta. Use .xlsx, .xlsm, .xltx ou .xltm."
@@ -105,4 +144,7 @@ def resolve_workbook_path(path_text: str) -> Path:
             "Arquivo temporario do Excel detectado (~$...). "
             "Selecione o arquivo principal da planilha."
         )
+    setup_error = workbook_setup_error(path)
+    if setup_error:
+        raise ValueError(f"Planilha invalida: {setup_error}")
     return path

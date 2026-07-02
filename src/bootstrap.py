@@ -208,6 +208,82 @@ def python_has_module(bootstrap: list[str], module: str) -> bool:
         return False
 
 
+def venv_has_pip(py: Path) -> bool:
+    return python_has_module([str(py)], "pip")
+
+
+def _venv_site_packages_for(py: Path) -> Path | None:
+    try:
+        proc = subprocess.run(
+            [str(py), "-c", "import site; print(site.getsitepackages()[0])"],
+            cwd=str(PROJECT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            return None
+        candidate = Path((proc.stdout or "").strip())
+        return candidate if candidate.is_dir() else None
+    except Exception:
+        return None
+
+
+def ensure_pip_in_venv(py: Path, *, prefix: str = "Projeto") -> None:
+    """Garante pip no venv (ensurepip ou fallback via Python do sistema)."""
+    if venv_has_pip(py):
+        return
+
+    log("pip ausente no ambiente virtual — configurando ...", prefix=prefix)
+
+    proc = subprocess.run(
+        [str(py), "-m", "ensurepip", "--upgrade", "--default-pip"],
+        cwd=str(PROJECT_DIR),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if proc.returncode == 0 and venv_has_pip(py):
+        log("pip instalado via ensurepip.", prefix=prefix)
+        return
+
+    site = _venv_site_packages_for(py)
+    if site is None:
+        raise SystemExit(
+            "Nao foi possivel localizar site-packages do .venv_native.\n"
+            "Recrie o ambiente: apague a pasta .venv_native e rode run_project.py de novo."
+        )
+
+    for bootstrap in find_bootstrap_python_candidates():
+        if not python_has_module(bootstrap, "pip"):
+            continue
+        proc = subprocess.run(
+            [
+                *bootstrap,
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "pip",
+                "--target",
+                str(site),
+            ],
+            cwd=str(PROJECT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if proc.returncode == 0 and venv_has_pip(py):
+            log("pip instalado via Python do sistema.", prefix=prefix)
+            return
+
+    raise SystemExit(
+        "Nao foi possivel instalar pip no .venv_native.\n"
+        "No Ubuntu/Debian: sudo apt install python3.12-venv python3-pip\n"
+        "Ou instale Python completo em https://www.python.org/downloads/"
+    )
+
+
 def _run_bootstrap(
     bootstrap: list[str], args: list[str], *, capture: bool = False
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
@@ -257,7 +333,10 @@ def activate_project_context() -> None:
 def ensure_venv(*, prefix: str = "Projeto") -> Path:
     py = venv_python()
     if python_works(py):
-        log("Ambiente virtual OK (.venv_native).", prefix=prefix)
+        if venv_has_pip(py):
+            log("Ambiente virtual OK (.venv_native).", prefix=prefix)
+        else:
+            ensure_pip_in_venv(py, prefix=prefix)
         return py
 
     if VENV_DIR.exists():
@@ -274,6 +353,7 @@ def ensure_venv(*, prefix: str = "Projeto") -> Path:
         ok, detail = create_venv_with(bootstrap)
         if ok:
             log(f"Ambiente virtual criado ({label}).", prefix=prefix)
+            ensure_pip_in_venv(py, prefix=prefix)
             return py
         if detail:
             errors.append(f"{label}: {detail}")
@@ -374,6 +454,59 @@ def _whisper_model_ready(model_size: str) -> Path | None:
     return None
 
 
+def _bundled_git_lfs() -> Path | None:
+    tools_dir = PROJECT_DIR / ".tools"
+    if not tools_dir.is_dir():
+        return None
+    for candidate in sorted(tools_dir.glob("git-lfs-*/git-lfs"), reverse=True):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _git_lfs_command() -> list[str] | None:
+    if shutil.which("git-lfs"):
+        return ["git-lfs"]
+    bundled = _bundled_git_lfs()
+    if bundled is not None:
+        return [str(bundled)]
+    proc = subprocess.run(
+        ["git", "lfs", "version"],
+        cwd=str(PROJECT_DIR),
+        capture_output=True,
+        timeout=30,
+    )
+    if proc.returncode == 0:
+        return ["git", "lfs"]
+    return None
+
+
+def _configured_workbook_path() -> Path | None:
+    workbook = os.getenv("WORKBOOK_PATH", "").strip().strip('"').strip("'")
+    if workbook:
+        return Path(workbook)
+    from src.workbook_paths import default_workbook_path
+
+    found = default_workbook_path([PROJECT_DIR])
+    return Path(found) if found else None
+
+
+def _workbook_needs_lfs_pull() -> bool:
+    from src.workbook_paths import is_git_lfs_pointer
+
+    workbook = _configured_workbook_path()
+    if workbook is None:
+        return False
+    return is_git_lfs_pointer(workbook)
+
+
+def _lfs_assets_ready() -> bool:
+    model_size = os.getenv("WHISPER_MODEL", "small").strip() or "small"
+    model_ok = _whisper_model_ready(model_size) is not None
+    workbook_ok = not _workbook_needs_lfs_pull()
+    return model_ok and workbook_ok
+
+
 def ensure_git_lfs_assets(*, prefix: str = "Projeto") -> None:
     """Baixa arquivos grandes do repositorio quando o clone veio sem Git LFS."""
     if not (PROJECT_DIR / ".git").is_dir():
@@ -381,25 +514,27 @@ def ensure_git_lfs_assets(*, prefix: str = "Projeto") -> None:
     if shutil.which("git") is None:
         log("Git nao encontrado — pulando git lfs pull.", prefix=prefix)
         return
-    if _whisper_model_ready(os.getenv("WHISPER_MODEL", "small").strip() or "small"):
+    if _lfs_assets_ready():
         return
 
-    proc = subprocess.run(
-        ["git", "lfs", "version"],
-        cwd=str(PROJECT_DIR),
-        capture_output=True,
-        timeout=30,
-    )
-    if proc.returncode != 0:
+    lfs_cmd = _git_lfs_command()
+    if lfs_cmd is None:
         log(
-            "Git LFS nao instalado — apos clone, instale Git LFS ou o modelo sera baixado depois.",
+            "Git LFS nao instalado — a planilha e outros arquivos grandes podem nao ter sido baixados.",
+            prefix=prefix,
+        )
+        log(
+            "No Ubuntu/Debian: sudo apt install git-lfs && git lfs install && git lfs pull",
             prefix=prefix,
         )
         return
 
+    if lfs_cmd[0].endswith("git-lfs"):
+        subprocess.run([*lfs_cmd, "install", "--local"], cwd=str(PROJECT_DIR), capture_output=True, timeout=60)
+
     log("Baixando arquivos grandes do repositorio (git lfs pull) ...", prefix=prefix)
     pull = subprocess.run(
-        ["git", "lfs", "pull"],
+        [*lfs_cmd, "pull"],
         cwd=str(PROJECT_DIR),
         capture_output=True,
         text=True,
@@ -407,9 +542,16 @@ def ensure_git_lfs_assets(*, prefix: str = "Projeto") -> None:
     )
     if pull.returncode == 0:
         log("Git LFS concluido.", prefix=prefix)
-    else:
-        err = (pull.stderr or pull.stdout or "").strip()
-        log(f"Git LFS pull falhou{': ' + err if err else ''}.", prefix=prefix)
+        return
+
+    err = (pull.stderr or pull.stdout or "").strip()
+    log(f"Git LFS pull falhou{': ' + err if err else ''}.", prefix=prefix)
+    if _workbook_needs_lfs_pull():
+        log(
+            "A planilha ainda esta como ponteiro LFS. Copie o .xlsx manualmente "
+            "ou rode git lfs pull com acesso ao GitHub.",
+            prefix=prefix,
+        )
 
 
 def ensure_whisper_model(py: Path, *, prefix: str = "Projeto") -> None:
@@ -465,7 +607,14 @@ def print_setup_report(*, prefix: str = "Projeto") -> None:
 
     workbook = os.getenv("WORKBOOK_PATH", "").strip().strip('"').strip("'")
     if workbook and Path(workbook).is_file():
-        log(f"  OK: planilha ({workbook})", prefix=prefix)
+        from src.workbook_paths import workbook_setup_error
+
+        setup_error = workbook_setup_error(Path(workbook))
+        if setup_error:
+            log(f"  ATENCAO: planilha ({workbook})", prefix=prefix)
+            log(f"           {setup_error}", prefix=prefix)
+        else:
+            log(f"  OK: planilha ({workbook})", prefix=prefix)
     else:
         log("  ATENCAO: planilha .xlsx nao encontrada — copie ou ajuste WORKBOOK_PATH no .env", prefix=prefix)
 
@@ -520,15 +669,32 @@ def ensure_env_file(*, prefix: str = "Projeto") -> None:
 
 def ensure_workbook_path(*, prefix: str = "Projeto") -> None:
     """Define WORKBOOK_PATH automaticamente se estiver vazio ou invalido nesta maquina."""
-    current = os.getenv("WORKBOOK_PATH", "").strip().strip('"').strip("'")
-    if current and Path(current).is_file():
-        return
+    from src.workbook_paths import default_workbook_path, is_valid_workbook_file, workbook_setup_error
 
-    from src.workbook_paths import default_workbook_path
+    current = os.getenv("WORKBOOK_PATH", "").strip().strip('"').strip("'")
+    if current:
+        current_path = Path(current)
+        if current_path.is_file():
+            setup_error = workbook_setup_error(current_path)
+            if setup_error is None:
+                return
+            log(f"WORKBOOK_PATH atual invalido: {setup_error}", prefix=prefix)
 
     found = default_workbook_path([PROJECT_DIR])
     if not found:
-        log("Nenhuma planilha .xlsx encontrada na pasta do projeto.", prefix=prefix)
+        log("Nenhuma planilha .xlsx valida encontrada na pasta do projeto.", prefix=prefix)
+        if current:
+            log(
+                "Copie a planilha real para o projeto ou rode: "
+                "sudo apt install git-lfs && git lfs install && git lfs pull",
+                prefix=prefix,
+            )
+        return
+
+    found_path = Path(found)
+    if not is_valid_workbook_file(found_path):
+        setup_error = workbook_setup_error(found_path)
+        log(f"Planilha encontrada, mas invalida: {setup_error or found}", prefix=prefix)
         return
 
     os.environ["WORKBOOK_PATH"] = found

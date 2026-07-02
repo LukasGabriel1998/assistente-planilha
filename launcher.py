@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from pathlib import Path
 import urllib.request
 
@@ -153,13 +154,53 @@ def wait_http_ready(port: int, timeout_sec: int = 90) -> bool:
     return False
 
 
+def native_desktop_supported() -> bool:
+    """pywebview instalado e com backend grafico disponivel nesta maquina."""
+    if webview is None:
+        return False
+    if sys.platform in ("win32", "darwin"):
+        return True
+    try:
+        import gi
+
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk  # noqa: F401
+
+        return True
+    except Exception:
+        pass
+    for qt_mod in ("PyQt6", "PyQt5", "PySide6"):
+        try:
+            __import__(qt_mod)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def desktop_window_supported() -> bool:
-    return webview is not None
+    return native_desktop_supported()
+
+
+def app_url(port: int) -> str:
+    return f"http://127.0.0.1:{port}"
+
+
+def open_app_in_browser(port: int) -> None:
+    url = app_url(port)
+    print(f"[App] Abrindo no navegador: {url}")
+    print("[App] Mantenha esta janela aberta. Use Ctrl+C para encerrar.")
+    webbrowser.open(url)
 
 
 def run_desktop_window(port: int) -> None:
     if webview is None:
         raise RuntimeError("pywebview nao esta instalado.")
+    if not native_desktop_supported():
+        raise RuntimeError(
+            "Janela nativa indisponivel neste sistema. "
+            "No Linux, instale GTK ou Qt, ou use o modo navegador."
+        )
 
     _set_windows_app_id()
     icon_path = resource_path("assets/p26.ico")
@@ -170,15 +211,27 @@ def run_desktop_window(port: int) -> None:
             daemon=True,
         ).start()
 
-    url = f"http://127.0.0.1:{port}"
     webview.create_window(
         APP_WINDOW_TITLE,
-        url=url,
+        url=app_url(port),
         width=1280,
         height=860,
         min_size=(1024, 720),
     )
     webview.start(debug=False)
+
+
+def wait_for_server_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except Exception:
+                pass
 
 
 def run_streamlit_server(port: int, workbook: str) -> None:
@@ -497,13 +550,8 @@ class LauncherUI:
             return
 
         if not desktop_window_supported():
-            self.set_status("Modo nativo indisponivel neste ambiente.", RED)
-            if messagebox:
-                messagebox.showerror(
-                    APP_TITLE,
-                    "O runtime nativo (pywebview) nao esta disponivel. "
-                    "Reinstale as dependencias do aplicativo.",
-                )
+            open_app_in_browser(self.port)
+            self.set_status("Aplicativo aberto no navegador.", MINT)
             return
 
         try:
@@ -571,12 +619,6 @@ def resolve_startup_workbook(workbook: str = "") -> str:
 
 
 def run_headless_fallback(workbook: str = "") -> None:
-    if not desktop_window_supported():
-        raise RuntimeError(
-            "O runtime nativo (pywebview) nao esta instalado. "
-            "Este aplicativo agora abre somente em modo nativo."
-        )
-
     port = find_available_port(8501)
     workbook = resolve_startup_workbook(workbook)
     command = build_server_command(port, workbook)
@@ -599,12 +641,15 @@ def run_headless_fallback(workbook: str = "") -> None:
             pass
         raise RuntimeError("Nao foi possivel iniciar o servidor local.")
 
-    try:
-        run_desktop_window(port)
-        return
-    finally:
-        if process.poll() is None:
-            process.terminate()
+    if desktop_window_supported():
+        try:
+            run_desktop_window(port)
+            return
+        except Exception:
+            print("[App] Janela nativa indisponivel — usando navegador.")
+
+    open_app_in_browser(port)
+    wait_for_server_process(process)
 
 
 def parse_args() -> argparse.Namespace:
@@ -643,7 +688,7 @@ if __name__ == "__main__":
 
     try:
         run_headless_fallback(workbook_override)
-    except Exception:
+    except Exception as exc:
         if messagebox:
-            messagebox.showerror(APP_TITLE, "Falha ao iniciar o aplicativo nativo.")
+            messagebox.showerror(APP_TITLE, f"Falha ao iniciar o aplicativo: {exc}")
         raise
