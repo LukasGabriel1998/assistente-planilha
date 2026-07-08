@@ -22,16 +22,6 @@
       "justMyCode": true
     },
     {
-      "name": "App desktop (launcher)",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/launcher.py",
-      "python": "${command:python.interpreterPath}",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "justMyCode": true
-    },
-    {
       "name": "API n8n",
       "type": "debugpy",
       "request": "launch",

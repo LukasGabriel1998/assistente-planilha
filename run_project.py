@@ -4,7 +4,7 @@
 Prepara o projeto — clique em Run aqui antes de usar o sistema.
 
 Instala/atualiza venv, bibliotecas, modelo Whisper, .env e planilha.
-Nao inicia o Telegram nem o App; depois rode telegram_bot.py (ou launcher.py).
+Nao inicia o Telegram; depois rode telegram_bot.py.
 
 Exemplo:
   python run_project.py

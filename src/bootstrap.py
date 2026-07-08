@@ -21,7 +21,6 @@ ENV_EXAMPLE = PROJECT_DIR / ".env.example"
 
 # Pacotes criticos verificados apos o pip install.
 REQUIRED_IMPORTS: tuple[tuple[str, str], ...] = (
-    ("streamlit", "streamlit"),
     ("openpyxl", "openpyxl"),
     ("dateparser", "dateparser"),
     ("requests", "requests"),
@@ -653,7 +652,6 @@ def print_ready_message(*, prefix: str = "Projeto") -> None:
         log("Setup concluido com avisos — revise o resumo acima.", prefix=prefix)
         log("Depois rode telegram_bot.py (Run).", prefix=prefix)
 
-    log("App desktop (opcional): launcher.py", prefix=prefix)
     log("API n8n (opcional): n8n_api.py", prefix=prefix)
 
 

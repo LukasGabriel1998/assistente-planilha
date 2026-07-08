@@ -10,7 +10,6 @@ dist/
 dist_novo/
 models_cache/
 .tools/
-.streamlit/
 *.xlsx
 *.xlsm
 *.xltx
