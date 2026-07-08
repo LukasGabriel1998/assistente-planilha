@@ -1,5 +1,7 @@
 {
-  "python.defaultInterpreterPath": "${workspaceFolder}/.venv_native/Scripts/python.exe",
+  "python.defaultInterpreterPath@linux": "${workspaceFolder}/.venv_native/bin/python",
+  "python.defaultInterpreterPath@osx": "${workspaceFolder}/.venv_native/bin/python",
+  "python.defaultInterpreterPath@windows": "${workspaceFolder}/.venv_native/Scripts/python.exe",
   "python.analysis.extraPaths": [
     "${workspaceFolder}"
   ],

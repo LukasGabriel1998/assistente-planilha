@@ -118,7 +118,6 @@ Para cancelar: `text: "NAO"` ou `action: "cancel"`.
 
 | Serviço | Comando | Porta |
 |---------|---------|-------|
-| App | `python launcher.py` | 8501 |
 | API n8n | `python n8n_api.py` | 8765 |
 | Bot Telegram (opcional) | `python telegram_bot.py` | — |
 

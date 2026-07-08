@@ -489,6 +489,107 @@ def _parse_reais_e_centavos(fragment: str) -> Optional[float]:
     return round(float(reais) + (cents / 100.0), 2)
 
 
+def _money_context_stop_pattern() -> str:
+    return (
+        r"\b(?:para|pra|cliente|id venda|id cliente|produto|data|dia|restante|saldo|"
+        r"amanha|amanhã|e o restante|e ela|e ele|mas|pagou|pagaram|entrada|entregar|"
+        r"entrega|vou|vai)\b"
+    )
+
+
+def _best_money_in_fragment(fragment: str) -> Optional[float]:
+    norm = _normalize(fragment or "")
+    if not norm:
+        return None
+    combined = _parse_reais_e_centavos(norm)
+    if combined is not None and combined > 0:
+        return combined
+    phrase_value = _parse_money_phrase(norm)
+    if phrase_value is not None and phrase_value > 0:
+        return phrase_value
+    return _parse_money_from_fragment(norm, prefer_leading=True)
+
+
+def _is_paid_in_full_context(text: str) -> bool:
+    norm = _normalize(text)
+    return any(
+        token in norm
+        for token in (
+            "a vista",
+            "à vista",
+            "avista",
+            "pagou tudo",
+            "pago integral",
+            "pagamento integral",
+            "pagou integral",
+            "quitado",
+            "quitou",
+            "pagou na hora",
+            "pago na hora",
+            "pagou o valor total",
+            "pagou o valor inteiro",
+        )
+    ) or bool(re.search(r"\b(?:me\s+)?pag(?:ou|aram|amos)\s+(?:tudo|integral)\b", norm))
+
+
+def _has_explicit_balance_context(text: str) -> bool:
+    norm = _normalize(text)
+    return any(
+        token in norm
+        for token in (
+            "saldo",
+            "restante",
+            "resto",
+            "pendente",
+            "vai pagar",
+            "vao pagar",
+            "vão pagar",
+            "vai me pagar",
+            "vou receber",
+            "receber",
+            "recebo",
+            "falta receber",
+            "metade depois",
+            "outra metade",
+        )
+    )
+
+
+def _reconcile_payment_amounts(
+    total: Optional[float],
+    entry: Optional[float],
+    balance: Optional[float],
+    text: str,
+) -> tuple[Optional[float], Optional[float]]:
+    if total is None or total <= 0:
+        return entry, balance
+
+    paid_in_full = _is_paid_in_full_context(text)
+    explicit_balance = _has_explicit_balance_context(text)
+
+    if paid_in_full and not explicit_balance:
+        return round(float(total), 2), 0.0
+
+    if entry is not None and balance is None:
+        diff = round(float(total) - float(entry), 2)
+        if 0 < diff < 1.0 and not explicit_balance:
+            return round(float(total), 2), 0.0
+
+    if entry is not None and balance is not None:
+        combined = round(float(entry) + float(balance), 2)
+        if (
+            not explicit_balance
+            and 0 < float(balance) < 1.0
+            and abs(combined - float(total)) <= 0.01
+        ):
+            return round(float(total), 2), 0.0
+        diff = round(float(total) - float(entry) - float(balance), 2)
+        if abs(diff) > 0.01 and 0 < float(balance) < 1.0 and not explicit_balance:
+            return round(float(total), 2), 0.0
+
+    return entry, balance
+
+
 def _parse_money_phrase(fragment: str) -> Optional[float]:
     norm = _normalize(fragment)
     combined = _parse_reais_e_centavos(norm)
@@ -529,9 +630,10 @@ def _word_window_after_prefix(text: str, prefix: str, max_words: int = 16) -> st
         return ""
     fragment = norm_text[match.end() :]
     fragment = re.split(
-        r"[,.;]|\b(?:para|pra|cliente|id venda|id cliente|produto|data|dia|restante|saldo|amanha|amanhã|e o restante|e ela|e ele|mas|pagou|pagaram|entrada)\b",
+        _money_context_stop_pattern(),
         fragment,
         maxsplit=1,
+        flags=re.IGNORECASE,
     )[0]
     words = fragment.strip().split()
     return " ".join(words[:max_words])
@@ -882,9 +984,10 @@ def parse_structured_sale_form(
     if total_value and payments:
         paid = round(sum(p.value for p in payments if p.status == "pago"), 2)
         pending = round(sum(p.value for p in payments if p.status != "pago"), 2)
-        if abs((paid + pending) - float(total_value)) >= 0.01 and pending <= 0.01 and paid > 0:
+        diff = round(float(total_value) - paid - pending, 2)
+        if abs(diff) >= 0.01 and pending <= 0.01 and paid > 0:
             saldo = round(max(float(total_value) - paid, 0), 2)
-            if saldo > 0.01:
+            if saldo > 0.01 and _has_explicit_balance_context(raw) and not _is_paid_in_full_context(raw):
                 payments.append(
                     Payment(
                         label="Saldo",
@@ -893,6 +996,11 @@ def parse_structured_sale_form(
                         status="pendente",
                     )
                 )
+            elif saldo > 0.01 and saldo < 1.0 and not _has_explicit_balance_context(raw):
+                for payment in payments:
+                    if payment.label == "Entrada" and payment.status == "pago":
+                        payment.value = round(float(total_value), 2)
+                        break
 
     material_cost = _extract_material_cost(raw)
     material_txt = _structured_field(raw, "material")
@@ -1873,19 +1981,25 @@ def _extract_amount_after_prefix(text: str, prefixes: list[str], max_gap_words: 
         match = re.search(pattern, norm_text, flags=re.IGNORECASE)
         if match:
             token = match.group(1)
+            value: Optional[float] = None
             if _is_money_like(token):
                 value = _parse_money_from_fragment(token)
                 if value is not None and value > 0:
-                    # Transcrição de áudio: "cinco mil" pode ser capturado só como "mil" (1000).
                     if token.strip().lower() == "mil":
                         word_fragment = _word_window_after_prefix(text, prefix)
-                        word_value = _parse_money_from_fragment(word_fragment, prefer_leading=True)
+                        word_value = _best_money_in_fragment(word_fragment)
                         if word_value is not None and word_value > value:
                             return word_value
-                    return value
+            word_fragment = _word_window_after_prefix(text, prefix)
+            word_value = _best_money_in_fragment(word_fragment)
+            if word_value is not None and word_value > 0:
+                if value is None or word_value >= value - 0.01:
+                    return word_value
+            if value is not None and value > 0:
+                return value
         if re.search(prefix, norm_text, flags=re.IGNORECASE):
             word_fragment = _word_window_after_prefix(text, prefix)
-            word_value = _parse_money_from_fragment(word_fragment, prefer_leading=True)
+            word_value = _best_money_in_fragment(word_fragment)
             if word_value is not None and word_value > 0:
                 return word_value
     return None
@@ -1948,6 +2062,14 @@ def _extract_total_value(text: str, numbers: list[float]) -> Optional[float]:
         return value
     if not numbers:
         return None
+    if "centavo" in norm or re.search(
+        r"\d[\d.,\s]*\s+e\s+\d{1,2}\s*centavos?\b",
+        norm,
+        flags=re.IGNORECASE,
+    ):
+        combined_values = [n for n in numbers if n > 0]
+        if combined_values:
+            return max(combined_values)
     big = [number for number in numbers if number >= 100]
     # Se houver múltiplos valores grandes na mesma frase, preferimos o MAIOR como total,
     # principalmente quando o texto menciona pagamento/entrada (ex.: "pagou 15000, entrada 8000").
@@ -1961,7 +2083,7 @@ def _parse_money_after_position(text: str, start: int) -> Optional[float]:
     tail = re.sub(r"^de\s+", "", tail, flags=re.IGNORECASE)
     chunk = re.split(
         r"\s+e\s+(?:o|a)\s+"
-        r"|\s*,|\s*\.\s"
+        r"|\s*,\s*(?=[a-z])"
         r"|\s+(?:no|na|em)\s+(?:o|a)\s+"
         r"|\s+(?:o|a)\s+(?!restante\b)(?:cliente|vendi|vendemos|um\b|uma\b|banner|fachada|painel|placa|\w+\s+vendi\b)"
         r"|\s+o\s+restante|\s+restante",
@@ -1969,7 +2091,7 @@ def _parse_money_after_position(text: str, start: int) -> Optional[float]:
         maxsplit=1,
         flags=re.IGNORECASE,
     )[0].strip()
-    direct = _parse_money_from_fragment(chunk, prefer_leading=True)
+    direct = _best_money_in_fragment(chunk)
     if direct is not None and direct > 0:
         return direct
     words = chunk.split()
@@ -3252,6 +3374,13 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
     if total_value and balance_value is not None and entry_value is None:
         entry_value = round(max(total_value - balance_value, 0), 2)
         warnings.append("Entrada calculada automaticamente (total - saldo).")
+
+    entry_value, balance_value = _reconcile_payment_amounts(
+        total_value,
+        entry_value,
+        balance_value,
+        raw_text,
+    )
 
     payments: list[Payment] = []
     if entry_value and entry_value > 0:

@@ -97,6 +97,14 @@ class SpreadsheetService:
                 "Nao foi possivel abrir a planilha. Feche o arquivo no Excel e tente novamente."
             ) from exc
         except zipfile.BadZipFile as exc:
+            from .workbook_paths import is_git_lfs_pointer
+
+            if is_git_lfs_pointer(self.workbook_path):
+                raise ValueError(
+                    "A planilha no disco ainda e um ponteiro do Git LFS (arquivo real nao baixado). "
+                    "Rode: sudo apt install git-lfs && git lfs install && git lfs pull "
+                    "ou copie manualmente o .xlsx e ajuste WORKBOOK_PATH no .env."
+                ) from exc
             raise ValueError(
                 "Arquivo de planilha invalido ou corrompido. "
                 "Abra e salve novamente no Excel como .xlsx/.xlsm."
