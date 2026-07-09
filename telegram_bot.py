@@ -159,7 +159,10 @@ Ao salvar, a planilha gera o 🧾 *ID VENDA* (ex.: 012). *Guarde esse código.*
 🔹🔹🔹
 
 ⚡ *Botões rápidos*
-📋 *Prévia* | 📊 *Resumo* | 🆕 *Nova conversa*
+📋 *Prévia* — pendências e entregas
+📊 *Resumo* — totais gerais
+🔍 *Detalhes* — quem pagou, quem deve e de quê
+🆕 *Nova conversa* — limpa o ID VENDA ativo
 
 🔁 *ID VENDA na conversa*
 Depois que informar um ID, o bot mantém para custos, pagamentos e entregas até *Nova conversa*.
@@ -172,7 +175,8 @@ Depois que informar um ID, o bot mantém para custos, pagamentos e entregas até
 MAIN_MENU_KEYBOARD = {
     "keyboard": [
         ["Prévia", "Resumo"],
-        ["Ajuda", "Nova conversa"],
+        ["Detalhes", "Nova conversa"],
+        ["Ajuda"],
     ],
     "resize_keyboard": True,
     "one_time_keyboard": False,
@@ -245,6 +249,8 @@ QUICK_DASHBOARD_KEYWORDS = (
     "planilha",
     "prévia",
     "previa",
+    "detalhes",
+    "detalhe",
 )
 
 _FONT_CACHE: dict[tuple[int, bool], object] = {}
@@ -468,11 +474,8 @@ def _maybe_build_status_table_image(
     font_label = _load_telegram_font(17, bold=False)
     font_value = _load_telegram_font(24, bold=True)
 
-    # Grade 2x3: mais legível no Telegram do que 6 colunas em uma única faixa
+    # Só o essencial na imagem — totais de vendas ficam no texto do Resumo.
     kpi = [
-        ("Total de vendas (geral)", _brl(total_sales), False),
-        ("Vendas pagas", _brl(total_paid), False),
-        ("Valor pendente", _brl(total_pending), False),
         ("Compras matéria-prima", _brl(total_mat), False),
         ("Gastos fixos", _brl(total_fix), False),
         ("Lucro estimado", _brl(lucro), True),
@@ -494,10 +497,10 @@ def _maybe_build_status_table_image(
     title_h = 54
     meta_h = 30
     gap = 14
-    cols = 2
-    rows = 3
+    cols = 3
+    rows = 1
     inner_w = card_w - pad * 2
-    cell_w = (inner_w - gap) // 2
+    cell_w = (inner_w - gap * (cols - 1)) // cols
     cell_h = 96
 
     card_h = pad + title_h + 8 + meta_h + 12 + rows * cell_h + (rows - 1) * gap + pad
@@ -522,7 +525,7 @@ def _maybe_build_status_table_image(
     draw.text((cx0 + (card_w - tw) / 2, cy0 + 14), title, fill=(255, 255, 255), font=font_title)
     draw.text(
         (cx0 + pad, bar_y1 + 6),
-        "Resumo calculado a partir da planilha • atualizado ao vivo",
+        "Custos e lucro • totais de vendas no texto abaixo",
         fill=label_muted,
         font=font_meta,
     )
@@ -565,6 +568,7 @@ def _maybe_build_sales_snippet_image(
     limit: int = 7,
     title_main: str = "TOTAL DE VENDAS - Visão atual",
     meta_line: str | None = None,
+    snippet_mode: str = "preview",
 ) -> str | None:
     """
     Gera um "mini-dashboard" da aba de Vendas (clientes, pagos/pendentes, datas).
@@ -586,18 +590,26 @@ def _maybe_build_sales_snippet_image(
             ws = wb[svc._resolve_sheet_name(wb, SHEET_SALES)]
             cols = svc._sales_columns(ws)
             material_totals = svc.material_costs_by_sale_id(wb)
-            # Ordem e labels fixos para ficar consistente/legível.
-            display_cols = [
-                ("data de venda", "Data da venda"),
-                ("data de entrega", "Data entrega"),
-                ("cliente", "Cliente"),
-                ("id produto", "Produto"),
-                ("__material__", "Custo material"),
-                ("total de vendas (pago)", "Pago"),
-                ("valor (pendente)", "Pendente"),
-                ("id venda", "ID VENDA"),
-                ("status de valor", "Status"),
-            ]
+            if snippet_mode == "details":
+                display_cols = [
+                    ("cliente", "Cliente"),
+                    ("id produto", "Produto"),
+                    ("total de vendas (pago)", "Entrada"),
+                    ("valor (pendente)", "Pendente"),
+                    ("__material__", "Material"),
+                ]
+            else:
+                display_cols = [
+                    ("data de venda", "Data da venda"),
+                    ("data de entrega", "Data entrega"),
+                    ("cliente", "Cliente"),
+                    ("id produto", "Produto"),
+                    ("__material__", "Custo material"),
+                    ("total de vendas (pago)", "Pago"),
+                    ("valor (pendente)", "Pendente"),
+                    ("id venda", "ID VENDA"),
+                    ("status de valor", "Status"),
+                ]
             col_pairs: list[tuple[str | None, str, str]] = []
             for key, label in display_cols:
                 if key == "__material__":
@@ -641,9 +653,12 @@ def _maybe_build_sales_snippet_image(
                         break
 
             # Pega as últimas N linhas e garante que a destacada esteja incluída.
-            last_rows = data_rows[-max(limit, 3):]
-            if highlight_row not in last_rows:
-                last_rows = (last_rows + [highlight_row])[-max(limit, 3):]
+            if snippet_mode == "details":
+                last_rows = data_rows[-max(limit, 3):]
+            else:
+                last_rows = data_rows[-max(limit, 3):]
+                if highlight_row not in last_rows:
+                    last_rows = (last_rows + [highlight_row])[-max(limit, 3):]
 
             # Cabeçalho: normalmente fica na linha anterior ao início dos dados.
             headers = [label for _c, label, _key in col_pairs]
@@ -675,16 +690,19 @@ def _maybe_build_sales_snippet_image(
 
             rows_txt = [[_cell_txt(c, key, r) for c, _label, key in col_pairs] for r in last_rows]
             delivery_cell_states: list[bool | None] = []
-            for r in last_rows:
-                delivery_col = cols.get("data de entrega")
-                state: bool | None = None
-                if delivery_col:
-                    cell = ws[f"{delivery_col}{r}"]
-                    if svc._cell_fill_matches(cell, "FFF59D"):
-                        state = True
-                    elif svc._cell_fill_matches(cell, "C8E6C9"):
-                        state = False
-                delivery_cell_states.append(state)
+            if snippet_mode != "details":
+                for r in last_rows:
+                    delivery_col = cols.get("data de entrega")
+                    state: bool | None = None
+                    if delivery_col:
+                        cell = ws[f"{delivery_col}{r}"]
+                        if svc._cell_fill_matches(cell, "FFF59D"):
+                            state = True
+                        elif svc._cell_fill_matches(cell, "C8E6C9"):
+                            state = False
+                    delivery_cell_states.append(state)
+            else:
+                delivery_cell_states = [None] * len(last_rows)
         finally:
             if own_wb:
                 wb.close()
@@ -744,7 +762,10 @@ def _maybe_build_sales_snippet_image(
             maxw = max(maxw, tlen(rr[ci], font_body))
         cap = 360 if ci == 3 else 230
         floor = 115 if headers[ci] in ("Data da venda", "Data entrega", "ID VENDA", "Status") else 140
-        if headers[ci] == "Custo material":
+        if headers[ci] in ("Custo material", "Material"):
+            floor = 130
+            cap = 200
+        if headers[ci] == "Entrada":
             floor = 130
             cap = 200
         col_widths.append(max(floor, min(cap, maxw + cell_pad_x * 2)))
@@ -833,7 +854,7 @@ def _maybe_build_sales_snippet_image(
         delivery_state = delivery_cell_states[ri - 1] if ri - 1 < len(delivery_cell_states) else None
         for ci, txt in enumerate(rvals):
             w = col_widths[ci]
-            is_money_col = headers[ci] in ("Pago", "Pendente", "Custo material")
+            is_money_col = headers[ci] in ("Pago", "Pendente", "Custo material", "Entrada", "Material")
             base_fill = highlight_bg if pending_row else (zebra if (ri % 2 == 0) else (255, 255, 255))
             if headers[ci] == "Data entrega":
                 if delivery_state is True:
@@ -1151,6 +1172,9 @@ def _dashboard_wait_message(cmd_strip: str) -> str:
     if cmd_strip.startswith(("prévia", "previa")):
         title = "a prévia"
         detail = "pendências e entregas"
+    elif cmd_strip.startswith(("detalhes", "detalhe")):
+        title = "os detalhes"
+        detail = "quem pagou, quem deve e de quê"
     elif cmd_strip.startswith("status"):
         title = "o status financeiro"
         detail = "lucro e totais"
@@ -1611,6 +1635,17 @@ def _build_dashboard_reply(cmd_strip: str) -> tuple[str, str | None]:
                 title_main="TOTAL DE VENDAS - Visão atual",
                 meta_line="Pendências e entregas • Atualizado ao vivo com base na planilha",
             )
+        elif cmd_strip.startswith(("detalhes", "detalhe")):
+            reply = svc.get_planilha_details(wb=wb)
+            img_path = _maybe_build_sales_snippet_image(
+                workbook_path,
+                wb=wb,
+                svc=svc,
+                limit=12,
+                title_main="DETALHES — O QUE COMPÕE O RESUMO",
+                meta_line="Cliente, produto, entrada e pendente por venda",
+                snippet_mode="details",
+            )
         elif cmd_strip.startswith(("status", "resumo", "planilha")):
             reply = svc.get_planilha_summary(wb=wb)
             img_path = _maybe_build_status_table_image(workbook_path, wb=wb, svc=svc)
@@ -1638,7 +1673,7 @@ def _handle_quick_dashboard_command(
     cmd_strip = (text or "").strip().lower()
     if not _is_quick_dashboard_command(cmd_strip):
         return False
-    if not cmd_strip.startswith(("status", "resumo", "planilha", "prévia", "previa")):
+    if not cmd_strip.startswith(("status", "resumo", "planilha", "prévia", "previa", "detalhes", "detalhe")):
         return False
 
     now = time.time()

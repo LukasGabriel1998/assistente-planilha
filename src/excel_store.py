@@ -2809,15 +2809,170 @@ class SpreadsheetService:
             return "\n".join(
                 [
                     f"• Total Vendas: {_format_currency_pt(total_vendas)}",
-                    f"• Total de vendas (pago): {_format_currency_pt(total_pago)}",
-                    f"• Valor (pendente): {_format_currency_pt(total_pendente)}",
+                    f"• Entradas recebidas: {_format_currency_pt(total_pago)}",
+                    f"• A receber (pendente): {_format_currency_pt(total_pendente)}",
                     f"• Total Compras Materia Prima: {_format_currency_pt(total_mat)}",
                     f"• Gastos Fixos: {_format_currency_pt(total_fixos)}",
                     f"• Lucro: {_format_currency_pt(lucro)}",
+                    "",
+                    "_Toque em *Detalhes* para ver cliente, produto e de quê é cada valor._",
                 ]
             )
         except Exception as e:
             return f"Erro ao ler planilha: {e}"
+        finally:
+            if own_wb:
+                wb.close()
+
+    def get_planilha_details(self, limit_per_section: int = 15, wb=None) -> str:
+        """Detalhamento do resumo: quem pagou, quem deve, materiais e gastos fixos."""
+        own_wb = wb is None
+        if own_wb:
+            wb = self._open_workbook(data_only=True)
+        try:
+            def _fmt(value: float) -> str:
+                txt = f"{float(value):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                return f"R$ {txt}"
+
+            sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
+            ws_sales = wb[sales_name]
+            sales_cols = self._sales_columns(ws_sales)
+            col_id = sales_cols.get("id venda")
+            col_customer = sales_cols.get("cliente")
+            col_desc = sales_cols.get("id produto")
+            col_paid = sales_cols.get("total de vendas (pago)")
+            col_pending = sales_cols.get("valor (pendente)")
+            sales_end = (
+                self._effective_data_end_row(ws_sales, col_id)
+                if col_id
+                else self._scan_row_cap(ws_sales)
+            )
+
+            paid_rows: list[dict[str, object]] = []
+            pending_rows: list[dict[str, object]] = []
+            if col_id:
+                for row in range(DATA_START_ROW, sales_end + 1):
+                    sale_id = str(ws_sales[f"{col_id}{row}"].value or "").strip()
+                    if not sale_id:
+                        continue
+                    customer = str(ws_sales[f"{col_customer}{row}"].value or "").strip() if col_customer else ""
+                    desc = str(ws_sales[f"{col_desc}{row}"].value or "").strip() if col_desc else ""
+                    paid = self._to_float(ws_sales[f"{col_paid}{row}"].value) if col_paid else 0.0
+                    pending = self._to_float(ws_sales[f"{col_pending}{row}"].value) if col_pending else 0.0
+                    if paid > 0.01:
+                        paid_rows.append(
+                            {"id": sale_id, "cliente": customer, "desc": desc, "valor": paid}
+                        )
+                    if pending > 0.01:
+                        pending_rows.append(
+                            {"id": sale_id, "cliente": customer, "desc": desc, "valor": pending}
+                        )
+
+            material_name = self._resolve_sheet_name(wb, SHEET_MATERIAL)
+            ws_mat = wb[material_name]
+            mat_cols = self._material_columns(ws_mat)
+            col_mat_desc = mat_cols.get("descricao")
+            col_mat_val = mat_cols.get("valor")
+            col_mat_sid = mat_cols.get("id venda")
+            mat_end = (
+                self._effective_data_end_row(ws_mat, col_mat_desc)
+                if col_mat_desc
+                else self._scan_row_cap(ws_mat)
+            )
+            material_rows: list[dict[str, object]] = []
+            sale_customer_by_id: dict[str, str] = {
+                str(item["id"]): str(item.get("cliente") or "")
+                for item in paid_rows + pending_rows
+            }
+            for row in range(DATA_START_ROW, mat_end + 1):
+                desc = str(ws_mat[f"{col_mat_desc}{row}"].value or "").strip() if col_mat_desc else ""
+                amount = self._to_float(ws_mat[f"{col_mat_val}{row}"].value) if col_mat_val else 0.0
+                if amount <= 0.01 and not desc:
+                    continue
+                if amount <= 0.01:
+                    continue
+                sale_id = str(ws_mat[f"{col_mat_sid}{row}"].value or "").strip() if col_mat_sid else ""
+                material_rows.append(
+                    {
+                        "id": sale_id,
+                        "cliente": sale_customer_by_id.get(sale_id, ""),
+                        "desc": desc,
+                        "valor": amount,
+                    }
+                )
+
+            fixed_name = self._resolve_sheet_name(wb, SHEET_FIXED)
+            ws_fix = wb[fixed_name]
+            fix_end = self._scan_row_cap(ws_fix)
+            fixed_rows: list[dict[str, object]] = []
+            for row in range(DATA_START_ROW, fix_end + 1):
+                amount = self._to_float(ws_fix[f"D{row}"].value)
+                if amount <= 0.01:
+                    continue
+                desc_b = str(ws_fix[f"B{row}"].value or "").strip()
+                desc_c = str(ws_fix[f"C{row}"].value or "").strip()
+                desc = " — ".join(p for p in (desc_b, desc_c) if p) or desc_b or desc_c or "Gasto fixo"
+                fixed_rows.append({"desc": desc, "valor": amount})
+
+            lines = ["📋 *Detalhes do resumo*", ""]
+
+            lines.append("*Entradas recebidas*")
+            if paid_rows:
+                for item in paid_rows[-limit_per_section:]:
+                    who = item["cliente"] or "Cliente não informado"
+                    prod = f" — {item['desc']}" if item.get("desc") else ""
+                    lines.append(
+                        f"• {who}{prod} | ID {item['id']} | {_fmt(float(item['valor']))}"
+                    )
+                if len(paid_rows) > limit_per_section:
+                    lines.append(f"  _… e mais {len(paid_rows) - limit_per_section} entrada(s)_")
+            else:
+                lines.append("• Nenhuma entrada registrada.")
+            lines.append("")
+
+            lines.append("*A receber (pendente)*")
+            if pending_rows:
+                for item in pending_rows[-limit_per_section:]:
+                    who = item["cliente"] or "Cliente não informado"
+                    prod = f" — {item['desc']}" if item.get("desc") else ""
+                    lines.append(
+                        f"• {who}{prod} | ID {item['id']} | {_fmt(float(item['valor']))}"
+                    )
+                if len(pending_rows) > limit_per_section:
+                    lines.append(f"  _… e mais {len(pending_rows) - limit_per_section} pendência(s)_")
+            else:
+                lines.append("• Nenhum valor pendente.")
+            lines.append("")
+
+            lines.append("*Materiais (por venda)*")
+            if material_rows:
+                for item in material_rows[-limit_per_section:]:
+                    who = item.get("cliente") or "—"
+                    sid = f"ID {item['id']} | " if item.get("id") else ""
+                    desc = f" — {item['desc']}" if item.get("desc") else ""
+                    lines.append(
+                        f"• {sid}{who}{desc} | {_fmt(float(item['valor']))}"
+                    )
+                if len(material_rows) > limit_per_section:
+                    lines.append(f"  _… e mais {len(material_rows) - limit_per_section} lançamento(s)_")
+            else:
+                lines.append("• Nenhum material registrado.")
+            lines.append("")
+
+            lines.append("*Gastos fixos*")
+            if fixed_rows:
+                for item in fixed_rows[-limit_per_section:]:
+                    lines.append(f"• {item['desc']} | {_fmt(float(item['valor']))}")
+                if len(fixed_rows) > limit_per_section:
+                    lines.append(f"  _… e mais {len(fixed_rows) - limit_per_section} gasto(s)_")
+            else:
+                lines.append("• Nenhum gasto fixo registrado.")
+
+            lines.append("")
+            lines.append("_Toque em *Resumo* para ver só os totais._")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Erro ao ler detalhes da planilha: {e}"
         finally:
             if own_wb:
                 wb.close()
