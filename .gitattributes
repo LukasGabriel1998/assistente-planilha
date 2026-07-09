@@ -2,4 +2,3 @@
 *.dll filter=lfs diff=lfs merge=lfs -text
 *.bin filter=lfs diff=lfs merge=lfs -text
 *.onnx filter=lfs diff=lfs merge=lfs -text
-dist_novo/AssistentePlanilha/** filter=lfs diff=lfs merge=lfs -text
