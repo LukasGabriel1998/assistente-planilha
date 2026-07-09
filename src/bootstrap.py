@@ -604,18 +604,27 @@ def print_setup_report(*, prefix: str = "Projeto") -> None:
     else:
         log("  ATENCAO: ambiente virtual incompleto", prefix=prefix)
 
-    workbook = os.getenv("WORKBOOK_PATH", "").strip().strip('"').strip("'")
-    if workbook and Path(workbook).is_file():
-        from src.workbook_paths import workbook_setup_error
+    from src.spreadsheet_config import spreadsheet_config_status, uses_google_sheets
 
-        setup_error = workbook_setup_error(Path(workbook))
-        if setup_error:
-            log(f"  ATENCAO: planilha ({workbook})", prefix=prefix)
-            log(f"           {setup_error}", prefix=prefix)
-        else:
-            log(f"  OK: planilha ({workbook})", prefix=prefix)
+    sheet_status = spreadsheet_config_status()
+    if sheet_status.ready:
+        log(f"  OK: planilha ({sheet_status.backend}) — {sheet_status.message}", prefix=prefix)
+    elif uses_google_sheets():
+        log("  ATENCAO: Google Sheets incompleto no .env", prefix=prefix)
+        log(f"           {sheet_status.message}", prefix=prefix)
     else:
-        log("  ATENCAO: planilha .xlsx nao encontrada — copie ou ajuste WORKBOOK_PATH no .env", prefix=prefix)
+        workbook = os.getenv("WORKBOOK_PATH", "").strip().strip('"').strip("'")
+        if workbook and Path(workbook).is_file():
+            from src.workbook_paths import workbook_setup_error
+
+            setup_error = workbook_setup_error(Path(workbook))
+            if setup_error:
+                log(f"  ATENCAO: planilha ({workbook})", prefix=prefix)
+                log(f"           {setup_error}", prefix=prefix)
+            else:
+                log(f"  OK: planilha ({workbook})", prefix=prefix)
+        else:
+            log("  ATENCAO: planilha .xlsx nao encontrada — copie ou ajuste WORKBOOK_PATH no .env", prefix=prefix)
 
     model_size = os.getenv("WHISPER_MODEL", "small").strip() or "small"
     model_path = _whisper_model_ready(model_size)
@@ -667,6 +676,11 @@ def ensure_env_file(*, prefix: str = "Projeto") -> None:
 
 def ensure_workbook_path(*, prefix: str = "Projeto") -> None:
     """Define WORKBOOK_PATH automaticamente se estiver vazio ou invalido nesta maquina."""
+    from src.spreadsheet_config import uses_google_sheets
+
+    if uses_google_sheets():
+        return
+
     from src.workbook_paths import default_workbook_path, is_valid_workbook_file, workbook_setup_error
 
     current = os.getenv("WORKBOOK_PATH", "").strip().strip('"').strip("'")
@@ -709,6 +723,27 @@ def ensure_workbook_path(*, prefix: str = "Projeto") -> None:
         if not updated:
             lines.append(f"WORKBOOK_PATH={found}")
         ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def ensure_spreadsheet_config(*, prefix: str = "Projeto") -> None:
+    """Valida Google Sheets ou Excel conforme SPREADSHEET_BACKEND no .env."""
+    from src.spreadsheet_config import spreadsheet_config_status, uses_google_sheets
+
+    status = spreadsheet_config_status()
+    if status.ready:
+        log(f"Planilha ({status.backend}): {status.message}", prefix=prefix)
+        return
+
+    if uses_google_sheets():
+        log(f"Google Sheets: {status.message}", prefix=prefix)
+        log(
+            "Quando tiver a planilha, preencha GOOGLE_SHEETS_ID no .env e coloque o JSON "
+            "da conta de servico em credentials/google-service-account.json",
+            prefix=prefix,
+        )
+        return
+
+    ensure_workbook_path(prefix=prefix)
 
 
 def load_dotenv_into_os() -> None:
@@ -847,7 +882,7 @@ def setup_project(*, verbose: bool = True, prefix: str = "Projeto") -> Path:
     py = ensure_venv(prefix=prefix)
     ensure_requirements(py, verbose=verbose, prefix=prefix)
     verify_imports(py, prefix=prefix)
-    ensure_workbook_path(prefix=prefix)
+    ensure_spreadsheet_config(prefix=prefix)
     ensure_whisper_model(py, prefix=prefix)
     print_setup_report(prefix=prefix)
     log("Projeto pronto para rodar nesta maquina.", prefix=prefix)

@@ -18,8 +18,10 @@ from .bot_processor import (
     build_preview,
     get_default_workbook,
     process_command,
+    spreadsheet_setup_hint,
 )
 from .parser import ParseResult, apply_multi_field_corrections, parse_message
+from .spreadsheet_config import spreadsheet_config_status, uses_google_sheets
 from .transcription import TranscriptionError, transcribe_audio
 
 CONFIRM_WORDS = frozenset(
@@ -71,11 +73,20 @@ def handle_message(
     lower = raw.lower()
 
     workbook = get_default_workbook()
-    if not workbook:
+    if uses_google_sheets():
+        if not spreadsheet_config_status().ready:
+            return {
+                "ok": False,
+                "conversation_id": conv,
+                "reply": spreadsheet_setup_hint(),
+                "needs_confirmation": False,
+                "applied": False,
+            }
+    elif not workbook:
         return {
             "ok": False,
             "conversation_id": conv,
-            "reply": "Planilha nao encontrada. Configure WORKBOOK_PATH no .env.",
+            "reply": spreadsheet_setup_hint(),
             "needs_confirmation": False,
             "applied": False,
         }

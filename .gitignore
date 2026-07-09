@@ -3,6 +3,8 @@ src/__pycache__/
 .venv/
 .venv_native/
 .env
+credentials/
+!credentials/.gitkeep
 *.pyc
 build/
 dist/

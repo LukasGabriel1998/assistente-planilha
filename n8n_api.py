@@ -175,7 +175,7 @@ async def post_transcribe(
 def main() -> None:
     import uvicorn
 
-    print(f"[n8n API] Planilha: {os.getenv('WORKBOOK_PATH', '(auto)')}")
+    print(f"[n8n API] Planilha: {os.getenv('SPREADSHEET_BACKEND', 'excel')} / {os.getenv('GOOGLE_SHEETS_ID') or os.getenv('WORKBOOK_PATH', '(auto)')}")
     print(f"[n8n API] http://{HOST}:{PORT}  |  docs: http://{HOST}:{PORT}/docs")
     if API_KEY:
         print("[n8n API] Autenticacao: header X-API-Key")

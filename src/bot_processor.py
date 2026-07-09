@@ -95,8 +95,25 @@ def _load_sale_context_for_preview(sale_id: str) -> dict[str, str | float] | Non
         return None
 
 
+def spreadsheet_setup_hint() -> str:
+    """Mensagem curta quando a planilha (Google ou Excel) nao esta pronta."""
+    from .spreadsheet_config import spreadsheet_config_status, uses_google_sheets
+
+    status = spreadsheet_config_status()
+    if uses_google_sheets():
+        if not status.ready:
+            return status.message
+        return "Google Sheets configurado no .env, mas a integracao ainda esta sendo ativada."
+    return "Planilha nao encontrada. Configure WORKBOOK_PATH no .env ou coloque a planilha na pasta do app."
+
+
 def get_default_workbook() -> str:
-    """Retorna o caminho da planilha (env WORKBOOK_PATH ou busca em cwd/pai)."""
+    """Retorna o caminho da planilha Excel (ignorado quando SPREADSHEET_BACKEND=google)."""
+    from .spreadsheet_config import uses_google_sheets
+
+    if uses_google_sheets():
+        return ""
+
     env_path = os.getenv("WORKBOOK_PATH", "").strip()
     if env_path:
         try:
@@ -277,7 +294,7 @@ def build_preview(parse_result: ParseResult) -> str:
         if not workbook_path or not Path(workbook_path).exists():
             return (
                 "📋 *Entendi assim: atualizar status*\n\n"
-                "Planilha nao encontrada para montar a previa. Configure WORKBOOK_PATH no .env."
+                spreadsheet_setup_hint()
             )
         service = SpreadsheetService(workbook_path)
         try:
@@ -508,7 +525,7 @@ def apply_parse_result(
     """Aplica um ParseResult já validado na planilha e retorna a mensagem de resposta."""
     workbook_path = get_default_workbook()
     if not workbook_path or not Path(workbook_path).exists():
-        return "Planilha nao encontrada. Configure WORKBOOK_PATH no .env."
+        return spreadsheet_setup_hint()
     service = SpreadsheetService(workbook_path)
     actions: list = []
     cmd = parse_result.command
@@ -638,7 +655,7 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
         if not re.search(r"\bpagou\b\s*(?:r\$\s*)?\d{2,}", cmd_lower):
             workbook_path = get_default_workbook()
             if not workbook_path or not Path(workbook_path).exists():
-                return "Planilha nao encontrada. Configure WORKBOOK_PATH no .env."
+                return spreadsheet_setup_hint()
             service = SpreadsheetService(workbook_path)
 
             ids: list[str] = []
@@ -670,7 +687,7 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
     if any(cmd_strip.startswith(kw) for kw in SUMMARY_KEYWORDS):
         workbook_path = get_default_workbook()
         if not workbook_path or not Path(workbook_path).exists():
-            return "Planilha nao encontrada. Configure WORKBOOK_PATH no .env ou coloque a planilha na pasta do app."
+            return spreadsheet_setup_hint()
         try:
             service = SpreadsheetService(workbook_path)
             return service.get_planilha_summary()
@@ -681,7 +698,7 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
     if any(cmd_strip.startswith(kw) for kw in STATUS_KEYWORDS):
         workbook_path = get_default_workbook()
         if not workbook_path or not Path(workbook_path).exists():
-            return "Planilha nao encontrada. Configure WORKBOOK_PATH no .env."
+            return spreadsheet_setup_hint()
         try:
             service = SpreadsheetService(workbook_path)
             return service.get_planilha_summary()
@@ -692,7 +709,7 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
     if any(cmd_strip.startswith(kw) for kw in PREVIEW_KEYWORDS):
         workbook_path = get_default_workbook()
         if not workbook_path or not Path(workbook_path).exists():
-            return "Planilha nao encontrada. Configure WORKBOOK_PATH no .env."
+            return spreadsheet_setup_hint()
         try:
             service = SpreadsheetService(workbook_path)
             return service.get_sales_preview()
@@ -711,7 +728,7 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
 
     workbook_path = get_default_workbook()
     if not workbook_path or not Path(workbook_path).exists():
-        return "Planilha nao encontrada. Configure WORKBOOK_PATH no .env."
+        return spreadsheet_setup_hint()
 
     service = SpreadsheetService(workbook_path)
     actions: list = []
