@@ -72,17 +72,9 @@ def handle_message(
     origin = f"n8n:{channel}" if channel else "n8n"
     lower = raw.lower()
 
-    workbook = get_default_workbook()
-    if uses_google_sheets():
-        if not spreadsheet_config_status().ready:
-            return {
-                "ok": False,
-                "conversation_id": conv,
-                "reply": spreadsheet_setup_hint(),
-                "needs_confirmation": False,
-                "applied": False,
-            }
-    elif not workbook:
+    from .spreadsheet_factory import spreadsheet_is_ready
+
+    if not spreadsheet_is_ready():
         return {
             "ok": False,
             "conversation_id": conv,

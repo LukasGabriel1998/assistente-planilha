@@ -41,6 +41,7 @@ from src.bot_processor import (
     get_default_workbook,
     process_command,
     sale_id_from_parse_result,
+    _spreadsheet_error_message,
 )
 from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer, apply_multi_field_corrections, apply_preview_corrections, apply_batch_preview_corrections, extract_supplemental_sale_id, _extract_target_sale_id_for_updates, extract_sale_ids_list_for_updates, extract_delete_sale_ids_list, _is_sale_delete_request, parse_multi_sales_message, detect_intent, sanitize_new_sale_identity
 from src.transcription import TranscriptionError, transcribe_audio
@@ -234,12 +235,10 @@ def _load_customer_from_workbook(sale_id: str) -> str:
     sale_id = str(sale_id or "").strip()
     if not sale_id:
         return ""
-    workbook_path = get_default_workbook()
-    if not workbook_path or not Path(workbook_path).exists():
+    if not _spreadsheet_ready_for_bot():
         return ""
     try:
-        from src.excel_store import SpreadsheetService
-        svc = SpreadsheetService(workbook_path)
+        svc = _open_spreadsheet_for_bot()
         rows = svc.get_pending_sale_by_sale_id(sale_id, max_rows_scan=500, include_paid=True)
         if rows:
             return str(rows[0].get("customer") or "").strip()
@@ -437,7 +436,7 @@ def _maybe_build_status_table_image(
     try:
         own_wb = wb is None
         if own_wb:
-            svc = SpreadsheetService(workbook_path)
+            svc = _open_spreadsheet_for_bot()
             wb = svc._open_workbook(data_only=True)
         try:
             ws_sales = wb[svc._resolve_sheet_name(wb, SHEET_SALES)]
@@ -584,7 +583,7 @@ def _maybe_build_sales_snippet_image(
     try:
         own_wb = wb is None
         if own_wb:
-            svc = SpreadsheetService(workbook_path)
+            svc = _open_spreadsheet_for_bot()
             wb = svc._open_workbook(data_only=False)
         try:
             ws = wb[svc._resolve_sheet_name(wb, SHEET_SALES)]
@@ -1459,14 +1458,11 @@ def _try_handle_overdue_delivery_reply(
         multi_ids = extract_sale_ids_list_for_updates(text)
         targets = [sid for sid in multi_ids if sid in bucket]
         if len(targets) > 1:
-            wb_path = _workbook_path_for_bot()
-            if not wb_path:
+            if not _spreadsheet_ready_for_bot():
                 send_message(chat_id, "Planilha não encontrada.")
                 return True
             try:
-                from src.excel_store import SpreadsheetService
-
-                svc = SpreadsheetService(wb_path)
+                svc = _open_spreadsheet_for_bot()
                 with _spreadsheet_saving_timer(chat_id, "delivery_finalize", batch=True):
                     ok_ids: list[str] = []
                     fail_ids: list[str] = []
@@ -1525,14 +1521,11 @@ def _try_handle_overdue_delivery_reply(
         )
         return True
 
-    wb_path = _workbook_path_for_bot()
-    if not wb_path:
+    if not _spreadsheet_ready_for_bot():
         send_message(chat_id, "Planilha não encontrada.")
         return True
     try:
-        from src.excel_store import SpreadsheetService
-
-        svc = SpreadsheetService(wb_path)
+        svc = _open_spreadsheet_for_bot()
         with _spreadsheet_saving_timer(chat_id, "delivery_finalize"):
             ok = svc.finalize_service(sale_id)
             bucket.pop(sale_id, None)
@@ -1558,11 +1551,21 @@ def _try_handle_overdue_delivery_reply(
 
 
 def _workbook_path_for_bot() -> str:
-    wb_path = os.getenv("WORKBOOK_PATH", "").strip()
-    if not wb_path:
-        from src.workbook_paths import default_workbook_path
-        wb_path = default_workbook_path([Path.cwd(), Path.cwd().parent])
-    return wb_path or ""
+    from src.spreadsheet_factory import get_workbook_path
+
+    return get_workbook_path()
+
+
+def _spreadsheet_ready_for_bot() -> bool:
+    from src.spreadsheet_factory import spreadsheet_is_ready
+
+    return spreadsheet_is_ready()
+
+
+def _open_spreadsheet_for_bot():
+    from src.spreadsheet_factory import get_spreadsheet_service
+
+    return get_spreadsheet_service()
 
 
 def _is_sale_already_delivered(sale_id: str | None) -> bool:
@@ -1570,13 +1573,10 @@ def _is_sale_already_delivered(sale_id: str | None) -> bool:
     sale_id = str(sale_id or "").strip()
     if not sale_id:
         return False
-    workbook_path = _workbook_path_for_bot()
-    if not workbook_path or not Path(workbook_path).exists():
+    if not _spreadsheet_ready_for_bot():
         return False
     try:
-        from src.excel_store import SpreadsheetService
-
-        return SpreadsheetService(workbook_path).is_sale_delivered(sale_id)
+        return _open_spreadsheet_for_bot().is_sale_delivered(sale_id)
     except Exception:
         return False
 
@@ -1631,11 +1631,15 @@ def _build_dashboard_reply(cmd_strip: str) -> tuple[str, str | None]:
     """
     from src.excel_store import SpreadsheetService
 
-    workbook_path = _workbook_path_for_bot()
-    if not workbook_path or not Path(workbook_path).exists():
+    if not _spreadsheet_ready_for_bot():
         return process_command(cmd_strip, origin="telegram"), None
 
-    svc = SpreadsheetService(workbook_path)
+    try:
+        svc = _open_spreadsheet_for_bot()
+    except Exception as exc:
+        return _spreadsheet_error_message(exc), None
+
+    workbook_path = _workbook_path_for_bot()
     wb = svc._open_workbook(data_only=False)
     img_path: str | None = None
     try:
@@ -1726,7 +1730,7 @@ def _handle_quick_dashboard_command(
     except Exception as exc:
         send_message(
             chat_id,
-            f"Erro ao gerar relatório: {exc}",
+            _spreadsheet_error_message(exc),
             reply_markup=MAIN_MENU_KEYBOARD,
         )
     finally:
@@ -1871,8 +1875,7 @@ def _try_handle_batch_sale_updates(
     if not is_payment and not is_delivery:
         return False
 
-    workbook_path = _workbook_path_for_bot()
-    if not workbook_path or not Path(workbook_path).exists():
+    if not _spreadsheet_ready_for_bot():
         return False
 
     batch_results: list = []
@@ -1888,9 +1891,10 @@ def _try_handle_batch_sale_updates(
                 batch_results.append(pr)
         kind = "entrega"
     else:
-        from src.excel_store import SpreadsheetService
-
-        svc = SpreadsheetService(workbook_path)
+        try:
+            svc = _open_spreadsheet_for_bot()
+        except Exception:
+            return False
         for cliente_id in ids:
             target_sale_id = None
             sale_rows = svc.get_pending_sale_by_sale_id(
@@ -2057,13 +2061,14 @@ def _process_scheduled_reminders(tracker) -> None:
         return
     today, slot_hour = slot
 
-    wb_path = os.getenv("WORKBOOK_PATH", "").strip()
-    if not wb_path:
-        wb_path = default_workbook_path([Path.cwd(), Path.cwd().parent])
-    if not wb_path or not Path(wb_path).exists():
+    if not _spreadsheet_ready_for_bot():
         return
 
-    svc = SpreadsheetService(wb_path)
+    try:
+        svc = _open_spreadsheet_for_bot()
+    except Exception:
+        return
+
     wb = svc._open_workbook(data_only=True)
     try:
         due = svc.list_due_reminders(wb, today)
@@ -2125,11 +2130,14 @@ def _process_overdue_deliveries(tracker, pending_overdue_delivery: dict) -> None
     now = datetime.now()
     today, slot_hour = overdue_reminder_slot(now)
 
-    wb_path = _workbook_path_for_bot()
-    if not wb_path or not Path(wb_path).exists():
+    if not _spreadsheet_ready_for_bot():
         return
 
-    svc = SpreadsheetService(wb_path)
+    try:
+        svc = _open_spreadsheet_for_bot()
+    except Exception:
+        return
+
     wb = svc._open_workbook(data_only=False)
     try:
         overdue = svc.list_overdue_deliveries(wb, today)
@@ -2395,16 +2403,22 @@ def run_polling() -> None:
                 # Finalizar serviço
                 if text.strip().lower().startswith("finalizar") and "id venda" in text.strip().lower():
                     import re
-                    from src.excel_store import SpreadsheetService
                     sale_digits = re.findall(r"\d+", text)
                     if sale_digits:
                         sale_id = sale_digits[-1].zfill(3) if len(sale_digits[-1]) <= 3 else sale_digits[-1]
-                        workbook_path = os.getenv("WORKBOOK_PATH", "").strip()
-                        if not workbook_path:
-                            from src.workbook_paths import default_workbook_path
-                            workbook_path = default_workbook_path([Path.cwd(), Path.cwd().parent])
-                        svc = SpreadsheetService(workbook_path)
-                        ok = svc.finalize_service(sale_id)
+                        if not _spreadsheet_ready_for_bot():
+                            send_message(chat_id, "Planilha não encontrada.", reply_markup=MAIN_MENU_KEYBOARD)
+                            continue
+                        try:
+                            svc = _open_spreadsheet_for_bot()
+                            ok = svc.finalize_service(sale_id)
+                        except Exception as exc:
+                            send_message(
+                                chat_id,
+                                _spreadsheet_error_message(exc),
+                                reply_markup=MAIN_MENU_KEYBOARD,
+                            )
+                            continue
                         if ok:
                             send_message(
                                 chat_id,
@@ -2718,11 +2732,11 @@ def run_polling() -> None:
                             )
                             if _is_service_delivery_finalized(raw):
                                 sale_id = getattr(parse_result.command, "sale_id", None)
-                                if sale_id:
-                                    workbook_path = get_default_workbook()
-                                    if workbook_path:
-                                        from src.excel_store import SpreadsheetService
-                                        SpreadsheetService(workbook_path).finalize_service(str(sale_id))
+                                if sale_id and _spreadsheet_ready_for_bot():
+                                    try:
+                                        _open_spreadsheet_for_bot().finalize_service(str(sale_id))
+                                    except Exception:
+                                        pass
                         send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
                         pending_delivery.pop(chat_id, None)
                         continue
@@ -2813,14 +2827,9 @@ def run_polling() -> None:
                         is_material_expense = bool(material_cost and float(material_cost) > 0 and (cmd.total_value or 0.0) <= 0.01 and not cmd.payments)
                         if is_material_expense:
                             customer_id = (getattr(cmd, "customer", "") or "").strip()
-                            if customer_id:
-                                workbook_path = os.getenv("WORKBOOK_PATH", "").strip()
-                                if not workbook_path:
-                                    from src.workbook_paths import default_workbook_path
-                                    workbook_path = default_workbook_path([Path.cwd(), Path.cwd().parent])
-                                if workbook_path and Path(workbook_path).exists():
-                                    from src.excel_store import SpreadsheetService
-                                    svc = SpreadsheetService(workbook_path)
+                            if customer_id and _spreadsheet_ready_for_bot():
+                                try:
+                                    svc = _open_spreadsheet_for_bot()
                                     customer_digits = re.sub(r"\D", "", customer_id)
                                     is_numeric_ref = bool(customer_digits) and customer_id.strip().isdigit()
                                     if is_numeric_ref:
@@ -2855,6 +2864,8 @@ def run_polling() -> None:
                                                 f for f in parse_result.missing_fields if f != "ID VENDA"
                                             ]
                                             print(f"[Telegram] Inferido ID VENDA {inferred_sale_id} (chat {chat_id}).")
+                                except Exception:
+                                    pass
                     except Exception as e:
                         print(f"[Telegram] Falha na inferencia de ID VENDA: {e}")
 

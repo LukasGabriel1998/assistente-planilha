@@ -68,7 +68,19 @@ class WriteAction:
 
 
 class SpreadsheetService:
-    def __init__(self, workbook_path: str | Path) -> None:
+    def __init__(
+        self,
+        workbook_path: str | Path | None = None,
+        *,
+        google_bridge=None,
+    ) -> None:
+        self._google_bridge = google_bridge
+        if google_bridge is not None:
+            self.workbook_path = Path("__google_sheets__")
+            return
+
+        if workbook_path is None:
+            raise ValueError("Informe workbook_path ou google_bridge.")
         self.workbook_path = Path(workbook_path)
         if not self.workbook_path.exists():
             raise FileNotFoundError(f"Planilha nao encontrada: {self.workbook_path}")
@@ -85,7 +97,13 @@ class SpreadsheetService:
                 "Selecione o arquivo principal da planilha."
             )
 
+    @property
+    def uses_google_sheets(self) -> bool:
+        return self._google_bridge is not None
+
     def _open_workbook(self, *, data_only: bool = False, read_only: bool = False):
+        if self._google_bridge is not None:
+            return self._google_bridge.open_workbook(data_only=data_only, read_only=read_only)
         try:
             return load_workbook(
                 self.workbook_path,
@@ -118,6 +136,9 @@ class SpreadsheetService:
             raise
 
     def _save_workbook(self, wb) -> None:
+        if self._google_bridge is not None:
+            self._google_bridge.save_workbook(wb)
+            return
         try:
             wb.save(self.workbook_path)
         except PermissionError as exc:

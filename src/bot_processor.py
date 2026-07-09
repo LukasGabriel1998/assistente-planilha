@@ -13,6 +13,7 @@ from .excel_store import SpreadsheetService, DATA_START_ROW
 from .parser import parse_message, ParseResult, _is_service_delivery_finalized, _is_delivery_explicitly_pending, _parse_pt_date
 from .models import StatusUpdateCommand
 from .workbook_paths import default_workbook_path, resolve_workbook_path
+from .spreadsheet_factory import get_spreadsheet_service, get_workbook_path, spreadsheet_is_ready
 
 SUMMARY_KEYWORDS = (
     "resumo", "planilha", "como está", "como esta",
@@ -56,11 +57,11 @@ def _load_sale_context_for_preview(sale_id: str) -> dict[str, str | float] | Non
     sale_id = str(sale_id or "").strip()
     if not sale_id:
         return None
-    workbook_path = get_default_workbook()
-    if not workbook_path or not Path(workbook_path).exists():
+    workbook_path = get_workbook_path()
+    if not spreadsheet_is_ready():
         return None
     try:
-        service = SpreadsheetService(workbook_path)
+        service = _open_spreadsheet_service()
         wb = service._open_workbook(data_only=True)
         try:
             sales_name = service._resolve_sheet_name(wb, "TOTAL DE VENDAS DE 2026")
@@ -100,30 +101,33 @@ def spreadsheet_setup_hint() -> str:
     from .spreadsheet_config import spreadsheet_config_status, uses_google_sheets
 
     status = spreadsheet_config_status()
+    if not status.ready:
+        return status.message
     if uses_google_sheets():
-        if not status.ready:
-            return status.message
-        return "Google Sheets configurado no .env, mas a integracao ainda esta sendo ativada."
+        return (
+            "Erro ao acessar Google Sheets. Verifique credenciais, "
+            "compartilhamento da planilha com a conta de servico e tente de novo."
+        )
     return "Planilha nao encontrada. Configure WORKBOOK_PATH no .env ou coloque a planilha na pasta do app."
 
 
+def _open_spreadsheet_service() -> SpreadsheetService:
+    if not spreadsheet_is_ready():
+        raise FileNotFoundError(spreadsheet_setup_hint())
+    return get_spreadsheet_service()
+
+
+def _spreadsheet_error_message(exc: Exception) -> str:
+    from .google_sheets_bridge import GoogleSheetsQuotaError
+
+    if isinstance(exc, GoogleSheetsQuotaError):
+        return str(exc)
+    return f"Erro ao acessar planilha: {exc}"
+
+
 def get_default_workbook() -> str:
-    """Retorna o caminho da planilha Excel (ignorado quando SPREADSHEET_BACKEND=google)."""
-    from .spreadsheet_config import uses_google_sheets
-
-    if uses_google_sheets():
-        return ""
-
-    env_path = os.getenv("WORKBOOK_PATH", "").strip()
-    if env_path:
-        try:
-            return str(resolve_workbook_path(env_path))
-        except Exception:
-            pass
-    roots = [Path.cwd()]
-    if Path.cwd().parent.exists():
-        roots.append(Path.cwd().parent)
-    return default_workbook_path(roots) or ""
+    """Caminho Excel local; vazio quando backend=google."""
+    return get_workbook_path()
 
 
 def format_reply(intent: str, actions: list, error: str | None = None) -> str:
@@ -244,10 +248,9 @@ def build_preview(parse_result: ParseResult) -> str:
         due_txt = due.strftime("%d/%m/%Y") if due is not None else "-"
         lines = ["📋 *Entendi assim: confirmar entrega*", ""]
         lines.append(f"🧾 ID VENDA: *{sale_id}*")
-        workbook_path = get_default_workbook()
-        if workbook_path and Path(workbook_path).exists():
+        if spreadsheet_is_ready():
             try:
-                service = SpreadsheetService(workbook_path)
+                service = _open_spreadsheet_service()
                 wb = service._open_workbook(data_only=True)
                 try:
                     sales_name = service._resolve_sheet_name(wb, "TOTAL DE VENDAS DE 2026")
@@ -290,13 +293,15 @@ def build_preview(parse_result: ParseResult) -> str:
     # Prévia específica para atualização de status (ex.: "ID VENDA 004 pagou")
     if parse_result.intent == "status_update" and getattr(parse_result, "status_update_command", None) is not None:
         su = parse_result.status_update_command
-        workbook_path = get_default_workbook()
-        if not workbook_path or not Path(workbook_path).exists():
+        if not spreadsheet_is_ready():
             return (
                 "📋 *Entendi assim: atualizar status*\n\n"
-                spreadsheet_setup_hint()
+                + spreadsheet_setup_hint()
             )
-        service = SpreadsheetService(workbook_path)
+        try:
+            service = _open_spreadsheet_service()
+        except Exception as exc:
+            return f"📋 *Entendi assim: atualizar status*\n\n{_spreadsheet_error_message(exc)}"
         try:
             wb = service._open_workbook(data_only=True)
             try:
@@ -523,10 +528,12 @@ def apply_parse_result(
     chat_id: str | None = None,
 ) -> str:
     """Aplica um ParseResult já validado na planilha e retorna a mensagem de resposta."""
-    workbook_path = get_default_workbook()
-    if not workbook_path or not Path(workbook_path).exists():
+    if not spreadsheet_is_ready():
         return spreadsheet_setup_hint()
-    service = SpreadsheetService(workbook_path)
+    try:
+        service = _open_spreadsheet_service()
+    except Exception as exc:
+        return _spreadsheet_error_message(exc)
     actions: list = []
     cmd = parse_result.command
     if parse_result.intent == "delivery_finalize":
@@ -653,10 +660,12 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
         # isso é pagamento parcial e deve seguir o parser normal (payment_update),
         # não o atalho de "marcar como pago" total.
         if not re.search(r"\bpagou\b\s*(?:r\$\s*)?\d{2,}", cmd_lower):
-            workbook_path = get_default_workbook()
-            if not workbook_path or not Path(workbook_path).exists():
+            if not spreadsheet_is_ready():
                 return spreadsheet_setup_hint()
-            service = SpreadsheetService(workbook_path)
+            try:
+                service = _open_spreadsheet_service()
+            except Exception as exc:
+                return _spreadsheet_error_message(exc)
 
             ids: list[str] = []
             for m in re.findall(r"\d{1,6}", text):
@@ -685,36 +694,33 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
     cmd_strip = cmd_lower.strip()
     # Resumo (visão geral)
     if any(cmd_strip.startswith(kw) for kw in SUMMARY_KEYWORDS):
-        workbook_path = get_default_workbook()
-        if not workbook_path or not Path(workbook_path).exists():
+        if not spreadsheet_is_ready():
             return spreadsheet_setup_hint()
         try:
-            service = SpreadsheetService(workbook_path)
+            service = _open_spreadsheet_service()
             return service.get_planilha_summary()
         except Exception as e:
-            return f"Erro ao gerar resumo: {e}"
+            return _spreadsheet_error_message(e)
 
     # Status: resumo da aba "Lucro Mensal e Anual" (usa get_planilha_summary)
     if any(cmd_strip.startswith(kw) for kw in STATUS_KEYWORDS):
-        workbook_path = get_default_workbook()
-        if not workbook_path or not Path(workbook_path).exists():
+        if not spreadsheet_is_ready():
             return spreadsheet_setup_hint()
         try:
-            service = SpreadsheetService(workbook_path)
+            service = _open_spreadsheet_service()
             return service.get_planilha_summary()
         except Exception as e:
-            return f"Erro ao ler status: {e}"
+            return _spreadsheet_error_message(e)
 
     # Prévia (pendências e entregas)
     if any(cmd_strip.startswith(kw) for kw in PREVIEW_KEYWORDS):
-        workbook_path = get_default_workbook()
-        if not workbook_path or not Path(workbook_path).exists():
+        if not spreadsheet_is_ready():
             return spreadsheet_setup_hint()
         try:
-            service = SpreadsheetService(workbook_path)
+            service = _open_spreadsheet_service()
             return service.get_sales_preview()
         except Exception as e:
-            return f"Erro ao gerar prévia: {e}"
+            return _spreadsheet_error_message(e)
 
     # Parse e atualização
     parse_result = parse_message(text, reference_date=date.today())
@@ -726,11 +732,13 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
             parse_result.intent,
         )
 
-    workbook_path = get_default_workbook()
-    if not workbook_path or not Path(workbook_path).exists():
+    if not spreadsheet_is_ready():
         return spreadsheet_setup_hint()
 
-    service = SpreadsheetService(workbook_path)
+    try:
+        service = _open_spreadsheet_service()
+    except Exception as exc:
+        return _spreadsheet_error_message(exc)
     actions: list = []
 
     if parse_result.intent == "mixed_update" and parse_result.status_update_command is not None:

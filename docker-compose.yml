@@ -9,8 +9,10 @@ services:
     environment:
       WORKBOOK_PATH: "dist_novo/AssistentePlanilha/Planilha_Comunicacao_Visual - EDIT.xlsx"
     volumes:
-      # Planilha — alterações do bot persistem aqui
+      # Planilha Excel — alterações do bot persistem aqui (backend excel)
       - ./dist_novo/AssistentePlanilha:/app/dist_novo/AssistentePlanilha
+      # Credenciais Google (backend google)
+      - ./credentials:/app/credentials
       # Modelo Whisper (~461 MB) — não precisa rebuildar a imagem
       - ./models:/app/models
     # Long polling do Telegram — não precisa expor porta na internet
