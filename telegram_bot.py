@@ -174,9 +174,8 @@ Depois que informar um ID, o bot mantém para custos, pagamentos e entregas até
 # Teclado de menu (botões que aparecem abaixo do campo de digitação)
 MAIN_MENU_KEYBOARD = {
     "keyboard": [
-        ["Prévia", "Resumo"],
-        ["Detalhes", "Nova conversa"],
-        ["Ajuda"],
+        ["Prévia", "Resumo", "Detalhes"],
+        ["Ajuda", "Nova conversa"],
     ],
     "resize_keyboard": True,
     "one_time_keyboard": False,
