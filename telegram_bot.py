@@ -181,6 +181,12 @@ MAIN_MENU_KEYBOARD = {
     "one_time_keyboard": False,
 }
 
+RESUMO_DETAILS_INLINE_KEYBOARD = {
+    "inline_keyboard": [
+        [{"text": "🔍 Ver detalhes", "callback_data": "resumo_detalhes"}],
+    ],
+}
+
 def _reset_chat_session(
     chat_id: int | str,
     *,
@@ -469,12 +475,14 @@ def _maybe_build_status_table_image(
         return f"R$ {txt}"
 
     font_title = _load_telegram_font(26, bold=True)
-    font_meta = _load_telegram_font(17, bold=False)
     font_label = _load_telegram_font(17, bold=False)
     font_value = _load_telegram_font(24, bold=True)
 
-    # Só o essencial na imagem — totais de vendas ficam no texto do Resumo.
+    # Grade 2x3: mais legível no Telegram do que 6 colunas em uma única faixa
     kpi = [
+        ("Total de vendas (geral)", _brl(total_sales), False),
+        ("Vendas pagas", _brl(total_paid), False),
+        ("Valor pendente", _brl(total_pending), False),
         ("Compras matéria-prima", _brl(total_mat), False),
         ("Gastos fixos", _brl(total_fix), False),
         ("Lucro estimado", _brl(lucro), True),
@@ -494,15 +502,14 @@ def _maybe_build_status_table_image(
     pad = 22
     card_w = 900
     title_h = 54
-    meta_h = 30
     gap = 14
-    cols = 3
-    rows = 1
+    cols = 2
+    rows = 3
     inner_w = card_w - pad * 2
-    cell_w = (inner_w - gap * (cols - 1)) // cols
+    cell_w = (inner_w - gap) // 2
     cell_h = 96
 
-    card_h = pad + title_h + 8 + meta_h + 12 + rows * cell_h + (rows - 1) * gap + pad
+    card_h = pad + title_h + 16 + rows * cell_h + (rows - 1) * gap + pad
     img_w = card_w + pad * 2
     img_h = card_h + pad * 2
 
@@ -522,14 +529,8 @@ def _maybe_build_status_table_image(
     title = "TOTAL DOS LUCROS MENSAIS E ANUAIS"
     tw = draw.textlength(title, font=font_title)
     draw.text((cx0 + (card_w - tw) / 2, cy0 + 14), title, fill=(255, 255, 255), font=font_title)
-    draw.text(
-        (cx0 + pad, bar_y1 + 6),
-        "Custos e lucro • totais de vendas no texto abaixo",
-        fill=label_muted,
-        font=font_meta,
-    )
 
-    y0 = bar_y1 + meta_h + 12
+    y0 = bar_y1 + 12
     x0 = cx0 + pad
 
     measure = ImageDraw.Draw(Image.new("RGB", (20, 20)))
@@ -976,6 +977,19 @@ def send_message(
     except Exception as e:
         print(f"[Telegram] Erro ao enviar: {e}")
         return None
+
+
+def answer_callback_query(callback_query_id: str, text: str = "") -> None:
+    """Confirma o toque em botão inline (remove o relógio de carregamento)."""
+    if not TELEGRAM_BOT_TOKEN or not callback_query_id:
+        return
+    try:
+        payload: dict = {"callback_query_id": str(callback_query_id)}
+        if text:
+            payload["text"] = text[:200]
+        requests.post(f"{BASE_URL}/answerCallbackQuery", json=payload, timeout=10)
+    except Exception as e:
+        print(f"[Telegram] Erro ao responder callback: {e}")
 
 
 def delete_chat_message(chat_id: int | str, message_id: int | None) -> None:
@@ -1702,13 +1716,71 @@ def _handle_quick_dashboard_command(
             chat_id,
             caption,
             parse_mode="Markdown",
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=(
+                RESUMO_DETAILS_INLINE_KEYBOARD
+                if cmd_strip.startswith(("status", "resumo", "planilha"))
+                else MAIN_MENU_KEYBOARD
+            ),
             image_path=img_path,
         )
     except Exception as exc:
         send_message(
             chat_id,
             f"Erro ao gerar relatório: {exc}",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+    finally:
+        delete_chat_message(chat_id, wait_message_id)
+        if img_path:
+            try:
+                Path(img_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        quick_menu_processing.discard(chat_id)
+        quick_menu_cooldown[chat_id] = time.time() + 3.0
+    return True
+
+
+def _handle_resumo_detalhes_callback(
+    chat_id: int | str,
+    callback_query_id: str,
+    *,
+    pending_preview: dict,
+    quick_menu_processing: set[int | str],
+    quick_menu_cooldown: dict[int | str, float],
+) -> bool:
+    """Botão inline 'Ver detalhes' no card do Resumo."""
+    now = time.time()
+    if chat_id in quick_menu_processing or now < quick_menu_cooldown.get(chat_id, 0.0):
+        answer_callback_query(
+            callback_query_id,
+            "Ainda preparando a resposta anterior...",
+        )
+        return True
+
+    quick_menu_processing.add(chat_id)
+    pending_preview.pop(chat_id, None)
+    wait_message_id: int | None = None
+    img_path: str | None = None
+    try:
+        answer_callback_query(callback_query_id, "Gerando detalhes...")
+        wait_message_id = _notify_dashboard_loading(chat_id, "detalhes")
+        caption, img_path = _run_with_chat_action(
+            chat_id,
+            "upload_photo",
+            lambda: _build_dashboard_reply("detalhes"),
+        )
+        send_reply(
+            chat_id,
+            caption,
+            parse_mode="Markdown",
+            reply_markup=MAIN_MENU_KEYBOARD,
+            image_path=img_path,
+        )
+    except Exception as exc:
+        send_message(
+            chat_id,
+            f"Erro ao gerar detalhes: {exc}",
             reply_markup=MAIN_MENU_KEYBOARD,
         )
     finally:
@@ -2172,6 +2244,24 @@ def run_polling() -> None:
                     for old in sorted(seen_update_ids)[:500]:
                         seen_update_ids.discard(old)
             next_offset = uid + 1
+
+            callback = update.get("callback_query")
+            if callback:
+                callback_id = callback.get("id")
+                callback_data = str(callback.get("data") or "").strip()
+                callback_chat_id = (callback.get("message") or {}).get("chat", {}).get("id")
+                if callback_data == "resumo_detalhes" and callback_chat_id:
+                    _handle_resumo_detalhes_callback(
+                        callback_chat_id,
+                        str(callback_id or ""),
+                        pending_preview=pending_preview,
+                        quick_menu_processing=quick_menu_processing,
+                        quick_menu_cooldown=quick_menu_cooldown,
+                    )
+                elif callback_id:
+                    answer_callback_query(str(callback_id))
+                continue
+
             msg = update.get("message") or update.get("edited_message")
             if not msg:
                 continue

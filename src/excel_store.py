@@ -2815,7 +2815,7 @@ class SpreadsheetService:
                     f"• Gastos Fixos: {_format_currency_pt(total_fixos)}",
                     f"• Lucro: {_format_currency_pt(lucro)}",
                     "",
-                    "_Toque em *Detalhes* para ver cliente, produto e de quê é cada valor._",
+                    "_Toque em *Ver detalhes* (botão na mensagem do resumo) para saber de quem é cada valor._",
                 ]
             )
         except Exception as e:
