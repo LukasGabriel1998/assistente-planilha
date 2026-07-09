@@ -92,6 +92,19 @@ python n8n_api.py
 
 Documentacao interativa: `http://127.0.0.1:8765/docs` — guia em `docs/HOWTO_N8N.md`.
 
+## Rodar 24h com Docker (sem Cursor)
+
+Para deixar o bot rodando automaticamente no Mini PC Ubuntu:
+
+1. Guia rapido: `docs/DOCKER.md`
+2. Passo a passo Ubuntu: `docs/DOCKER_UBUNTU.md`
+3. Deploy automatico apos `git push`: `docs/DEPLOY_AUTOMATICO.md`
+
+```bash
+docker compose up -d --build          # sobe o bot
+./scripts/setup-server.sh             # setup completo (bot + cron de deploy)
+```
+
 ## Limites deste MVP
 
 - Parser por regras: cobre muitos casos, mas nao 100% das falas.

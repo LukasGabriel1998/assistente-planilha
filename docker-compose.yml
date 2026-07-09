@@ -1,0 +1,16 @@
+services:
+  assistente-planilha:
+    build: .
+    container_name: assistente-planilha-bot
+    # unless-stopped: reinicia sozinho se cair ou quando o Ubuntu ligar (com Docker ativo)
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      WORKBOOK_PATH: "dist_novo/AssistentePlanilha/Planilha_Comunicacao_Visual - EDIT.xlsx"
+    volumes:
+      # Planilha — alterações do bot persistem aqui
+      - ./dist_novo/AssistentePlanilha:/app/dist_novo/AssistentePlanilha
+      # Modelo Whisper (~461 MB) — não precisa rebuildar a imagem
+      - ./models:/app/models
+    # Long polling do Telegram — não precisa expor porta na internet
