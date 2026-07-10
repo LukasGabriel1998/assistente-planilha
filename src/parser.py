@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Optional
 
+from .dates import today_local
 from .models import DeleteSaleCommand, FinancialCommand, MaterialAllocation, Payment, RefundCommand, StatusUpdateCommand
 
 try:
@@ -927,7 +928,7 @@ def parse_structured_sale_form(
 ) -> Optional[ParseResult]:
     """Interpreta venda nova enviada como formulário (róteiro da Ajuda)."""
     if reference_date is None:
-        reference_date = date.today()
+        reference_date = today_local()
     raw = (message or "").strip()
     if not _looks_like_structured_sale_form(raw):
         return None
@@ -1281,10 +1282,15 @@ def _extract_customer(text: str) -> Optional[str]:
     update_context = _is_update_context(text)
     _cust_stop = (
         r"(?=\s*[,.]"
+        r"|\s+(?:um|uma|o|a)\s+"
         r"|\s+(?:ela|ele|eles|elas|adiciona|comprou|compraram|pagou|pago|no\s+valor|valor|entrou|saldo|restante|vai)\b"
         r"|\s*$)"
     )
+    _cust_name = rf"{LETTER_RX}[\w'-]+(?:\s+{LETTER_RX}[\w'-]+){{0,3}}"
     patterns = [
+        # "vendi para o cliente florellzis uma fachada 10000 ..."
+        rf"\bvend(?:i|emos|er)\s+(?:para|pro|pra)\s+(?:(?:o|a)\s+)?cliente\s+({_cust_name})(?=\s+(?:um|uma|o|a)\s+)",
+        rf"\b(?:para|pro|pra)\s+(?:(?:o|a)\s+)?cliente\s+({_cust_name})(?=\s+(?:um|uma|o|a)\s+)",
         rf"\bacabei\s+de\s+fazer\s+(?:uma\s+)?venda\s+(?:aqui\s+)?(?:para|pro|pra)\s+(?:o|a)\s+cliente\s+([^,.;\n]+?){_cust_stop}",
         rf"\b(?:para|pro|pra)\s+(?:o|a)\s+cliente\s+([^,.;\n]+?){_cust_stop}",
         # "fiz outra venda aqui para a Aline" / "fiz venda para João"
@@ -1361,6 +1367,13 @@ def _extract_customer(text: str) -> Optional[str]:
             candidate,
             flags=re.IGNORECASE,
         )
+        candidate = re.sub(
+            r"\s+(?:um|uma|o|a)\s+[^\d,.;]+(?:\s+\d+)?$",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        ).strip(" ,.-")
+        candidate = re.sub(r"\s+\d{3,}$", "", candidate).strip(" ,.-")
         candidate = _clean_extracted_phrase(candidate)
         candidate = _strip_leading_article(candidate)
         words = [word for word in candidate.split() if word]
@@ -1397,7 +1410,12 @@ def _extract_customer(text: str) -> Optional[str]:
 
 
 def _extract_product(text: str) -> Optional[str]:
+    _cust_name = rf"{LETTER_RX}[\w'-]+(?:\s+{LETTER_RX}[\w'-]+){{0,3}}"
+    _product_stop = r"(?=\s+\d|\s+(?:por|no\s+valor|valor|pagou|vai\s+pagar|ele|ela|me)\b|\s*[,.;]|\s*$)"
     patterns = [
+        # "vendi para o cliente florellzis uma fachada 10000 ..."
+        rf"\bvend(?:i|emos|er)\s+(?:para|pro|pra)\s+(?:(?:o|a)\s+)?cliente\s+{_cust_name}\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?){_product_stop}",
+        rf"\bcliente\s+{_cust_name}\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?){_product_stop}",
         rf"\bproduto\s+que\s+(?:ela|ele|eles)\s+comprou\s+foi\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s+(?:a\s+data|data|valor|no\s+valor|pagou|entrada|saldo|restante)\b|\s*$)",
         # "eles compraram uma fachada" / "comprou um banner"
         rf"\b(?:eles?\s+)?compr(?:ou|aram|amos)\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s*[,.]|\s+(?:eu\s+vendi|vendi\s+ele|adiciona|valor|no\s+valor|pagou|pagaram|vai|vao|vão)\b|\s*$)",
@@ -1409,7 +1427,7 @@ def _extract_product(text: str) -> Optional[str]:
         rf"\b(?:acabei\s+de\s+)?vend(?:i|er)\s+((?:um|uma|o|a)\s+)?({LETTER_RX}[\w .'/+-]{{1,50}}?)\s+(?:para|pro|pra)\s+(?:(?:o|a)\s+)?cliente\b",
         # "fiz uma fachada para o cliente X ..."
         rf"\b(?:acabei\s+de\s+)?fiz\s+((?:um|uma|o|a)\s+)?({LETTER_RX}[\w .'/+-]{{1,50}}?)\s+(?:para|pro|pra)\s+(?:(?:o|a)\s+)?cliente\b",
-        rf"\b(?:acabei\s+de\s+)?vend(?:i|emos|er)\s+(?:para|pro|pra)\s+(?:(?:o|a)\s+)?[^,.;\n]+?\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s+(?:por|no\s+valor|valor|pagou|vai\s+pagar|e\b|,|\.|;))",
+        rf"\b(?:acabei\s+de\s+)?vend(?:i|emos|er)\s+(?:para|pro|pra)\s+(?:(?:o|a)\s+)?[^,.;\n]+?\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s+(?:por|no\s+valor|valor|pagou|vai\s+pagar|e\b|,|\.|;|\d))",
         rf"\bfechei\s+com\s+[^,.;\n]+?\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s+(?:por|no\s+valor|valor|pagou|vai\s+pagar|e\b|,|\.|;))",
         rf"\bfechamos\s+com\s+[^,.;\n]+?\s+(?:um|uma|o|a)\s+({LETTER_RX}[\w .'/+-]{{1,50}}?)(?=\s+(?:por|no\s+valor|valor|pagou|vai\s+pagar|e\b|,|\.|;))",
         rf"\b(?:para|pro|pra)\s+(?:(?:o|a)\s+)?[^,.;\n]+[,;:-]\s*((?:um|uma|o|a)\s+)?({LETTER_RX}[\w .'/+-]{{1,50}})(?=[,.;]\s*(?:vend|fech|valor))",
@@ -1720,7 +1738,7 @@ def _is_sale_delete_request(message: str) -> bool:
 
 def parse_delete_sale_message(message: str, reference_date: Optional[date] = None) -> tuple[DeleteSaleCommand, list[str]]:
     if reference_date is None:
-        reference_date = date.today()
+        reference_date = today_local()
     raw = (message or "").strip()
     norm = _normalize(raw)
     sale_id = _extract_delete_sale_id(raw) or ""
@@ -2487,7 +2505,7 @@ def parse_multi_sales_message(
     Ex.: fachada 5 mil + banner 2 mil, cada um com pagamento diferente.
     """
     if reference_date is None:
-        reference_date = date.today()
+        reference_date = today_local()
     raw = normalize_spoken_ids_in_text(message or "")
     if detect_intent(raw) != "sale":
         return None
@@ -3050,7 +3068,7 @@ def should_replace_pending_preview(text: str) -> bool:
 
 def parse_financial_message(message: str, reference_date: Optional[date] = None) -> ParseResult:
     if reference_date is None:
-        reference_date = date.today()
+        reference_date = today_local()
 
     raw_text = message.strip()
     norm_text = _normalize(raw_text)
@@ -3544,8 +3562,8 @@ def detect_intent(message: str) -> str:
             ],
             max_gap_words=8,
         )
-    material_allocations = _extract_material_allocations(message, date.today())
-    delivery_date = _extract_delivery_update_date(message, date.today())
+    material_allocations = _extract_material_allocations(message, today_local())
+    delivery_date = _extract_delivery_update_date(message, today_local())
     pending_override = _extract_pending_amount_override(message)
     payment_amount = _extract_amount_after_prefix(
         message,
@@ -3574,7 +3592,7 @@ def detect_intent(message: str) -> str:
 
 def parse_status_update_message(message: str, reference_date: Optional[date] = None) -> StatusUpdateCommand:
     if reference_date is None:
-        reference_date = date.today()
+        reference_date = today_local()
     sale_id = _extract_target_sale_id_for_updates(message) or _extract_sale_id_from_text(message)
     if not sale_id:
         raise ValueError("ID VENDA nao identificado na mensagem.")
@@ -3593,7 +3611,7 @@ def parse_status_update_message(message: str, reference_date: Optional[date] = N
 
 def parse_refund_message(message: str, reference_date: Optional[date] = None) -> RefundCommand:
     if reference_date is None:
-        reference_date = date.today()
+        reference_date = today_local()
     raw = message.strip()
     norm = _normalize(raw)
     customer = _extract_customer(raw) or "Cliente nao identificado"
@@ -3797,7 +3815,7 @@ def _upsert_payment(
 ) -> bool:
     payment = _find_payment(command, label)
     if payment is None:
-        ref = command.sale_date or date.today()
+        ref = command.sale_date or today_local()
         default_status = "pago" if label == "entrada" else "pendente"
         command.payments.append(
             Payment(
@@ -3954,7 +3972,7 @@ def apply_batch_preview_corrections(
 ) -> tuple[bool, list[ParseResult]]:
     """Aplica correção pontual em uma venda dentro de um lote pendente."""
     if reference_date is None:
-        reference_date = date.today()
+        reference_date = today_local()
     if not batch:
         return False, batch
     idx = resolve_batch_sale_index(text, batch)
@@ -3993,7 +4011,7 @@ def apply_multi_field_corrections(
     Ex.: 'Cliente: Ana, Produto: Banner, Valor total: 3000, Entrada: 1500, Saldo: 1500'.
     """
     if reference_date is None:
-        reference_date = date.today()
+        reference_date = today_local()
 
     updated = False
     if parse_result is not None and parse_result.intent == "sale_delete":
@@ -4166,7 +4184,7 @@ def apply_preview_corrections(
     Retorna True se algum campo foi atualizado.
     """
     if reference_date is None:
-        reference_date = date.today()
+        reference_date = today_local()
     raw = message.strip()
     if not raw:
         return False
@@ -4247,7 +4265,7 @@ def parse_message(message: str, reference_date: Optional[date] = None) -> ParseR
     intent = detect_intent(message)
     if intent == "delivery_finalize":
         if reference_date is None:
-            reference_date = date.today()
+            reference_date = today_local()
         target_sale_id = _extract_target_sale_id_for_updates(message) or ""
         delivery_date = _parse_pt_date(message, reference_date, full_text=message) or reference_date
         missing: list[str] = []
@@ -4273,7 +4291,7 @@ def parse_message(message: str, reference_date: Optional[date] = None) -> ParseR
         )
     if intent == "delivery_update":
         if reference_date is None:
-            reference_date = date.today()
+            reference_date = today_local()
         target_sale_id = _extract_target_sale_id_for_updates(message) or ""
         delivery_date = _extract_delivery_update_date(message, reference_date)
         missing: list[str] = []
@@ -4308,7 +4326,7 @@ def parse_message(message: str, reference_date: Optional[date] = None) -> ParseR
         return financial_result
     if intent == "sale_value_update":
         if reference_date is None:
-            reference_date = date.today()
+            reference_date = today_local()
         target_sale_id = _extract_target_sale_id_for_updates(message) or ""
         pending_override = _extract_pending_amount_override(message)
         missing: list[str] = []
@@ -4335,7 +4353,7 @@ def parse_message(message: str, reference_date: Optional[date] = None) -> ParseR
         )
     if intent == "payment_update":
         if reference_date is None:
-            reference_date = date.today()
+            reference_date = today_local()
         target_sale_id = _extract_target_sale_id_for_updates(message) or ""
         amount = _extract_amount_after_prefix(
             message,

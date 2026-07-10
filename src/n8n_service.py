@@ -9,6 +9,7 @@ from dataclasses import asdict
 from datetime import date, datetime
 from typing import Any
 
+from .dates import today_local
 from .bot_processor import (
     SUMMARY_KEYWORDS,
     STATUS_KEYWORDS,
@@ -185,7 +186,7 @@ def handle_message(
             "read_only": True,
         }
 
-    parse_result = parse_message(raw, reference_date=date.today())
+    parse_result = parse_message(raw, reference_date=today_local())
 
     if parse_result.missing_fields:
         missing_set = set(parse_result.missing_fields)

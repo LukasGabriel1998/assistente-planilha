@@ -4,6 +4,8 @@ from copy import copy
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+
+from .dates import today_local
 import os
 import re
 import unicodedata
@@ -1486,7 +1488,7 @@ class SpreadsheetService:
             payment_status_raw = (snap.get("payment_status") or self._status_text(pending_amount)).strip()
             payment_status = payment_status_raw.upper() if payment_status_raw else ("PENDENTE" if pending_amount > 0.01 else "PAGO")
             due_date = self._parse_date_cell(snap.get("delivery_date"))
-            sale_date = self._parse_date_cell(snap.get("sale_date")) or date.today()
+            sale_date = self._parse_date_cell(snap.get("sale_date")) or today_local()
             self.upsert_reminder(
                 wb,
                 sale_id=str(sale_id).strip(),

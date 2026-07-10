@@ -7,6 +7,8 @@ import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from .dates import now_local
+
 DEFAULT_START_HOUR = 6
 DEFAULT_END_HOUR = 22
 DEFAULT_INTERVAL_HOURS = 2
@@ -29,7 +31,7 @@ def overdue_reminder_slot(now: datetime | None = None) -> tuple[date, int]:
     Slot para cobrança de entrega amarela atrasada.
     Usa sempre a data local de hoje e repete a cada N horas (24h, sem janela 6h–22h).
     """
-    now = now or datetime.now()
+    now = now or now_local()
     interval = max(1, reminder_interval_hours())
     return now.date(), (now.hour // interval) * interval
 
@@ -39,7 +41,7 @@ def current_reminder_slot(now: datetime | None = None) -> tuple[date, int] | Non
     Retorna (dia, hora_do_slot) se estivermos em uma janela de lembrete.
     Ex.: das 6h às 7h59 -> (hoje, 6); das 8h às 9h59 -> (hoje, 8).
   """
-    now = now or datetime.now()
+    now = now or now_local()
     hour = now.hour
     start = reminder_start_hour()
     end = reminder_end_hour()

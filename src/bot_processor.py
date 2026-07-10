@@ -9,6 +9,7 @@ import os
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
+from .dates import today_local
 from .excel_store import SpreadsheetService, DATA_START_ROW
 from .parser import parse_message, ParseResult, _is_service_delivery_finalized, _is_delivery_explicitly_pending, _parse_pt_date
 from .models import StatusUpdateCommand
@@ -470,7 +471,7 @@ def build_preview(parse_result: ParseResult) -> str:
     if parse_result.intent != "sale" and getattr(cmd, "sale_id", None):
         lines.append(f"🧾 ID VENDA: *{cmd.sale_id}*")
     if getattr(cmd, "sale_date", None):
-        if cmd.sale_date == date.today():
+        if cmd.sale_date == today_local():
             lines.append(f"📅 Data da venda: *hoje ({cmd.sale_date.strftime('%d/%m/%Y')})*")
         else:
             lines.append(f"📅 Data da venda: *{cmd.sale_date.strftime('%d/%m/%Y')}*")
@@ -540,7 +541,7 @@ def apply_parse_result(
         if not getattr(cmd, "sale_id", None):
             return "Faltou o *ID VENDA* para confirmar a entrega. Ex.: `id venda 002 foi entregue`."
         sale_id = str(cmd.sale_id).strip()
-        delivery_date = getattr(cmd, "service_due_date", None) or date.today()
+        delivery_date = getattr(cmd, "service_due_date", None) or today_local()
         service.update_sale_delivery_date(sale_id, delivery_date)
         ok = service.finalize_service(sale_id)
         if not ok:
@@ -569,7 +570,7 @@ def apply_parse_result(
         if amount <= 0:
             return "Faltou o *valor pago*. Ex.: `id venda 005 recebeu 2500 hoje`."
         # A data foi formatada em DD/MM/YYYY em detected_values; usamos hoje se falhar.
-        pay_date = date.today()
+        pay_date = today_local()
         action = service.apply_partial_payment(
             sale_id,
             amount=amount,
@@ -602,7 +603,7 @@ def apply_parse_result(
         if cmd.service_due_date is not None and not delivery_still_pending:
             service.update_sale_delivery_date(sale_id, cmd.service_due_date)
         elif _is_service_delivery_finalized(original_text) and not delivery_still_pending:
-            delivery_date = _parse_pt_date(original_text, date.today(), full_text=original_text) or date.today()
+            delivery_date = _parse_pt_date(original_text, today_local(), full_text=original_text) or today_local()
             service.update_sale_delivery_date(sale_id, delivery_date)
             service.finalize_service(sale_id)
             service.refresh_delivery_reminder(sale_id, chat_id=chat_id or "", mark_delivered=True)
@@ -676,7 +677,7 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
                 return "Nao entendi quais IDs devem ser marcados como pagos. Diga, por exemplo: ID VENDA 001 pagou tudo."
 
             actions = []
-            today = date.today()
+            today = today_local()
             for sid in ids:
                 su = StatusUpdateCommand(sale_id=sid, status="pago", ref_date=today)
                 try:
@@ -723,7 +724,7 @@ def process_command(command_text: str, origin: str = "telegram") -> str:
             return _spreadsheet_error_message(e)
 
     # Parse e atualização
-    parse_result = parse_message(text, reference_date=date.today())
+    parse_result = parse_message(text, reference_date=today_local())
     cmd = parse_result.command
 
     if parse_result.missing_fields:

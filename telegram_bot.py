@@ -34,6 +34,7 @@ from pathlib import Path
 
 import requests
 
+from src.dates import today_local, now_local
 from src.bot_processor import (
     apply_parse_result,
     build_missing_fields_message,
@@ -1366,7 +1367,7 @@ def _build_overdue_delivery_message(item: dict) -> str:
     cliente = item.get("cliente", "") or "-"
     desc = item.get("descricao", "") or "-"
     delivery_txt = item.get("data entrega") or "-"
-    today_txt = item.get("reference_today") or date.today().strftime("%d/%m/%Y")
+    today_txt = item.get("reference_today") or today_local().strftime("%d/%m/%Y")
     days = int(item.get("days_overdue") or 0)
     if days <= 1:
         days_txt = "1 dia"
@@ -1880,7 +1881,7 @@ def _try_handle_batch_sale_updates(
 
     batch_results: list = []
     not_found: list[str] = []
-    today = date.today()
+    today = today_local()
 
     if is_delivery:
         for sale_id in ids:
@@ -1946,7 +1947,7 @@ def _try_handle_batch_delete(
     if len(ids) < 2:
         return False
 
-    today = date.today()
+    today = today_local()
     batch_results: list = []
     not_found: list[str] = []
 
@@ -1985,7 +1986,7 @@ def _try_handle_multi_sales_same_customer(
     if detect_intent(text) != "sale":
         return False
 
-    batch = parse_multi_sales_message(text, reference_date=date.today())
+    batch = parse_multi_sales_message(text, reference_date=today_local())
     if not batch or len(batch) < 2:
         return False
 
@@ -2121,13 +2122,13 @@ def _process_scheduled_reminders(tracker) -> None:
 
 def _process_overdue_deliveries(tracker, pending_overdue_delivery: dict) -> None:
     """
-    Cobra entregas amarelas cuja data já passou em relação a hoje (date.today()).
+    Cobra entregas amarelas cuja data já passou em relação a hoje (today_local()).
     Roda a cada ~1 min; na subida do bot já verifica na hora.
     """
     from src.excel_store import SpreadsheetService
     from src.reminder_scheduler import overdue_reminder_slot
 
-    now = datetime.now()
+    now = now_local()
     today, slot_hour = overdue_reminder_slot(now)
 
     if not _spreadsheet_ready_for_bot():
@@ -2223,7 +2224,7 @@ def run_polling() -> None:
 
     print(
         f"[Telegram] Verificação inicial de entregas amarelas "
-        f"(data de hoje: {date.today().strftime('%d/%m/%Y')})..."
+        f"(data de hoje: {today_local().strftime('%d/%m/%Y')})..."
     )
     try:
         _process_overdue_deliveries(reminder_tracker, pending_overdue_delivery)
@@ -2606,7 +2607,7 @@ def run_polling() -> None:
                                 updated, batch_results = apply_batch_preview_corrections(
                                     text,
                                     batch_results,
-                                    reference_date=date.today(),
+                                    reference_date=today_local(),
                                 )
                                 if updated:
                                     _resend_multi_sales_batch_preview(
@@ -2626,7 +2627,7 @@ def run_polling() -> None:
                                     parse_mode="Markdown",
                                 )
                                 continue
-                            repl = parse_message(text, reference_date=date.today())
+                            repl = parse_message(text, reference_date=today_local())
                             if (
                                 repl.intent == "sale_delete"
                                 and repl.delete_command
@@ -2644,7 +2645,7 @@ def run_polling() -> None:
                             parse_result = pending["parse_result"]
                             cmd = parse_result.command
                             updated = apply_multi_field_corrections(
-                                text, cmd, parse_result, reference_date=date.today()
+                                text, cmd, parse_result, reference_date=today_local()
                             )
                             if not updated:
                                 updated = apply_preview_corrections(text, cmd)
@@ -2702,21 +2703,21 @@ def run_polling() -> None:
                         if not pending:
                             continue
                         raw = text.strip()
-                        parsed = _parse_pt_date(raw, date.today(), full_text=raw)
+                        parsed = _parse_pt_date(raw, today_local(), full_text=raw)
                         if parsed is None:
                             from datetime import datetime
                             for fmt in ("%d/%m/%Y", "%d/%m/%y", "%d/%m"):
                                 try:
                                     dt = datetime.strptime(raw, fmt)
                                     if fmt == "%d/%m":
-                                        dt = dt.replace(year=date.today().year)
+                                        dt = dt.replace(year=today_local().year)
                                     parsed = dt.date()
                                     break
                                 except Exception:
                                     continue
                         if parsed is None:
                             if _is_service_delivery_finalized(raw):
-                                parsed = date.today()
+                                parsed = today_local()
                             else:
                                 raise ValueError("Data inválida.")
                         parse_result = pending["parse_result"]
@@ -2771,7 +2772,7 @@ def run_polling() -> None:
                 parse_text = enrich_with_last_sale_context(text, last_sale_id_by_chat.get(chat_id))
                 if parse_text != text:
                     print(f"[Telegram] Contexto: último ID VENDA {last_sale_id_by_chat.get(chat_id)} aplicado no chat {chat_id}")
-                parse_result = parse_message(parse_text, reference_date=date.today())
+                parse_result = parse_message(parse_text, reference_date=today_local())
                 _normalize_material_only_sale(parse_result)
 
                 # Atualiza cache quando conseguir extrair cliente.
@@ -2851,7 +2852,7 @@ def run_polling() -> None:
                                             # Se ainda nao houver material_allocations, crie agora para vincular no Excel.
                                             if not getattr(cmd, "material_allocations", None):
                                                 from src.models import MaterialAllocation
-                                                alloc_date = getattr(cmd, "material_date", None) or date.today()
+                                                alloc_date = getattr(cmd, "material_date", None) or today_local()
                                                 cmd.material_allocations = [
                                                     MaterialAllocation(
                                                         sale_id=str(inferred_sale_id).strip(),
@@ -3000,7 +3001,7 @@ def _run_local_test(args: argparse.Namespace) -> None:
         raise SystemExit("Informe --test-message com um texto para testar.")
 
     # Mantemos a mesma lógica do bot.
-    parse_result = parse_message(text, reference_date=date.today())
+    parse_result = parse_message(text, reference_date=today_local())
 
     if parse_result.missing_fields:
         print("Missing fields:", ", ".join(parse_result.missing_fields))
