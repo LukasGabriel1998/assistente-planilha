@@ -1207,6 +1207,15 @@ def _parse_pt_date(fragment: str, reference_date: date, *, full_text: str = "") 
     norm = _normalize(fragment)
     context_norm = _normalize(context)
 
+    # Termos relativos antes de dd/mm — evita que "Data da venda: hoje ... entrega 10/07"
+    # interprete a data de entrega como data da venda.
+    if ("hoje" in norm) or re.search(r"\bhj\b", norm):
+        return reference_date
+    if "amanha" in norm:
+        return reference_date + timedelta(days=1)
+    if "ontem" in norm:
+        return reference_date - timedelta(days=1)
+
     match = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", norm)
     if match:
         day = int(match.group(1))
@@ -1218,14 +1227,6 @@ def _parse_pt_date(fragment: str, reference_date: date, *, full_text: str = "") 
             return date(year, month, day)
         except ValueError:
             pass
-
-    # Se nao houver data explicita (dd/mm), ai sim aplica termos relativos.
-    if ("hoje" in norm) or re.search(r"\bhj\b", norm):
-        return reference_date
-    if "amanha" in norm:
-        return reference_date + timedelta(days=1)
-    if "ontem" in norm:
-        return reference_date - timedelta(days=1)
 
     ordinal_day = re.search(
         r"\b(?:no\s+)?dia\s+(primeiro|primeira|segundo|segunda|terceiro|terceira)\b",

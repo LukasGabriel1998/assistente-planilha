@@ -51,20 +51,28 @@ class GoogleSheetsBridge:
             )
         return self._spreadsheet
 
-    def _worksheet(self, title: str):
+    def _find_worksheet(self, spreadsheet, title: str):
+        try:
+            return spreadsheet.worksheet(title)
+        except Exception:
+            for ws in spreadsheet.worksheets():
+                if ws.title == title:
+                    return ws
+        return None
+
+    def _worksheet(self, title: str, *, create_if_missing: bool = False):
         if title not in self._worksheets:
             spreadsheet = self._spreadsheet_obj()
 
             def _open():
-                try:
-                    return spreadsheet.worksheet(title)
-                except Exception:
-                    for ws in spreadsheet.worksheets():
-                        if ws.title == title:
-                            return ws
-                    raise
+                ws = self._find_worksheet(spreadsheet, title)
+                if ws is not None:
+                    return ws
+                if not create_if_missing:
+                    raise KeyError(title)
+                return spreadsheet.add_worksheet(title=title, rows=1000, cols=26)
 
-            self._worksheets[title] = sheets_call(_open)
+            self._worksheets[title] = sheets_call(_open, is_write=create_if_missing)
         return self._worksheets[title]
 
     @staticmethod
@@ -132,7 +140,7 @@ class GoogleSheetsBridge:
 
         for name in wb.sheetnames:
             ws = wb[name]
-            worksheet = self._worksheet(name)
+            worksheet = self._worksheet(name, create_if_missing=True)
             old_cells = self._baseline.get(name, {})
             batch: list[dict[str, Any]] = []
 

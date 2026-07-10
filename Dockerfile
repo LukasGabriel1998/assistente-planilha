@@ -15,6 +15,8 @@ COPY . .
 
 # Planilha e modelos ficam em volumes (docker-compose) para persistir dados
 ENV PYTHONUNBUFFERED=1 \
+    TZ=America/Sao_Paulo \
+    TIMEZONE=America/Sao_Paulo \
     WORKBOOK_PATH="dist_novo/AssistentePlanilha/Planilha_Comunicacao_Visual - EDIT.xlsx" \
     WHISPER_LOCAL_MODEL_DIR=models
 
