@@ -102,18 +102,27 @@ class GoogleSheetsBridge:
             snap[name] = cells
         return snap
 
-    def open_workbook(self, *, data_only: bool = False, read_only: bool = False):
-        """Baixa a planilha inteira em uma única operação (export xlsx)."""
-        from gspread.utils import ExportFormat
+    def _build_workbook_from_grids(self, *, data_only: bool = False, read_only: bool = False):
+        """Fallback: lê abas via get_all_values (só escopo spreadsheets)."""
+        from openpyxl import Workbook
 
-        def _export():
-            return self._authorize().export(self.sheet_id, ExportFormat.EXCEL)
-
-        data = sheets_call(_export)
-        wb = load_workbook(BytesIO(data), data_only=data_only, read_only=read_only)
+        spreadsheet = self._spreadsheet_obj()
+        wb = Workbook()
+        wb.remove(wb.active)
+        for ws_meta in spreadsheet.worksheets():
+            rows = sheets_call(ws_meta.get_all_values)
+            sheet = wb.create_sheet(title=ws_meta.title[:31])
+            for r_idx, row in enumerate(rows, start=1):
+                for c_idx, value in enumerate(row, start=1):
+                    if value not in (None, ""):
+                        sheet.cell(row=r_idx, column=c_idx, value=value)
         self._baseline = self._snapshot_workbook(wb)
         self._worksheets.clear()
         return wb
+
+    def open_workbook(self, *, data_only: bool = False, read_only: bool = False):
+        """Carrega a planilha via get_all_values (escopo spreadsheets — sem Drive API)."""
+        return self._build_workbook_from_grids(data_only=data_only, read_only=read_only)
 
     def save_workbook(self, wb) -> None:
         """Envia apenas células alteradas via batch_update (uma ou poucas requisições)."""
