@@ -35,6 +35,14 @@ from pathlib import Path
 import requests
 
 from src.dates import today_local, now_local
+from src.telegram_images import (
+    THEME,
+    format_brl,
+    pil_available,
+    render_data_table,
+    render_kpi_dashboard,
+    render_text_card,
+)
 from src.bot_processor import (
     apply_parse_result,
     build_missing_fields_message,
@@ -258,49 +266,6 @@ QUICK_DASHBOARD_KEYWORDS = (
     "detalhe",
 )
 
-_FONT_CACHE: dict[tuple[int, bool], object] = {}
-
-
-def _load_telegram_font(size: int, bold: bool = False):
-    """Carrega fonte uma vez e reutiliza (acelera geração de imagens)."""
-    from PIL import ImageFont  # type: ignore
-
-    key = (size, bold)
-    cached = _FONT_CACHE.get(key)
-    if cached is not None:
-        return cached
-    candidates = (
-        [
-            r"C:\Windows\Fonts\segoeuib.ttf",
-            r"C:\Windows\Fonts\arialbd.ttf",
-            r"C:\Windows\Fonts\calibrib.ttf",
-        ]
-        if bold
-        else [
-            r"C:\Windows\Fonts\segoeui.ttf",
-            r"C:\Windows\Fonts\arial.ttf",
-            r"C:\Windows\Fonts\calibri.ttf",
-        ]
-    )
-    for fp in candidates:
-        try:
-            font = ImageFont.truetype(fp, size=size)
-            _FONT_CACHE[key] = font
-            return font
-        except Exception:
-            continue
-    font = ImageFont.load_default()
-    _FONT_CACHE[key] = font
-    return font
-
-
-def _save_telegram_image(img) -> str:
-    """Salva imagem em JPEG (mais rápido e leve para enviar no Telegram)."""
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-    tmp.close()
-    img.save(tmp.name, format="JPEG", quality=88, optimize=False)
-    return tmp.name
-
 
 def send_chat_action(chat_id: int | str, action: str = "typing") -> None:
     """Indica no Telegram que o bot está processando (melhora percepção de velocidade)."""
@@ -345,79 +310,13 @@ def _is_quick_dashboard_command(text: str) -> bool:
 
 
 def _maybe_build_text_image_png(text: str) -> str | None:
-    """
-    Gera uma imagem (PNG) com o texto para facilitar visualização no Telegram.
-    Retorna o caminho do arquivo temporário, ou None se não for possível.
-    """
+    """Gera imagem legível do resumo em texto para o Telegram."""
+    if not pil_available():
+        return None
     try:
-        from PIL import Image, ImageDraw, ImageFont  # type: ignore
+        return render_text_card(text, title="Resumo da planilha")
     except Exception:
         return None
-
-    raw = (text or "").strip()
-    if not raw:
-        return None
-
-    # Normaliza bullets e remove markdown básico para ficar legível na imagem
-    lines_in = [
-        ln.replace("*", "").replace("📄", "").replace("📋", "").rstrip()
-        for ln in raw.splitlines()
-    ]
-
-    max_width = 980
-    padding = 28
-    bg = (2, 6, 23)          # #020617
-    card = (15, 23, 42)      # #0f172a
-    ink = (226, 232, 240)    # #e2e8f0
-    soft = (148, 163, 184)   # #94a3b8
-
-    font = ImageFont.load_default()
-
-    def wrap_line(s: str) -> list[str]:
-        s = (s or "").strip()
-        if not s:
-            return [""]
-        words = s.split()
-        out: list[str] = []
-        cur = ""
-        for w in words:
-            nxt = (cur + " " + w).strip()
-            if ImageDraw.Draw(Image.new("RGB", (10, 10))).textlength(nxt, font=font) <= (max_width - 2 * padding):
-                cur = nxt
-            else:
-                if cur:
-                    out.append(cur)
-                cur = w
-        out.append(cur)
-        return out
-
-    wrapped: list[str] = []
-    for ln in lines_in:
-        for wln in wrap_line(ln):
-            wrapped.append(wln)
-
-    # Calcula altura
-    line_h = int(font.getbbox("Ag")[3] - font.getbbox("Ag")[1]) + 8
-    title = "Resumo da planilha"
-    height = padding + 40 + 18 + (len(wrapped) * line_h) + padding
-
-    img = Image.new("RGB", (max_width, max(240, height)), bg)
-    draw = ImageDraw.Draw(img)
-
-    # Card
-    card_x0, card_y0 = padding, padding
-    card_x1, card_y1 = max_width - padding, img.height - padding
-    draw.rounded_rectangle((card_x0, card_y0, card_x1, card_y1), radius=18, fill=card)
-
-    # Título
-    draw.text((card_x0 + 18, card_y0 + 14), title, fill=ink, font=font)
-    y = card_y0 + 44
-    for ln in wrapped:
-        color = soft if (not ln.strip() or ln.strip().lower().startswith("nenhuma")) else ink
-        draw.text((card_x0 + 18, y), ln, fill=color, font=font)
-        y += line_h
-
-    return _save_telegram_image(img)
 
 
 def _maybe_build_status_table_image(
@@ -425,12 +324,11 @@ def _maybe_build_status_table_image(
     wb=None,
     svc=None,
 ) -> str | None:
-    """
-    Gera imagem estilo "TOTAL DOS LUCROS MENSAIS E ANUAIS" com valores dinâmicos.
-    """
+    """Gera card de lucros e totais (Status / Resumo)."""
+    if not pil_available():
+        return None
     try:
-        from PIL import Image, ImageDraw  # type: ignore
-        from src.excel_store import SpreadsheetService, SHEET_SALES, SHEET_MATERIAL, SHEET_FIXED, DATA_START_ROW
+        from src.excel_store import SHEET_SALES, SHEET_MATERIAL, SHEET_FIXED, DATA_START_ROW
     except Exception:
         return None
 
@@ -469,94 +367,18 @@ def _maybe_build_status_table_image(
 
     total_sales = round(total_paid + total_pending, 2)
     lucro = round(total_sales - total_mat - total_fix, 2)
-
-    def _brl(v: float) -> str:
-        txt = f"{float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        return f"R$ {txt}"
-
-    font_title = _load_telegram_font(26, bold=True)
-    font_label = _load_telegram_font(17, bold=False)
-    font_value = _load_telegram_font(24, bold=True)
-
-    # Grade 2x3: mais legível no Telegram do que 6 colunas em uma única faixa
     kpi = [
-        ("Total de vendas (geral)", _brl(total_sales), False),
-        ("Vendas pagas", _brl(total_paid), False),
-        ("Valor pendente", _brl(total_pending), False),
-        ("Compras matéria-prima", _brl(total_mat), False),
-        ("Gastos fixos", _brl(total_fix), False),
-        ("Lucro estimado", _brl(lucro), True),
+        ("Total de vendas (geral)", format_brl(total_sales), False),
+        ("Vendas pagas", format_brl(total_paid), False),
+        ("Valor pendente", format_brl(total_pending), False),
+        ("Compras materia-prima", format_brl(total_mat), False),
+        ("Gastos fixos", format_brl(total_fix), False),
+        ("Lucro estimado", format_brl(lucro), True),
     ]
-
-    outer_bg = (241, 245, 249)
-    card_bg = (255, 255, 255)
-    title_bar = (12, 74, 110)
-    border_soft = (207, 221, 232)
-    label_muted = (75, 85, 99)
-    ink = (17, 24, 39)
-    green_profit = (5, 122, 85)
-    red_loss = (185, 28, 28)
-    cell_zebra = (249, 252, 255)
-    cell_lucro_bg = (236, 253, 245)
-
-    pad = 22
-    card_w = 900
-    title_h = 54
-    gap = 14
-    cols = 2
-    rows = 3
-    inner_w = card_w - pad * 2
-    cell_w = (inner_w - gap) // 2
-    cell_h = 96
-
-    card_h = pad + title_h + 16 + rows * cell_h + (rows - 1) * gap + pad
-    img_w = card_w + pad * 2
-    img_h = card_h + pad * 2
-
-    img = Image.new("RGB", (img_w, img_h), outer_bg)
-    draw = ImageDraw.Draw(img)
-
-    cx0 = pad
-    cy0 = pad
-    cx1 = cx0 + card_w
-    cy1 = cy0 + card_h
-    draw.rounded_rectangle((cx0, cy0, cx1, cy1), radius=18, fill=card_bg, outline=border_soft, width=1)
-
-    bar_y1 = cy0 + title_h + 6
-    draw.rounded_rectangle((cx0, cy0, cx1, bar_y1), radius=18, fill=title_bar)
-    draw.rectangle((cx0, cy0 + 16, cx1, bar_y1), fill=title_bar)
-
-    title = "TOTAL DOS LUCROS MENSAIS E ANUAIS"
-    tw = draw.textlength(title, font=font_title)
-    draw.text((cx0 + (card_w - tw) / 2, cy0 + 14), title, fill=(255, 255, 255), font=font_title)
-
-    y0 = bar_y1 + 12
-    x0 = cx0 + pad
-
-    measure = ImageDraw.Draw(Image.new("RGB", (20, 20)))
-
-    def _vlen(s: str, fnt) -> int:
-        try:
-            return int(measure.textlength(s, font=fnt))
-        except Exception:
-            return len(s) * 10
-
-    for i, (lbl, val, is_lucro) in enumerate(kpi):
-        r, c = divmod(i, cols)
-        x = x0 + c * (cell_w + gap)
-        y = y0 + r * (cell_h + gap)
-        fill = cell_lucro_bg if is_lucro else (cell_zebra if (r + c) % 2 == 0 else (255, 255, 255))
-        draw.rounded_rectangle((x, y, x + cell_w, y + cell_h), radius=12, fill=fill, outline=border_soft, width=1)
-        if is_lucro:
-            border_lucro = green_profit if lucro >= 0 else red_loss
-            draw.rounded_rectangle((x, y, x + cell_w, y + cell_h), radius=12, outline=border_lucro, width=2)
-
-        draw.text((x + 16, y + 14), lbl, fill=label_muted, font=font_label)
-        val_color = green_profit if is_lucro and lucro >= 0 else (red_loss if is_lucro and lucro < 0 else ink)
-        vw = _vlen(val, font_value)
-        draw.text((x + cell_w - 16 - vw, y + 44), val, fill=val_color, font=font_value)
-
-    return _save_telegram_image(img)
+    try:
+        return render_kpi_dashboard(kpi, profit_value=lucro)
+    except Exception:
+        return None
 
 
 def _maybe_build_sales_snippet_image(
@@ -570,16 +392,17 @@ def _maybe_build_sales_snippet_image(
     meta_line: str | None = None,
     snippet_mode: str = "preview",
 ) -> str | None:
-    """
-    Gera um "mini-dashboard" da aba de Vendas (clientes, pagos/pendentes, datas).
-    Visual alinhado ao card do Status (faixa azul + card branco + tipografia).
-    Usado no botão Prévia — não confundir com o resumo financeiro (lucro) do Status.
-    """
+    """Gera tabela visual da aba de vendas (Prévia / Detalhes)."""
+    if not pil_available():
+        return None
     try:
-        from PIL import Image, ImageDraw, ImageFont  # type: ignore
-        from src.excel_store import SpreadsheetService, SHEET_SALES, DATA_START_ROW
+        from src.excel_store import SHEET_SALES, DATA_START_ROW
     except Exception:
         return None
+
+    rows_txt: list[list[str]] = []
+    headers: list[str] = []
+    delivery_cell_states: list[bool | None] = []
 
     try:
         own_wb = wb is None
@@ -616,11 +439,9 @@ def _maybe_build_sales_snippet_image(
                     col_pairs.append((None, label, key))
                 elif cols.get(key):
                     col_pairs.append((cols.get(key), label, key))
-            col_letters = [c for c, _label, _key in col_pairs if c]
-            if not col_letters:
+            if not any(c for c, _label, _key in col_pairs if c):
                 return None
 
-            # Determina linhas de dados existentes (baseado em ID VENDA).
             id_col = cols.get("id venda")
             data_rows: list[int] = []
             if id_col:
@@ -644,7 +465,6 @@ def _maybe_build_sales_snippet_image(
             if not data_rows:
                 return None
 
-            # Linha para destacar (se informar sale_id); senão destaca a última.
             highlight_row = data_rows[-1]
             if sale_id and id_col:
                 for r in reversed(data_rows[-250:]):
@@ -652,20 +472,11 @@ def _maybe_build_sales_snippet_image(
                         highlight_row = r
                         break
 
-            # Pega as últimas N linhas e garante que a destacada esteja incluída.
-            if snippet_mode == "details":
-                last_rows = data_rows[-max(limit, 3):]
-            else:
-                last_rows = data_rows[-max(limit, 3):]
-                if highlight_row not in last_rows:
-                    last_rows = (last_rows + [highlight_row])[-max(limit, 3):]
+            last_rows = data_rows[-max(limit, 3):]
+            if snippet_mode != "details" and highlight_row not in last_rows:
+                last_rows = (last_rows + [highlight_row])[-max(limit, 3):]
 
-            # Cabeçalho: normalmente fica na linha anterior ao início dos dados.
             headers = [label for _c, label, _key in col_pairs]
-
-            def _fmt_money(num: float) -> str:
-                txt = f"{float(num):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-                return f"R$ {txt}"
 
             def _cell_txt(c: str | None, key: str, r: int) -> str:
                 if key == "__material__":
@@ -675,12 +486,12 @@ def _maybe_build_sales_snippet_image(
                     amount = material_totals.get(sid, 0.0)
                     if amount <= 0.01:
                         return "-"
-                    return _fmt_money(amount)
+                    return format_brl(amount)
                 v = ws[f"{c}{r}"].value
                 if v in (None, ""):
                     return ""
                 if key in ("total de vendas (pago)", "valor (pendente)"):
-                    return _fmt_money(svc._to_float(v))
+                    return format_brl(svc._to_float(v))
                 if hasattr(v, "strftime"):
                     try:
                         return v.strftime("%d/%m/%Y")
@@ -689,7 +500,6 @@ def _maybe_build_sales_snippet_image(
                 return str(v)
 
             rows_txt = [[_cell_txt(c, key, r) for c, _label, key in col_pairs] for r in last_rows]
-            delivery_cell_states: list[bool | None] = []
             if snippet_mode != "details":
                 for r in last_rows:
                     delivery_col = cols.get("data de entrega")
@@ -712,115 +522,7 @@ def _maybe_build_sales_snippet_image(
     if not rows_txt:
         return None
 
-    # Renderização visual premium
-    font_body = _load_telegram_font(24, bold=False)
-    font_header = _load_telegram_font(22, bold=True)
-    font_title = _load_telegram_font(30, bold=True)
-    font_meta = _load_telegram_font(20, bold=False)
-
-    pad = 22
-    card_pad = 18
-    cell_pad_x = 12
-    cell_pad_y = 10
-    outer_bg = (241, 245, 249)
-    card_bg = (255, 255, 255)
-    title_bar = (12, 74, 110)
-    header_bg = (230, 243, 251)
-    header_ink = (10, 45, 70)
-    grid = (207, 221, 232)
-    ink = (20, 23, 28)
-    muted = (75, 85, 99)
-    red_pending = (185, 28, 28)
-    zebra = (249, 252, 255)
-    highlight_bg = (255, 246, 214)
-    status_pago_bg = (220, 252, 231)
-    status_pend_bg = (254, 249, 195)
-    delivery_done_bg = (200, 230, 201)
-
-    # Medição de texto
-    measure_draw = ImageDraw.Draw(Image.new("RGB", (20, 20)))
-
-    def tlen(s: str, font_obj) -> int:
-        try:
-            return int(measure_draw.textlength(s, font=font_obj))
-        except Exception:
-            return max(1, len(s)) * 8
-
-    def _truncate(text: str, max_width: int, font_obj) -> str:
-        text = str(text or "")
-        if tlen(text, font_obj) <= max_width:
-            return text
-        suffix = "..."
-        while text and tlen(text + suffix, font_obj) > max_width:
-            text = text[:-1]
-        return (text + suffix) if text else suffix
-
-    col_widths: list[int] = []
-    for ci in range(len(headers)):
-        maxw = tlen(headers[ci], font_header)
-        for rr in rows_txt:
-            maxw = max(maxw, tlen(rr[ci], font_body))
-        cap = 360 if ci == 3 else 230
-        floor = 115 if headers[ci] in ("Data da venda", "Data entrega", "ID VENDA", "Status") else 140
-        if headers[ci] in ("Custo material", "Material"):
-            floor = 130
-            cap = 200
-        if headers[ci] == "Entrada":
-            floor = 130
-            cap = 200
-        col_widths.append(max(floor, min(cap, maxw + cell_pad_x * 2)))
-
-    row_h = (font_body.getbbox("Ag")[3] - font_body.getbbox("Ag")[1]) + (cell_pad_y * 2) + 2
-    title_h = 58
-    meta_h = 36
-    table_w = sum(col_widths)
-    table_h = row_h * (1 + len(rows_txt))
-    card_w = table_w + card_pad * 2
-    card_h = title_h + meta_h + table_h + card_pad * 2 + 12
-    img_w = card_w + pad * 2
-    img_h = card_h + pad * 2
-
-    img = Image.new("RGB", (img_w, img_h), outer_bg)
-    draw = ImageDraw.Draw(img)
-
-    # Card principal
-    card_x0 = pad
-    card_y0 = pad
-    card_x1 = img_w - pad
-    card_y1 = img_h - pad
-    draw.rounded_rectangle((card_x0, card_y0, card_x1, card_y1), radius=18, fill=card_bg, outline=grid, width=1)
-
-    # Barra de título
-    bar_y1 = card_y0 + title_h + 8
-    draw.rounded_rectangle((card_x0, card_y0, card_x1, bar_y1), radius=18, fill=title_bar)
-    # Corrige cantos inferiores da barra para ficar reta
-    draw.rectangle((card_x0, card_y0 + 18, card_x1, bar_y1), fill=title_bar)
-
-    tw_title = draw.textlength(title_main, font=font_title)
-    draw.text(
-        (card_x0 + (card_w - tw_title) / 2, card_y0 + 14),
-        title_main,
-        fill=(255, 255, 255),
-        font=font_title,
-    )
-
-    # Meta (Prévia: foco em pendências/entregas; fallback: últimas linhas)
-    meta_text = meta_line or (
-        f"Mostrando {len(rows_txt)} linha(s) mais recentes • Atualizado ao vivo"
-    )
-    tw_meta = draw.textlength(meta_text, font=font_meta)
-    draw.text(
-        (card_x0 + (card_w - tw_meta) / 2, bar_y1 + 8),
-        meta_text,
-        fill=muted,
-        font=font_meta,
-    )
-
-    x0 = card_x0 + card_pad
-    y0 = bar_y1 + meta_h + 8
-
     def _row_has_pending(rvals: list[str]) -> bool:
-        """Amarelo na linha inteira só quando há pendência real (valor ou status)."""
         try:
             pi = headers.index("Pendente")
             pt = rvals[pi]
@@ -838,70 +540,50 @@ def _maybe_build_sales_snippet_image(
             pass
         return False
 
-    # Header
-    x = x0
-    for ci, h in enumerate(headers):
-        w = col_widths[ci]
-        draw.rectangle((x, y0, x + w, y0 + row_h), fill=header_bg, outline=grid, width=1)
-        draw.text((x + cell_pad_x, y0 + cell_pad_y), _truncate(h, w - 2 * cell_pad_x, font_header), fill=header_ink, font=font_header)
-        x += w
+    def _cell_style(ri: int, ci: int, header: str, row: list[str]) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        pending_row = _row_has_pending(row)
+        delivery_state = delivery_cell_states[ri] if ri < len(delivery_cell_states) else None
+        base_fill = THEME.highlight if pending_row else (THEME.zebra if ri % 2 else THEME.card_bg)
+        cell_ink = THEME.ink
 
-    # Rows: Status = pagamento; Data entrega = entrega (amarelo até confirmar entrega).
-    for ri, rvals in enumerate(rows_txt, start=1):
-        y = y0 + (row_h * ri)
-        x = x0
-        pending_row = _row_has_pending(rvals)
-        delivery_state = delivery_cell_states[ri - 1] if ri - 1 < len(delivery_cell_states) else None
-        for ci, txt in enumerate(rvals):
-            w = col_widths[ci]
-            is_money_col = headers[ci] in ("Pago", "Pendente", "Custo material", "Entrada", "Material")
-            base_fill = highlight_bg if pending_row else (zebra if (ri % 2 == 0) else (255, 255, 255))
-            if headers[ci] == "Data entrega":
-                if delivery_state is True:
-                    cell_fill = status_pend_bg
-                elif delivery_state is False:
-                    cell_fill = delivery_done_bg
-                else:
-                    cell_fill = base_fill
-            elif headers[ci] == "Status":
-                sl = (txt or "").strip().lower()
-                if sl == "pago" or (sl.startswith("pago") and "pendente" not in sl):
-                    cell_fill = status_pago_bg
-                elif "pendente" in sl:
-                    cell_fill = status_pend_bg
-                else:
-                    cell_fill = base_fill
-            else:
-                cell_fill = base_fill
-            draw.rectangle(
-                (x, y, x + w, y + row_h),
-                fill=cell_fill,
-                outline=grid,
-                width=1,
-            )
-            text_value = _truncate(txt, w - 2 * cell_pad_x, font_body)
-            cell_ink = ink
-            if headers[ci] == "Pendente" and text_value.startswith("R$"):
+        if header == "Data entrega":
+            if delivery_state is True:
+                return THEME.status_pending, THEME.ink
+            if delivery_state is False:
+                return THEME.delivery_done, THEME.ink
+            return base_fill, cell_ink
+
+        if header == "Status":
+            sl = (row[ci] or "").strip().lower()
+            if sl == "pago" or (sl.startswith("pago") and "pendente" not in sl):
+                return THEME.status_paid, THEME.ink
+            if "pendente" in sl:
+                return THEME.status_pending, THEME.ink
+            return base_fill, cell_ink
+
+        if header == "Pendente":
+            txt = row[ci] or ""
+            if txt.startswith("R$"):
                 try:
-                    raw = (
-                        text_value.replace("R$", "")
-                        .strip()
-                        .replace(".", "")
-                        .replace(",", ".")
-                    )
+                    raw = txt.replace("R$", "").strip().replace(".", "").replace(",", ".")
                     if float(raw) > 0.01:
-                        cell_ink = red_pending
+                        return base_fill, THEME.pending
                 except Exception:
                     pass
-            if is_money_col:
-                tw = tlen(text_value, font_body)
-                tx = x + w - cell_pad_x - tw
-            else:
-                tx = x + cell_pad_x
-            draw.text((tx, y + cell_pad_y), text_value, fill=cell_ink, font=font_body)
-            x += w
 
-    return _save_telegram_image(img)
+        return base_fill, cell_ink
+
+    meta_text = meta_line or f"Mostrando {len(rows_txt)} linha(s) mais recentes"
+    try:
+        return render_data_table(
+            title=title_main,
+            meta=meta_text,
+            headers=headers,
+            rows=rows_txt,
+            cell_style=_cell_style,
+        )
+    except Exception:
+        return None
 
 
 def send_photo(
