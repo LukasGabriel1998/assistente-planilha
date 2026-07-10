@@ -2653,7 +2653,9 @@ def run_polling() -> None:
                 reply = process_command(text, origin="telegram")
                 send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
             except Exception as e:
-                reply = f"⚠️ Não consegui processar essa mensagem: {e}"
+                from src.bot_processor import _spreadsheet_error_message
+
+                reply = f"⚠️ Não consegui processar essa mensagem:\n{_spreadsheet_error_message(e)}"
                 send_message(chat_id, reply, reply_markup=MAIN_MENU_KEYBOARD)
                 print(f"[Telegram] Erro ao processar: {e}")
 

@@ -105,6 +105,11 @@ class SpreadsheetService:
 
     def _open_workbook(self, *, data_only: bool = False, read_only: bool = False):
         if self._google_bridge is not None:
+            # Garante abas auxiliares no Google antes de ler/gravar (evita KeyError Log_Agente).
+            try:
+                self._google_bridge.ensure_sheets((SHEET_LOG, SHEET_REMINDERS))
+            except Exception as exc:
+                print(f"[planilha] aviso: nao foi possivel preparar abas auxiliares: {exc}")
             return self._google_bridge.open_workbook(data_only=data_only, read_only=read_only)
         try:
             return load_workbook(
@@ -137,9 +142,9 @@ class SpreadsheetService:
                 ) from exc
             raise
 
-    def _save_workbook(self, wb) -> None:
+    def _save_workbook(self, wb, *, allow_clears: bool = False) -> None:
         if self._google_bridge is not None:
-            self._google_bridge.save_workbook(wb)
+            self._google_bridge.save_workbook(wb, allow_clears=allow_clears)
             return
         try:
             wb.save(self.workbook_path)
@@ -587,6 +592,34 @@ class SpreadsheetService:
             return text.lower()
         return text
 
+    @staticmethod
+    def _format_sale_id(sale_id) -> str:
+        """Padroniza ID VENDA curto como 001, 002... (narrativa da Ajuda)."""
+        raw = str(sale_id or "").strip()
+        if raw.startswith("'"):
+            raw = raw[1:].strip()
+        if not raw:
+            return ""
+        if raw.isdigit() and 0 <= int(raw) <= 999:
+            return f"{int(raw):03d}"
+        digits = re.findall(r"\d+", raw)
+        if digits and raw.replace(" ", "").isalnum() and len(digits[-1]) <= 3 and raw.upper() == digits[-1]:
+            return f"{int(digits[-1]):03d}"
+        return raw
+
+    @classmethod
+    def _sale_ids_equal(cls, left, right) -> bool:
+        """Compara IDs aceitando 1 == 001 == '001'."""
+        a = cls._format_sale_id(left)
+        b = cls._format_sale_id(right)
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        if a.isdigit() and b.isdigit():
+            return int(a) == int(b)
+        return cls._normalize_name(a) == cls._normalize_name(b)
+
     def _generate_sale_id(self, ws, sale_id_col: str) -> str:
         used_short_ids: set[int] = set()
         max_id = 0
@@ -607,11 +640,11 @@ class SpreadsheetService:
         return str(max_id + 1)
 
     def _sale_id_exists_in_sales(self, ws, sale_id_col: str, sale_id: str) -> bool:
-        target = str(sale_id or "").strip()
+        target = self._format_sale_id(sale_id)
         if not target:
             return False
         for row in range(DATA_START_ROW, min(ws.max_row + 1, self.MAX_DATA_ROW)):
-            if str(ws[f"{sale_id_col}{row}"].value or "").strip() == target:
+            if self._sale_ids_equal(ws[f"{sale_id_col}{row}"].value, target):
                 return True
         return False
 
@@ -1225,12 +1258,12 @@ class SpreadsheetService:
             wb.close()
 
     def _find_sale_row(self, ws, sale_id_col: str, sale_id: str) -> int:
-        wanted = self._normalize_name(str(sale_id))
+        wanted = self._format_sale_id(sale_id) or self._normalize_name(str(sale_id))
         for row in range(DATA_START_ROW, ws.max_row + 1):
             value = ws[f"{sale_id_col}{row}"].value
             if value in (None, ""):
                 continue
-            if self._normalize_name(str(value)) == wanted:
+            if self._sale_ids_equal(value, wanted):
                 return row
         raise ValueError(f"ID VENDA nao encontrado: {sale_id}")
 
@@ -1352,46 +1385,62 @@ class SpreadsheetService:
 
     @staticmethod
     def _ensure_log_sheet(wb):
-        if SHEET_LOG in wb.sheetnames:
-            return wb[SHEET_LOG]
-        ws = wb.create_sheet(SHEET_LOG)
-        ws.append(
-            [
-                "id",
-                "timestamp",
-                "origem",
-                "cliente",
-                "descricao",
-                "valor",
-                "data_ref",
-                "aba",
-                "linha",
-                "texto_original",
-            ]
-        )
-        return ws
+        try:
+            if SHEET_LOG in wb.sheetnames:
+                return wb[SHEET_LOG]
+            for real_name in wb.sheetnames:
+                if SpreadsheetService._normalize_name(real_name) == SpreadsheetService._normalize_name(SHEET_LOG):
+                    return wb[real_name]
+            ws = wb.create_sheet(SHEET_LOG)
+            ws.append(
+                [
+                    "id",
+                    "timestamp",
+                    "origem",
+                    "cliente",
+                    "descricao",
+                    "valor",
+                    "data_ref",
+                    "aba",
+                    "linha",
+                    "texto_original",
+                ]
+            )
+            return ws
+        except Exception as exc:
+            print(f"[planilha] aviso: nao foi possivel preparar Log_Agente: {exc}")
+            return None
 
     @staticmethod
     def _ensure_reminders_sheet(wb):
-        if SHEET_REMINDERS in wb.sheetnames:
-            return wb[SHEET_REMINDERS]
-        ws = wb.create_sheet(SHEET_REMINDERS)
-        ws.append(
-            [
-                "ID VENDA",
-                "Cliente",
-                "Descricao",
-                "Data venda",
-                "Data entrega",
-                "Valor pendente",
-                "Status pagamento",
-                "Status servico",
-                "Chat ID",
-                "Criado em",
-                "Atualizado em",
-            ]
-        )
-        return ws
+        try:
+            if SHEET_REMINDERS in wb.sheetnames:
+                return wb[SHEET_REMINDERS]
+            for real_name in wb.sheetnames:
+                if SpreadsheetService._normalize_name(real_name) == SpreadsheetService._normalize_name(
+                    SHEET_REMINDERS
+                ):
+                    return wb[real_name]
+            ws = wb.create_sheet(SHEET_REMINDERS)
+            ws.append(
+                [
+                    "ID VENDA",
+                    "Cliente",
+                    "Descricao",
+                    "Data venda",
+                    "Data entrega",
+                    "Valor pendente",
+                    "Status pagamento",
+                    "Status servico",
+                    "Chat ID",
+                    "Criado em",
+                    "Atualizado em",
+                ]
+            )
+            return ws
+        except Exception as exc:
+            print(f"[planilha] aviso: nao foi possivel preparar Lembretes: {exc}")
+            return None
 
     @staticmethod
     def _reminders_header_map(ws) -> dict[str, int]:
@@ -1418,11 +1467,14 @@ class SpreadsheetService:
         chat_id: str,
     ) -> None:
         ws = self._ensure_reminders_sheet(wb)
+        if ws is None:
+            print("[planilha] aviso: lembrete nao registrado (aba Lembretes indisponivel).")
+            return
         headers = self._reminders_header_map(ws)
         col_sale_id = headers.get(self._normalize_name("ID VENDA"), 1)
         target_row: int | None = None
         for row in range(2, ws.max_row + 1):
-            if str(ws.cell(row=row, column=col_sale_id).value or "").strip() == str(sale_id).strip():
+            if self._sale_ids_equal(ws.cell(row=row, column=col_sale_id).value, sale_id):
                 target_row = row
                 break
         if target_row is None:
@@ -1436,7 +1488,7 @@ class SpreadsheetService:
                 return
             ws.cell(row=target_row, column=idx).value = value
 
-        _set("ID VENDA", sale_id)
+        _set("ID VENDA", self._format_sale_id(sale_id))
         _set("Cliente", customer)
         _set("Descricao", description)
         _set("Data venda", self._excel_date_value(sale_date))
@@ -1464,7 +1516,7 @@ class SpreadsheetService:
         if not col_chat:
             return ""
         for row in range(2, ws.max_row + 1):
-            if str(ws.cell(row=row, column=col_sale_id).value or "").strip() == str(sale_id).strip():
+            if self._sale_ids_equal(ws.cell(row=row, column=col_sale_id).value, sale_id):
                 return str(ws.cell(row=row, column=col_chat).value or "").strip()
         return ""
 
@@ -1559,7 +1611,7 @@ class SpreadsheetService:
         col_chat = headers.get(self._normalize_name("Chat ID"))
         col_status = headers.get(self._normalize_name("Status servico"))
         for row in range(2, ws.max_row + 1):
-            sale_id = str(ws.cell(row=row, column=col_sale_id).value or "").strip()
+            sale_id = self._format_sale_id(ws.cell(row=row, column=col_sale_id).value)
             if not sale_id:
                 continue
             meta[sale_id] = {
@@ -1589,7 +1641,7 @@ class SpreadsheetService:
         rows: list[dict] = []
         scan_until = min(ws_sales.max_row, self.MAX_DATA_ROW, DATA_START_ROW + max_rows_scan)
         for row in range(DATA_START_ROW, scan_until + 1):
-            sale_id = str(ws_sales[f"{col_sale_id}{row}"].value or "").strip()
+            sale_id = self._format_sale_id(ws_sales[f"{col_sale_id}{row}"].value)
             if not sale_id:
                 continue
             delivery_dt = self._parse_date_cell(ws_sales[f"{col_delivery}{row}"].value)
@@ -1657,7 +1709,7 @@ class SpreadsheetService:
             if not (due_raw and due_raw == today_txt):
                 continue
 
-            sale_id = str(ws_rem.cell(row=row, column=headers.get(self._normalize_name("ID VENDA"), 1)).value or "").strip()
+            sale_id = self._format_sale_id(ws_rem.cell(row=row, column=headers.get(self._normalize_name("ID VENDA"), 1)).value)
             if not sale_id:
                 continue
 
@@ -1708,7 +1760,7 @@ class SpreadsheetService:
         if not col_status:
             return False
         for row in range(2, ws.max_row + 1):
-            if str(ws.cell(row=row, column=col_sale_id).value or "").strip() != str(sale_id).strip():
+            if not self._sale_ids_equal(ws.cell(row=row, column=col_sale_id).value, sale_id):
                 continue
             ws.cell(row=row, column=col_status).value = "FINALIZADO"
             if col_updated:
@@ -1735,7 +1787,7 @@ class SpreadsheetService:
             col_sale_id = sales_cols["id venda"]
             col_delivery = sales_cols["data de entrega"]
             for row in range(DATA_START_ROW, min(ws_sales.max_row + 1, self.MAX_DATA_ROW)):
-                if str(ws_sales[f"{col_sale_id}{row}"].value or "").strip() != str(sale_id).strip():
+                if not self._sale_ids_equal(ws_sales[f"{col_sale_id}{row}"].value, sale_id):
                     continue
                 pending_col = sales_cols["valor (pendente)"]
                 current_pending = self._to_float(ws_sales[f"{pending_col}{row}"].value)
@@ -1757,7 +1809,7 @@ class SpreadsheetService:
         col_sale_id = sales_cols["id venda"]
         row_found = None
         for row in range(DATA_START_ROW, min(ws_sales.max_row + 1, self.MAX_DATA_ROW)):
-            if str(ws_sales[f"{col_sale_id}{row}"].value or "").strip() == str(sale_id).strip():
+            if self._sale_ids_equal(ws_sales[f"{col_sale_id}{row}"].value, sale_id):
                 row_found = row
                 break
         if row_found is None:
@@ -1768,7 +1820,7 @@ class SpreadsheetService:
                 return ""
             return str(ws_sales[f"{col}{row_found}"].value or "").strip()
         return {
-            "sale_id": str(sale_id).strip(),
+            "sale_id": self._format_sale_id(sale_id),
             "customer": _v("cliente"),
             "description": _v("id produto"),
             "sale_date": _v("data de venda") or _v("data"),
@@ -1784,7 +1836,7 @@ class SpreadsheetService:
         headers = self._reminders_header_map(ws)
         col_sale_id = headers.get(self._normalize_name("ID VENDA"), 1)
         for row in range(2, ws.max_row + 1):
-            if str(ws.cell(row=row, column=col_sale_id).value or "").strip() != str(sale_id).strip():
+            if not self._sale_ids_equal(ws.cell(row=row, column=col_sale_id).value, sale_id):
                 continue
             for col in range(1, ws.max_column + 1):
                 ws.cell(row=row, column=col).value = None
@@ -1798,7 +1850,7 @@ class SpreadsheetService:
             return 0
         count = 0
         for row in range(DATA_START_ROW, min(ws.max_row + 1, self.MAX_DATA_ROW)):
-            if str(ws[f"{col_sale_id}{row}"].value or "").strip() == str(sale_id).strip():
+            if self._sale_ids_equal(ws[f"{col_sale_id}{row}"].value, sale_id):
                 count += 1
         return count
 
@@ -1833,7 +1885,7 @@ class SpreadsheetService:
                 max_col=max(sid_idx, val_idx),
             ):
                 values = {cell.column: cell.value for cell in row_cells}
-                sale_id = str(values.get(sid_idx) or "").strip()
+                sale_id = self._format_sale_id(values.get(sid_idx))
                 if not sale_id:
                     continue
                 amount = self._to_float(values.get(val_idx))
@@ -1842,7 +1894,7 @@ class SpreadsheetService:
                 totals[sale_id] = round(totals.get(sale_id, 0.0) + amount, 2)
         else:
             for row in range(DATA_START_ROW, end_row + 1):
-                sale_id = str(ws[f"{col_sale_id}{row}"].value or "").strip()
+                sale_id = self._format_sale_id(ws[f"{col_sale_id}{row}"].value)
                 if not sale_id:
                     continue
                 amount = self._to_float(ws[f"{col_valor}{row}"].value)
@@ -1853,7 +1905,7 @@ class SpreadsheetService:
 
     def _clear_material_rows_for_sale(self, ws, sale_id: str) -> int:
         """Remove linhas de material vinculadas a um ID VENDA (antes de substituir custo)."""
-        sale_id = str(sale_id or "").strip()
+        sale_id = self._format_sale_id(sale_id)
         if not sale_id:
             return 0
         material_cols = self._material_columns(ws)
@@ -1870,7 +1922,7 @@ class SpreadsheetService:
         mat_cols = mat_cols + (col_sid,)
         cleared = 0
         for mat_row in range(DATA_START_ROW, min(ws.max_row + 1, self.MAX_DATA_ROW)):
-            if str(ws[f"{col_sid}{mat_row}"].value or "").strip() != sale_id:
+            if not self._sale_ids_equal(ws[f"{col_sid}{mat_row}"].value, sale_id):
                 continue
             self._clear_row_values(ws, mat_row, mat_cols)
             cleared += 1
@@ -1949,7 +2001,7 @@ class SpreadsheetService:
                         mat_cols = (material_cols["fornecedor"],) + mat_cols
                     mat_cols = mat_cols + (col_sid,)
                     for mat_row in range(DATA_START_ROW, min(ws_material.max_row + 1, self.MAX_DATA_ROW)):
-                        if str(ws_material[f"{col_sid}{mat_row}"].value or "").strip() != sale_id:
+                        if not self._sale_ids_equal(ws_material[f"{col_sid}{mat_row}"].value, sale_id):
                             continue
                         self._clear_row_values(ws_material, mat_row, mat_cols)
 
@@ -1980,7 +2032,7 @@ class SpreadsheetService:
                 row=row,
                 original_text=original_text or delete_cmd.reason,
             )
-            self._save_workbook(wb)
+            self._save_workbook(wb, allow_clears=True)
             return action
         finally:
             wb.close()
@@ -1999,10 +2051,11 @@ class SpreadsheetService:
         if abs((paid_amount + pending_amount) - float(cmd.total_value or 0.0)) >= 0.01:
             pending_amount = round(max(float(cmd.total_value or 0.0) - paid_amount, 0.0), 2)
         sale_id_col = sales_cols["id venda"]
-        sale_id = (cmd.sale_id or "").strip()
+        sale_id = self._format_sale_id(cmd.sale_id)
         if sale_id and self._sale_id_exists_in_sales(ws, sale_id_col, sale_id):
             sale_id = ""
         sale_id = sale_id or self._generate_sale_id(ws, sale_id_col)
+        sale_id = self._format_sale_id(sale_id)
         value_status = self._status_text(pending_amount)
         value_status_display = self._match_text_case(
             template_ws[f"{sales_cols['status de valor']}{template_row}"].value,
@@ -2079,7 +2132,7 @@ class SpreadsheetService:
         ws[f"{material_cols['descricao']}{row}"] = description
         ws[f"{material_cols['valor']}{row}"] = float(amount)
         if material_cols.get("id venda") and sale_id:
-            ws[f"{material_cols['id venda']}{row}"] = sale_id
+            ws[f"{material_cols['id venda']}{row}"] = self._format_sale_id(sale_id)
         self._ensure_number_format_if_general(ws, material_cols["data"], row, "DD/MM/YYYY")
         self._ensure_number_format_if_general(ws, material_cols["valor"], row, "R$ #,##0.00")
         return row
@@ -2103,20 +2156,25 @@ class SpreadsheetService:
 
     @staticmethod
     def _append_log(ws, log_id: str, origin: str, cmd: FinancialCommand, amount: float, ref_date, sheet: str, row: int, original_text: str) -> None:
-        ws.append(
-            [
-                log_id,
-                datetime.now(),
-                origin,
-                cmd.customer,
-                cmd.description,
-                amount,
-                ref_date,
-                sheet,
-                row,
-                original_text,
-            ]
-        )
+        if ws is None:
+            return
+        try:
+            ws.append(
+                [
+                    log_id,
+                    datetime.now(),
+                    origin,
+                    cmd.customer,
+                    cmd.description,
+                    amount,
+                    ref_date,
+                    sheet,
+                    row,
+                    original_text,
+                ]
+            )
+        except Exception as exc:
+            print(f"[planilha] aviso: falha ao gravar Log_Agente: {exc}")
 
     def apply_command(
         self,
@@ -2462,16 +2520,16 @@ class SpreadsheetService:
             col_delivery = sales_cols["data de entrega"]
             col_customer = sales_cols.get("cliente")
             target_row = None
-            needle = str(sale_id).strip()
+            needle = self._format_sale_id(sale_id) or str(sale_id).strip()
             # 1) Primeiro tenta por ID VENDA
             for row in range(DATA_START_ROW, min(ws_sales.max_row + 1, self.MAX_DATA_ROW)):
-                if str(ws_sales[f"{col_sale_id}{row}"].value or "").strip() == needle:
+                if self._sale_ids_equal(ws_sales[f"{col_sale_id}{row}"].value, needle):
                     target_row = row
                     break
             # 2) Fallback: tenta pelo nome na coluna Cliente
             if target_row is None and col_customer:
                 for row in range(DATA_START_ROW, min(ws_sales.max_row + 1, self.MAX_DATA_ROW)):
-                    if str(ws_sales[f"{col_customer}{row}"].value or "").strip() == needle:
+                    if str(ws_sales[f"{col_customer}{row}"].value or "").strip() == str(sale_id).strip():
                         target_row = row
                         break
             if target_row is None:

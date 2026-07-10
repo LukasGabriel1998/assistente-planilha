@@ -123,7 +123,21 @@ def _spreadsheet_error_message(exc: Exception) -> str:
 
     if isinstance(exc, GoogleSheetsQuotaError):
         return str(exc)
-    return f"Erro ao acessar planilha: {exc}"
+    msg = str(exc).strip() or type(exc).__name__
+    lower = msg.lower()
+    if "log_agente" in lower or "lembretes" in lower:
+        return (
+            "Erro ao acessar aba auxiliar da planilha "
+            f"({msg}). A venda principal deve ser salva mesmo assim após a atualização do bot; "
+            "se persistir, confira se a conta de serviço tem permissão de *Editor* na planilha."
+        )
+    if "aba" in lower and ("nao encontrada" in lower or "não encontrada" in lower):
+        return (
+            f"Erro na planilha: {msg}\n"
+            "Confira se as abas principais existem "
+            "(TOTAL DE VENDAS, Compras Matéria-Prima, Gastos Fixos)."
+        )
+    return f"Erro ao acessar planilha: {msg}"
 
 
 def get_default_workbook() -> str:
@@ -531,6 +545,24 @@ def apply_parse_result(
     """Aplica um ParseResult já validado na planilha e retorna a mensagem de resposta."""
     if not spreadsheet_is_ready():
         return spreadsheet_setup_hint()
+    try:
+        return _apply_parse_result_inner(
+            parse_result,
+            origin=origin,
+            original_text=original_text,
+            chat_id=chat_id,
+        )
+    except Exception as exc:
+        return _spreadsheet_error_message(exc)
+
+
+def _apply_parse_result_inner(
+    parse_result: ParseResult,
+    origin: str = "telegram",
+    original_text: str = "",
+    *,
+    chat_id: str | None = None,
+) -> str:
     try:
         service = _open_spreadsheet_service()
     except Exception as exc:
