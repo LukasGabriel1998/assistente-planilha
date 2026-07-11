@@ -170,8 +170,7 @@ Ao salvar, a planilha gera o 🧾 *ID VENDA* (ex.: 012). *Guarde esse código.*
 
 ⚡ *Botões rápidos*
 📋 *Prévia* — pendências e entregas
-📊 *Resumo* — totais gerais
-🔍 *Detalhes* — quem pagou, quem deve e de quê
+📊 *Resumo* — totais gerais (use *Ver detalhes* na mensagem para quem pagou/deve)
 🆕 *Nova conversa* — limpa o ID VENDA ativo
 
 🔁 *ID VENDA na conversa*
@@ -184,7 +183,7 @@ Depois que informar um ID, o bot mantém para custos, pagamentos e entregas até
 # Teclado de menu (botões que aparecem abaixo do campo de digitação)
 MAIN_MENU_KEYBOARD = {
     "keyboard": [
-        ["Prévia", "Resumo", "Detalhes"],
+        ["Prévia", "Resumo"],
         ["Ajuda", "Nova conversa"],
     ],
     "resize_keyboard": True,
@@ -1336,16 +1335,8 @@ def _build_dashboard_reply(cmd_strip: str) -> tuple[str, str | None]:
                 meta_line="Pendências e entregas • Atualizado ao vivo com base na planilha",
             )
         elif cmd_strip.startswith(("detalhes", "detalhe")):
-            reply = svc.get_planilha_details(wb=wb)
-            img_path = _maybe_build_sales_snippet_image(
-                workbook_path,
-                wb=wb,
-                svc=svc,
-                limit=12,
-                title_main="DETALHES — O QUE COMPÕE O RESUMO",
-                meta_line="Cliente, produto, entrada e pendente por venda",
-                snippet_mode="details",
-            )
+            # Detalhes vão como mensagem de texto (não imagem).
+            return svc.get_planilha_details(wb=wb), None
         elif cmd_strip.startswith(("status", "resumo", "planilha")):
             reply = svc.get_planilha_summary(wb=wb)
             img_path = _maybe_build_status_table_image(workbook_path, wb=wb, svc=svc)
@@ -1392,24 +1383,44 @@ def _handle_quick_dashboard_command(
     pending_preview.pop(chat_id, None)
     wait_message_id: int | None = None
     img_path: str | None = None
+    is_details = cmd_strip.startswith(("detalhes", "detalhe"))
     try:
-        wait_message_id = _notify_dashboard_loading(chat_id, cmd_strip)
-        caption, img_path = _run_with_chat_action(
-            chat_id,
-            "upload_photo",
-            lambda: _build_dashboard_reply(cmd_strip),
-        )
-        send_reply(
-            chat_id,
-            caption,
-            parse_mode="Markdown",
-            reply_markup=(
-                RESUMO_DETAILS_INLINE_KEYBOARD
-                if cmd_strip.startswith(("status", "resumo", "planilha"))
-                else MAIN_MENU_KEYBOARD
-            ),
-            image_path=img_path,
-        )
+        if is_details:
+            send_chat_action(chat_id, "typing")
+            wait_message_id = send_message(
+                chat_id,
+                _dashboard_wait_message(cmd_strip),
+                parse_mode="Markdown",
+            )
+            caption, img_path = _run_with_chat_action(
+                chat_id,
+                "typing",
+                lambda: _build_dashboard_reply(cmd_strip),
+            )
+            send_message(
+                chat_id,
+                caption or "Nenhum detalhe disponível.",
+                parse_mode="Markdown",
+                reply_markup=MAIN_MENU_KEYBOARD,
+            )
+        else:
+            wait_message_id = _notify_dashboard_loading(chat_id, cmd_strip)
+            caption, img_path = _run_with_chat_action(
+                chat_id,
+                "upload_photo",
+                lambda: _build_dashboard_reply(cmd_strip),
+            )
+            send_reply(
+                chat_id,
+                caption,
+                parse_mode="Markdown",
+                reply_markup=(
+                    RESUMO_DETAILS_INLINE_KEYBOARD
+                    if cmd_strip.startswith(("status", "resumo", "planilha"))
+                    else MAIN_MENU_KEYBOARD
+                ),
+                image_path=img_path,
+            )
     except Exception as exc:
         send_message(
             chat_id,
@@ -1436,7 +1447,7 @@ def _handle_resumo_detalhes_callback(
     quick_menu_processing: set[int | str],
     quick_menu_cooldown: dict[int | str, float],
 ) -> bool:
-    """Botão inline 'Ver detalhes' no card do Resumo."""
+    """Botão inline 'Ver detalhes' no card do Resumo — responde em texto."""
     now = time.time()
     if chat_id in quick_menu_processing or now < quick_menu_cooldown.get(chat_id, 0.0):
         answer_callback_query(
@@ -1448,21 +1459,24 @@ def _handle_resumo_detalhes_callback(
     quick_menu_processing.add(chat_id)
     pending_preview.pop(chat_id, None)
     wait_message_id: int | None = None
-    img_path: str | None = None
     try:
         answer_callback_query(callback_query_id, "Gerando detalhes...")
-        wait_message_id = _notify_dashboard_loading(chat_id, "detalhes")
-        caption, img_path = _run_with_chat_action(
+        send_chat_action(chat_id, "typing")
+        wait_message_id = send_message(
             chat_id,
-            "upload_photo",
+            _dashboard_wait_message("detalhes"),
+            parse_mode="Markdown",
+        )
+        caption, _img = _run_with_chat_action(
+            chat_id,
+            "typing",
             lambda: _build_dashboard_reply("detalhes"),
         )
-        send_reply(
+        send_message(
             chat_id,
-            caption,
+            caption or "Nenhum detalhe disponível.",
             parse_mode="Markdown",
             reply_markup=MAIN_MENU_KEYBOARD,
-            image_path=img_path,
         )
     except Exception as exc:
         send_message(
@@ -1472,11 +1486,6 @@ def _handle_resumo_detalhes_callback(
         )
     finally:
         delete_chat_message(chat_id, wait_message_id)
-        if img_path:
-            try:
-                Path(img_path).unlink(missing_ok=True)
-            except Exception:
-                pass
         quick_menu_processing.discard(chat_id)
         quick_menu_cooldown[chat_id] = time.time() + 3.0
     return True
