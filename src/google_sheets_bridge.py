@@ -25,8 +25,17 @@ _MAX_SYNC_COL = 26  # A..Z
 
 # Abas auxiliares: se falharem no sync, a venda principal ainda deve ser salva.
 _OPTIONAL_SHEETS = frozenset({"Log_Agente", "Lembretes"})
-# Janela curta pós-save para reutilizar a planilha em memória (ex.: gerar imagem).
-_CACHE_TTL_SEC = 20.0
+# Reusa a planilha em memória entre leituras/gravações do bot (bem mais rápido).
+_CACHE_TTL_SEC = 90.0
+# Só baixa abas usadas pelo robô (igual à ideia do Line: não varrer a planilha inteira).
+_CORE_SHEET_HINTS = (
+    "total de vendas",
+    "compras",
+    "gastos fixos",
+    "log agente",
+    "lembretes",
+    "_tmpl_",
+)
 
 
 class GoogleSheetsBridge:
@@ -40,7 +49,7 @@ class GoogleSheetsBridge:
         self._worksheets: dict[str, Any] = {}
         self._baseline: dict[str, dict[str, Any]] = {}
         self._aux_sheets_ready = False
-        # Cache em memória: evita 2ª leitura completa logo após salvar (ex.: imagem da prévia).
+        # Cache em memória: evita baixar a planilha inteira de novo a cada operação.
         self._memory_wb: Workbook | None = None
         self._cache_until = 0.0
 
@@ -123,8 +132,24 @@ class GoogleSheetsBridge:
                 print(f"[GoogleSheets] aviso: nao foi possivel garantir aba '{title}': {exc}")
         self._aux_sheets_ready = True
 
+    @classmethod
+    def _is_core_sheet(cls, title: str) -> bool:
+        norm = cls._normalize_sheet_title(title)
+        return any(hint in norm for hint in _CORE_SHEET_HINTS)
+
     @staticmethod
-    def _serialize_value(value: Any) -> str | int | float:
+    def _date_as_sheets_text(value: date | datetime) -> str:
+        """
+        Mesmo formato do Assistente_Line na nuvem: 'YYYY-MM-DD HH:MM:SS'.
+        Sem fórmula (=DATE/=DATA) — o Sheets interpreta o texto como data.
+        """
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now()
+        return datetime.combine(value, now.time()).strftime("%Y-%m-%d %H:%M:%S")
+
+    @classmethod
+    def _serialize_value(cls, value: Any) -> str | int | float:
         if value is None:
             return ""
         if isinstance(value, bool):
@@ -132,31 +157,49 @@ class GoogleSheetsBridge:
         if isinstance(value, (int, float)):
             return value
         if isinstance(value, datetime):
-            d = value.date()
-            # Fórmula DATE: valor absoluto, independente do locale MM/DD vs DD/MM.
-            return f"=DATE({d.year},{d.month},{d.day})"
+            return cls._date_as_sheets_text(value)
         if isinstance(value, date):
-            return f"=DATE({value.year},{value.month},{value.day})"
+            return cls._date_as_sheets_text(value)
         text = str(value).strip()
         # USER_ENTERED transforma "001" em número 1 — força texto para IDs com zero à esquerda.
         if text.isdigit() and len(text) >= 2 and text.startswith("0"):
             return f"'{text}"
-        # Datas texto DD/MM/YYYY → fórmula DATE (evita inversão no locale americano).
         if text.startswith("'"):
             text = text[1:].strip()
+        # Já está no formato Line / ISO datetime — mantém.
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?", text):
+            if "T" in text:
+                text = text.replace("T", " ", 1)
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+                return cls._date_as_sheets_text(date.fromisoformat(text))
+            return text
+        # Datas texto DD/MM/YYYY → mesmo formato ISO do Line.
         m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", text)
         if m:
             day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
             if year < 100:
                 year += 2000
             try:
-                date(year, month, day)  # valida dia/mês BR
-                return f"=DATE({year},{month},{day})"
+                return cls._date_as_sheets_text(date(year, month, day))
             except ValueError:
                 pass
-        # Já veio como fórmula DATE — mantém.
-        if text.upper().startswith("=DATE("):
-            return text
+        # Fórmulas antigas DATE/DATA → converte para texto ISO (corrige #ERROR!).
+        m_formula = re.fullmatch(
+            r"=(?:DATE|DATA)\((\d{4})\s*[,;]\s*(\d{1,2})\s*[,;]\s*(\d{1,2})\)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if m_formula:
+            try:
+                return cls._date_as_sheets_text(
+                    date(
+                        int(m_formula.group(1)),
+                        int(m_formula.group(2)),
+                        int(m_formula.group(3)),
+                    )
+                )
+            except ValueError:
+                pass
         return str(value)
 
     @staticmethod
@@ -227,7 +270,7 @@ class GoogleSheetsBridge:
         return wb
 
     def _build_workbook_from_grids(self, *, data_only: bool = False, read_only: bool = False):
-        """Lê todas as abas em 1–2 chamadas à API (batchGet)."""
+        """Lê abas do robô em 1–2 chamadas à API (batchGet) — sem baixar o resto da planilha."""
         spreadsheet = self._spreadsheet_obj()
         worksheets = sheets_call(spreadsheet.worksheets)
         if not worksheets:
@@ -236,11 +279,14 @@ class GoogleSheetsBridge:
             self._worksheets.clear()
             return wb
 
-        # Cache local dos handles das abas (evita reabrir depois no save).
-        for ws_meta in worksheets:
+        # Preferência: só abas usadas pelo bot (mais rápido, no espírito do Line).
+        core = [ws for ws in worksheets if self._is_core_sheet(ws.title)]
+        selected = core if core else list(worksheets)
+
+        for ws_meta in selected:
             self._worksheets[ws_meta.title] = ws_meta
 
-        ranges = [f"'{ws_meta.title}'" for ws_meta in worksheets]
+        ranges = [f"'{ws_meta.title}'" for ws_meta in selected]
 
         def _batch_get():
             return spreadsheet.values_batch_get(
@@ -256,13 +302,13 @@ class GoogleSheetsBridge:
             payload = sheets_call(_batch_get)
         except Exception as exc:
             print(f"[GoogleSheets] aviso: batchGet falhou ({exc}); fallback get_all_values")
-            return self._build_workbook_from_grids_fallback(worksheets)
+            return self._build_workbook_from_grids_fallback(selected)
 
         value_ranges = payload.get("valueRanges", []) if isinstance(payload, dict) else []
         wb = Workbook()
         wb.remove(wb.active)
 
-        for idx, ws_meta in enumerate(worksheets):
+        for idx, ws_meta in enumerate(selected):
             sheet = wb.create_sheet(title=ws_meta.title[:31])
             rows = []
             if idx < len(value_ranges):
@@ -294,16 +340,16 @@ class GoogleSheetsBridge:
         self._cache_until = 0.0
 
     def open_workbook(self, *, data_only: bool = False, read_only: bool = False):
-        """Carrega a planilha. Reusa cache em memória só na janela curta pós-save."""
+        """Carrega a planilha. Reusa cache em memória na janela TTL (evita download a cada save)."""
         if self._memory_wb is not None and time.monotonic() < self._cache_until:
             return self._clone_workbook(self._memory_wb)
         wb = self._build_workbook_from_grids(data_only=data_only, read_only=read_only)
         self._memory_wb = self._clone_workbook(wb)
-        self._cache_until = 0.0
+        self._cache_until = time.monotonic() + _CACHE_TTL_SEC
         return wb
 
     def save_workbook(self, wb, *, allow_clears: bool = False) -> None:
-        """Envia apenas células alteradas via batch_update (uma ou poucas requisições).
+        """Envia apenas células alteradas em 1 batchUpdate (estilo Line: só o que mudou).
 
         Por padrão NÃO apaga valores existentes na nuvem quando a célula local está vazia
         (evita wipe acidental). Use allow_clears=True em exclusões explícitas.
@@ -315,19 +361,21 @@ class GoogleSheetsBridge:
             return
 
         optional_failures: list[str] = []
+        # Um único values.batchUpdate para todas as abas (menos round-trips à API).
+        remote_data: list[dict[str, Any]] = []
+
         for name in wb.sheetnames:
             try:
                 ws = wb[name]
-                worksheet = self._worksheet(name, create_if_missing=True)
+                # Garante handle da aba (cria se for auxiliar nova).
+                self._worksheet(name, create_if_missing=True)
                 old_cells = self._baseline.get(name, {})
-                batch: list[dict[str, Any]] = []
 
                 baseline_max_row = 1
                 for key in old_cells:
                     digits = "".join(ch for ch in key if ch.isdigit())
                     if digits:
                         baseline_max_row = max(baseline_max_row, int(digits))
-                # Limita varredura: dados reais + folga (nunca milhões de linhas da âncora).
                 scan_max = min(
                     max(ws.max_row or 1, baseline_max_row + 5, 50),
                     2000,
@@ -348,29 +396,20 @@ class GoogleSheetsBridge:
                         if new_empty and old_empty:
                             continue
                         if new_empty and not old_empty and not allow_clears:
-                            # Preserva valor na nuvem — não propaga vazio acidental.
                             continue
                         if not new_empty and not old_empty and new_val == old_val:
                             continue
-                        batch.append(
+                        serialized = self._serialize_value(new_val)
+                        # Evita reescrever data que na nuvem já está como serial/texto equivalente.
+                        if not new_empty and not old_empty:
+                            if self._values_equivalent(old_val, new_val, serialized):
+                                continue
+                        remote_data.append(
                             {
-                                "range": key,
-                                "values": [[self._serialize_value(new_val)]],
+                                "range": f"'{name}'!{key}",
+                                "values": [[serialized]],
                             }
                         )
-
-                if not batch:
-                    continue
-
-                # Um único batch_update por aba (até 400 células; se passar, chunka).
-                chunk_size = 400
-                for i in range(0, len(batch), chunk_size):
-                    chunk = batch[i : i + chunk_size]
-
-                    def _write(c=chunk, w=worksheet):
-                        w.batch_update(c, value_input_option="USER_ENTERED")
-
-                    sheets_call(_write, is_write=True)
             except Exception as exc:
                 if name in _OPTIONAL_SHEETS or self._normalize_sheet_title(name) in {
                     self._normalize_sheet_title(t) for t in _OPTIONAL_SHEETS
@@ -379,6 +418,22 @@ class GoogleSheetsBridge:
                     print(f"[GoogleSheets] aviso: falha ao sincronizar aba opcional '{name}': {exc}")
                     continue
                 raise
+
+        if remote_data:
+            spreadsheet = self._spreadsheet_obj()
+            chunk_size = 400
+            for i in range(0, len(remote_data), chunk_size):
+                chunk = remote_data[i : i + chunk_size]
+
+                def _write(c=chunk):
+                    return spreadsheet.values_batch_update(
+                        {
+                            "valueInputOption": "USER_ENTERED",
+                            "data": c,
+                        }
+                    )
+
+                sheets_call(_write, is_write=True)
 
         if optional_failures:
             print(
@@ -389,6 +444,32 @@ class GoogleSheetsBridge:
         self._baseline = self._snapshot_workbook(wb)
         self._memory_wb = self._clone_workbook(wb)
         self._cache_until = time.monotonic() + _CACHE_TTL_SEC
+
+    @classmethod
+    def _values_equivalent(cls, old_val: Any, new_val: Any, serialized_new: Any) -> bool:
+        """True se o valor antigo (nuvem/baseline) já representa o mesmo dado que vamos gravar."""
+        if old_val == new_val:
+            return True
+        if old_val == serialized_new:
+            return True
+        # Serial Sheets vs date/datetime
+        if isinstance(new_val, (date, datetime)) and isinstance(old_val, (int, float)):
+            try:
+                d = new_val.date() if isinstance(new_val, datetime) else new_val
+                serial = (d - date(1899, 12, 30)).days
+                if abs(float(old_val) - serial) < 0.0001:
+                    return True
+            except Exception:
+                pass
+        # Texto ISO já na nuvem vs date local
+        if isinstance(new_val, (date, datetime)) and isinstance(old_val, str):
+            old_txt = old_val.strip().replace("T", " ", 1)
+            new_txt = str(serialized_new).strip()
+            if old_txt == new_txt:
+                return True
+            if old_txt[:10] == new_txt[:10]:
+                return True
+        return False
 
 
 __all__ = ["GoogleSheetsBridge", "GoogleSheetsQuotaError"]

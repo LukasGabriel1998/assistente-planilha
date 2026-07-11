@@ -172,7 +172,7 @@ Ao salvar, a planilha gera o 🧾 *ID VENDA* (ex.: 012). *Guarde esse código.*
 📋 *Prévia* — pendências e entregas
 📊 *Resumo* — totais gerais (use *Ver detalhes* na mensagem para quem pagou/deve)
 ✏️ *Corrigir* — alterar ou apagar um lançamento
-🆕 *Nova conversa* — limpa o ID VENDA ativo
+🔄 *Nova conversa* — limpa o ID VENDA ativo
 
 🔁 *ID VENDA na conversa*
 Depois que informar um ID, o bot mantém para custos, pagamentos e entregas até *Nova conversa*.
@@ -186,7 +186,7 @@ MAIN_MENU_KEYBOARD = {
     "keyboard": [
         ["Prévia", "Resumo"],
         ["✏️ Corrigir", "Ajuda"],
-        ["Nova conversa"],
+        ["🔄 Nova conversa"],
     ],
     "resize_keyboard": True,
     "one_time_keyboard": False,
@@ -2568,7 +2568,14 @@ def run_polling() -> None:
 
             # Nova conversa: limpa prévia e contexto de ID VENDA
             lower_cmd = text.strip().lower()
-            if lower_cmd in ("nova conversa", "novo atendimento", "novo chat", "reiniciar"):
+            # Remove emoji do botão "🔄 Nova conversa" para o match.
+            lower_cmd_clean = lower_cmd.replace("🔄", "").strip()
+            if lower_cmd_clean in ("nova conversa", "novo atendimento", "novo chat", "reiniciar") or lower_cmd in (
+                "nova conversa",
+                "novo atendimento",
+                "novo chat",
+                "reiniciar",
+            ):
                 _reset_chat_session(
                     chat_id,
                     pending_preview=pending_preview,
@@ -2578,15 +2585,15 @@ def run_polling() -> None:
                     last_customer_by_chat=last_customer_by_chat,
                     pending_correct=pending_correct,
                 )
-                if lower_cmd.startswith("nova"):
+                if lower_cmd_clean.startswith("nova") or lower_cmd.startswith("nova"):
                     msg = (
-                        "🆕 *Nova conversa iniciada.*\n\n"
+                        "🔄 *Nova conversa iniciada.*\n\n"
                         "O contexto do ID VENDA foi limpo. Pode registrar uma venda nova "
                         "ou informar outro ID quando quiser."
                     )
                 else:
                     msg = (
-                        "🆕 *Nova conversa iniciada.*\n\n"
+                        "🔄 *Nova conversa iniciada.*\n\n"
                         "Contexto limpo. Pode enviar um novo comando ou tocar em *Prévia*."
                     )
                 send_message(chat_id, msg, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)

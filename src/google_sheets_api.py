@@ -10,11 +10,11 @@ from typing import TypeVar
 T = TypeVar("T")
 
 # Margem abaixo do limite oficial (~60 leituras/min por usuário).
-# Com batchGet o bot faz poucas chamadas; limite um pouco mais folgado evita espera de ~1 min.
-_READS_PER_MINUTE = 55
-_WRITES_PER_MINUTE = 55
+# Com batchGet o bot faz poucas chamadas; limite folgado evita espera artificial de ~1 min.
+_READS_PER_MINUTE = 58
+_WRITES_PER_MINUTE = 58
 _MAX_RETRIES = 4
-_BASE_BACKOFF_SEC = 1.0
+_BASE_BACKOFF_SEC = 0.5
 
 _lock = threading.Lock()
 _read_timestamps: list[float] = []

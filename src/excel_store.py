@@ -105,11 +105,12 @@ class SpreadsheetService:
 
     def _open_workbook(self, *, data_only: bool = False, read_only: bool = False):
         if self._google_bridge is not None:
-            # Garante abas auxiliares no Google antes de ler/gravar (evita KeyError Log_Agente).
-            try:
-                self._google_bridge.ensure_sheets((SHEET_LOG, SHEET_REMINDERS))
-            except Exception as exc:
-                print(f"[planilha] aviso: nao foi possivel preparar abas auxiliares: {exc}")
+            # Abas auxiliares só na 1ª abertura desta ponte (não a cada save).
+            if not getattr(self._google_bridge, "_aux_sheets_ready", False):
+                try:
+                    self._google_bridge.ensure_sheets((SHEET_LOG, SHEET_REMINDERS))
+                except Exception as exc:
+                    print(f"[planilha] aviso: nao foi possivel preparar abas auxiliares: {exc}")
             return self._google_bridge.open_workbook(data_only=data_only, read_only=read_only)
         try:
             return load_workbook(
@@ -411,15 +412,42 @@ class SpreadsheetService:
             cell.number_format = fmt
 
     @staticmethod
-    def _excel_date_value(value):
-        """Retorna date para gravação segura (ISO no Google); evita ambiguidade MM/DD vs DD/MM."""
+    def _sheets_date_text(value) -> str | None:
+        """
+        Padrão do Assistente_Line na nuvem: 'YYYY-MM-DD HH:MM:SS'.
+        Usado em Data de venda e Data de Entrega no Google Sheets.
+        """
         if value in (None, ""):
             return None
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(value, date):
+            now = datetime.now()
+            return datetime.combine(value, now.time()).strftime("%Y-%m-%d %H:%M:%S")
+        parsed = SpreadsheetService._parse_date_cell(value)
+        if parsed is None:
+            return None
+        now = datetime.now()
+        return datetime.combine(parsed, now.time()).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _excel_date_value(self, value):
+        """Valor de data para gravação.
+
+        - Google Sheets: texto 'YYYY-MM-DD HH:MM:SS' (mesmo padrão do Line / Data de Entrega).
+        - Excel local: objeto date (openpyxl).
+        """
+        if value in (None, ""):
+            return None
+        if self.uses_google_sheets:
+            text = self._sheets_date_text(value)
+            if text is not None:
+                return text
+            return str(value)
         if isinstance(value, datetime):
             return value.date()
         if isinstance(value, date):
             return value
-        parsed = SpreadsheetService._parse_date_cell(value)
+        parsed = self._parse_date_cell(value)
         if parsed is not None:
             return parsed
         return str(value)
@@ -625,9 +653,9 @@ class SpreadsheetService:
             s = s[1:].strip()
         if not s:
             return None
-        # Fórmula =DATE(y,m,d) gravada como texto
+        # Fórmula =DATE(y,m,d) ou =DATA(y;m;d) gravada como texto
         m_date = re.fullmatch(
-            r"=?DATE\((\d{4})\s*,\s*(\d{1,2})\s*,\s*(\d{1,2})\)",
+            r"=(?:DATE|DATA)\((\d{4})\s*[,;]\s*(\d{1,2})\s*[,;]\s*(\d{1,2})\)",
             s,
             flags=re.IGNORECASE,
         )
@@ -636,12 +664,28 @@ class SpreadsheetService:
                 return date(int(m_date.group(1)), int(m_date.group(2)), int(m_date.group(3)))
             except ValueError:
                 return None
-        # ISO primeiro (não ambíguo), depois DD/MM (Brasil)
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"):
+        # ISO com ou sem hora (formato do Assistente_Line na nuvem)
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%d/%m/%Y",
+            "%d/%m/%y",
+            "%d-%m-%Y",
+            "%d-%m-%y",
+        ):
             try:
                 return datetime.strptime(s, fmt).date()
             except Exception:
                 continue
+        # "2026-07-11 13:30:45.123" ou com T
+        s_norm = s.replace("T", " ", 1)
+        if " " in s_norm:
+            head = s_norm.split(" ", 1)[0]
+            try:
+                return datetime.strptime(head, "%Y-%m-%d").date()
+            except Exception:
+                pass
         m = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", s)
         if m:
             a, b, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -2151,7 +2195,8 @@ class SpreadsheetService:
             value_status,
         )
 
-        # Datas seguindo o padrão da planilha (Data de venda / Data de Entrega)
+        # Datas no padrão da nuvem (Line): YYYY-MM-DD HH:MM:SS
+        # — Data de venda e Data de Entrega.
         ws[f"{sales_cols['data de venda']}{row}"] = self._excel_date_value(cmd.sale_date)
         # Data de Entrega:
         # - Preferência: campo explícito (cmd.service_due_date).
