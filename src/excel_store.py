@@ -411,9 +411,17 @@ class SpreadsheetService:
             cell.number_format = fmt
 
     @staticmethod
-    def _excel_date_value(value) -> str:
-        if hasattr(value, "strftime"):
-            return value.strftime("%d/%m/%Y")
+    def _excel_date_value(value):
+        """Retorna date para gravação segura (ISO no Google); evita ambiguidade MM/DD vs DD/MM."""
+        if value in (None, ""):
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        parsed = SpreadsheetService._parse_date_cell(value)
+        if parsed is not None:
+            return parsed
         return str(value)
 
     @classmethod
@@ -537,12 +545,47 @@ class SpreadsheetService:
 
     @staticmethod
     def _to_float(value) -> float:
+        """Converte número de célula (int/float ou texto pt-BR / en-US) para float."""
         if value in (None, ""):
             return 0.0
-        try:
+        if isinstance(value, bool):
+            return 0.0
+        if isinstance(value, (int, float)):
             return float(value)
+        txt = str(value).strip()
+        if not txt:
+            return 0.0
+        txt = (
+            txt.replace("R$", "")
+            .replace("r$", "")
+            .replace("\xa0", "")
+            .replace(" ", "")
+        )
+        if not txt:
+            return 0.0
+        negative = False
+        if txt.startswith("(") and txt.endswith(")"):
+            negative = True
+            txt = txt[1:-1]
+        if txt.startswith("-"):
+            negative = True
+            txt = txt[1:]
+        # pt-BR: 1.500,00 | en-US: 1,500.00 | simples: 1500 / 1500,5
+        if "," in txt and "." in txt:
+            if txt.rfind(",") > txt.rfind("."):
+                txt = txt.replace(".", "").replace(",", ".")
+            else:
+                txt = txt.replace(",", "")
+        elif "," in txt:
+            txt = txt.replace(".", "").replace(",", ".")
+        elif "." in txt:
+            if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", txt):
+                txt = txt.replace(".", "")
+        try:
+            number = float(txt)
         except Exception:
             return 0.0
+        return -number if negative else number
 
     @staticmethod
     def _status_text(pending_amount: float) -> str:
@@ -555,25 +598,48 @@ class SpreadsheetService:
 
     @staticmethod
     def _parse_date_cell(value):
-        """Tenta interpretar valores da célula como data (string DD/MM/YYYY ou objeto date/datetime)."""
+        """Interpreta célula como data (prioriza dia/mês/ano — padrão Brasil)."""
         if value in (None, ""):
             return None
         if isinstance(value, datetime):
             return value.date()
+        if isinstance(value, date):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            # Serial do Google Sheets / Excel (dias desde 1899-12-30)
+            try:
+                serial = float(value)
+                if 20000 <= serial <= 80000:
+                    from datetime import timedelta
+
+                    return date(1899, 12, 30) + timedelta(days=int(serial))
+            except Exception:
+                return None
         if hasattr(value, "strftime"):
-            # date (sem .date()) ou datetime (já coberto acima)
             try:
                 return value.date()  # type: ignore[attr-defined]
             except Exception:
                 return value  # type: ignore[return-value]
         s = str(value).strip()
+        if s.startswith("'"):
+            s = s[1:].strip()
         if not s:
             return None
-        for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
+        # ISO (gravação segura) e depois DD/MM (Brasil)
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"):
             try:
                 return datetime.strptime(s, fmt).date()
             except Exception:
                 continue
+        m = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", s)
+        if m:
+            day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if year < 100:
+                year += 2000
+            try:
+                return date(year, month, day)
+            except ValueError:
+                return None
         return None
 
     @staticmethod
@@ -3334,6 +3400,126 @@ class SpreadsheetService:
                     }
                 )
                 break
+            return rows
+        finally:
+            wb.close()
+
+    def list_recent_sales(self, limit: int = 12, *, max_rows_scan: int = 500) -> list[dict[str, str]]:
+        """Últimas vendas para o menu Corrigir (mais recentes primeiro)."""
+        wb = self._open_workbook(data_only=True)
+        try:
+            sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
+            ws = wb[sales_name]
+            sales_cols = self._sales_columns(ws)
+            col_id = sales_cols.get("id venda")
+            col_customer = sales_cols.get("cliente")
+            col_desc = sales_cols.get("id produto")
+            col_paid = sales_cols.get("total de vendas (pago)")
+            col_pending = sales_cols.get("valor (pendente)")
+            col_status = sales_cols.get("status de valor")
+            col_delivery = sales_cols.get("data de entrega")
+            col_sale_date = sales_cols.get("data de venda")
+            if not col_id:
+                return []
+
+            end_row = self._effective_data_end_row(ws, col_id, max_rows_scan=max_rows_scan)
+            rows: list[dict[str, str]] = []
+            for row in range(end_row, DATA_START_ROW - 1, -1):
+                sale_id = self._format_sale_id(ws[f"{col_id}{row}"].value)
+                if not sale_id:
+                    continue
+                delivery_raw = ws[f"{col_delivery}{row}"].value if col_delivery else None
+                sale_date_raw = ws[f"{col_sale_date}{row}"].value if col_sale_date else None
+                delivery_dt = self._parse_date_cell(delivery_raw)
+                sale_dt = self._parse_date_cell(sale_date_raw)
+                pending = self._to_float(ws[f"{col_pending}{row}"].value) if col_pending else 0.0
+                paid = self._to_float(ws[f"{col_paid}{row}"].value) if col_paid else 0.0
+                rows.append(
+                    {
+                        "sale_id": sale_id,
+                        "cliente": str(ws[f"{col_customer}{row}"].value or "").strip() if col_customer else "",
+                        "produto": str(ws[f"{col_desc}{row}"].value or "").strip() if col_desc else "",
+                        "pago": f"{paid:.2f}",
+                        "pendente": f"{pending:.2f}",
+                        "status": str(ws[f"{col_status}{row}"].value or "").strip() if col_status else "",
+                        "delivery": delivery_dt.strftime("%d/%m/%Y") if delivery_dt else str(delivery_raw or "").strip(),
+                        "sale_date": sale_dt.strftime("%d/%m/%Y") if sale_dt else str(sale_date_raw or "").strip(),
+                        "row": str(row),
+                    }
+                )
+                if len(rows) >= limit:
+                    break
+            return rows
+        finally:
+            wb.close()
+
+    def list_recent_materials(self, limit: int = 12, *, max_rows_scan: int = 500) -> list[dict[str, str]]:
+        """Últimos lançamentos de material para o menu Corrigir."""
+        wb = self._open_workbook(data_only=True)
+        try:
+            material_name = self._resolve_sheet_name(wb, SHEET_MATERIAL)
+            ws = wb[material_name]
+            cols = self._material_columns(ws)
+            col_desc = cols.get("descricao")
+            col_val = cols.get("valor")
+            col_sid = cols.get("id venda")
+            col_date = cols.get("data")
+            col_forn = cols.get("fornecedor")
+            if not col_desc and not col_val:
+                return []
+            key_col = col_desc or col_val
+            end_row = self._effective_data_end_row(ws, key_col, max_rows_scan=max_rows_scan)
+            rows: list[dict[str, str]] = []
+            for row in range(end_row, DATA_START_ROW - 1, -1):
+                desc = str(ws[f"{col_desc}{row}"].value or "").strip() if col_desc else ""
+                amount = self._to_float(ws[f"{col_val}{row}"].value) if col_val else 0.0
+                if amount <= 0.01 and not desc:
+                    continue
+                date_raw = ws[f"{col_date}{row}"].value if col_date else None
+                date_dt = self._parse_date_cell(date_raw)
+                rows.append(
+                    {
+                        "row": str(row),
+                        "desc": desc or "Material",
+                        "valor": f"{amount:.2f}",
+                        "sale_id": self._format_sale_id(ws[f"{col_sid}{row}"].value) if col_sid else "",
+                        "fornecedor": str(ws[f"{col_forn}{row}"].value or "").strip() if col_forn else "",
+                        "data": date_dt.strftime("%d/%m/%Y") if date_dt else str(date_raw or "").strip(),
+                    }
+                )
+                if len(rows) >= limit:
+                    break
+            return rows
+        finally:
+            wb.close()
+
+    def list_recent_fixed_costs(self, limit: int = 12, *, max_rows_scan: int = 500) -> list[dict[str, str]]:
+        """Últimos gastos fixos para o menu Corrigir."""
+        wb = self._open_workbook(data_only=True)
+        try:
+            fixed_name = self._resolve_sheet_name(wb, SHEET_FIXED)
+            ws = wb[fixed_name]
+            end_row = self._effective_data_end_row(ws, "D", max_rows_scan=max_rows_scan)
+            rows: list[dict[str, str]] = []
+            for row in range(end_row, DATA_START_ROW - 1, -1):
+                amount = self._to_float(ws[f"D{row}"].value)
+                if amount <= 0.01:
+                    continue
+                desc_b = str(ws[f"B{row}"].value or "").strip()
+                desc_c = str(ws[f"C{row}"].value or "").strip()
+                desc = " — ".join(p for p in (desc_b, desc_c) if p) or "Gasto fixo"
+                date_raw = ws[f"A{row}"].value
+                date_dt = self._parse_date_cell(date_raw)
+                rows.append(
+                    {
+                        "row": str(row),
+                        "desc": desc,
+                        "valor": f"{amount:.2f}",
+                        "data": date_dt.strftime("%d/%m/%Y") if date_dt else str(date_raw or "").strip(),
+                    }
+                )
+                if len(rows) >= limit:
+                    break
             return rows
         finally:
             wb.close()

@@ -1271,6 +1271,7 @@ def _parse_pt_date(fragment: str, reference_date: date, *, full_text: str = "") 
             languages=["pt"],
             settings={
                 "PREFER_DATES_FROM": "future",
+                "DATE_ORDER": "DMY",
                 "RELATIVE_BASE": datetime.combine(reference_date, datetime.min.time()),
             },
         )
@@ -2466,7 +2467,8 @@ def _build_sale_parse_result(
                 label="Saldo",
                 value=round(float(balance_value), 2),
                 due_date=balance_date,
-                status="pendente" if balance_date > sale_date else "pago",
+                # Saldo/restante é pendente por definição (salvo quitação explícita noutro fluxo).
+                status="pendente",
             )
         )
     command = FinancialCommand(
@@ -2999,6 +3001,10 @@ def _contains_future_balance_hint(text: str) -> bool:
         "vai me pagar",
         "vou receber",
         "restante depois",
+        "pendente",
+        "valor pendente",
+        "em aberto",
+        "a receber",
     )
     return any(token in norm for token in future_tokens)
 
@@ -3417,7 +3423,8 @@ def parse_financial_message(message: str, reference_date: Optional[date] = None)
                 label="Saldo",
                 value=float(balance_value),
                 due_date=balance_date,
-                status="pendente" if (balance_future_hint or balance_date > sale_date) else "pago",
+                # Saldo/restante é sempre "a receber" até quitação explícita noutro comando.
+                status="pendente",
             )
         )
 

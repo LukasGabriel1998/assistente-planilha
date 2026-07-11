@@ -145,7 +145,8 @@ def _draw_gradient_header(
     font_title = load_font(24, bold=True)
     font_sub = load_font(15, bold=False)
     tw = _text_width(draw, title, font_title)
-    draw.text((x0 + ((x1 - x0) - tw) / 2, y0 + 14), title, fill=THEME.header_text, font=font_title)
+    title_y = y0 + (18 if subtitle else ((height - _text_height(font_title)) // 2))
+    draw.text((x0 + ((x1 - x0) - tw) / 2, title_y), title, fill=THEME.header_text, font=font_title)
     if subtitle:
         sw = _text_width(draw, subtitle, font_sub)
         draw.text(
@@ -314,7 +315,7 @@ def render_text_card(text: str, *, title: str = "Resumo da planilha") -> str | N
 def render_data_table(
     *,
     title: str,
-    meta: str,
+    meta: str | None = None,
     headers: list[str],
     rows: list[list[str]],
     col_widths: list[int] | None = None,
@@ -329,6 +330,7 @@ def render_data_table(
     card_pad = 18
     cell_pad_x = 14
     cell_pad_y = 10
+    meta_text = (meta or "").strip()
 
     img_probe = Image.new("RGB", (20, 20))
     probe = ImageDraw.Draw(img_probe)
@@ -344,8 +346,8 @@ def render_data_table(
             col_widths.append(max(floor, min(cap, maxw + cell_pad_x * 2)))
 
     row_h = _text_height(font_body) + cell_pad_y * 2 + 4
-    header_h = 72
-    meta_h = 28
+    header_h = 72 if meta_text else 56
+    meta_h = 28 if meta_text else 0
     table_w = sum(col_widths)
     table_h = row_h * (1 + len(rows))
     card_w = table_w + card_pad * 2
@@ -360,7 +362,13 @@ def render_data_table(
     cx1, cy1 = cx0 + card_w, cy0 + card_h
     _draw_card_shadow(draw, (cx0, cy0, cx1, cy1))
     draw.rounded_rectangle((cx0, cy0, cx1, cy1), radius=20, fill=THEME.card_bg, outline=THEME.border, width=1)
-    _draw_gradient_header(draw, (cx0, cy0, cx1, cy0 + header_h), title=title, subtitle=meta, radius=20)
+    _draw_gradient_header(
+        draw,
+        (cx0, cy0, cx1, cy0 + header_h),
+        title=title,
+        subtitle=meta_text or None,
+        radius=20,
+    )
 
     x0 = cx0 + card_pad
     y0 = cy0 + header_h + meta_h + 8

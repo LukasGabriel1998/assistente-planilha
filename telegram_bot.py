@@ -171,6 +171,7 @@ Ao salvar, a planilha gera o 🧾 *ID VENDA* (ex.: 012). *Guarde esse código.*
 ⚡ *Botões rápidos*
 📋 *Prévia* — pendências e entregas
 📊 *Resumo* — totais gerais (use *Ver detalhes* na mensagem para quem pagou/deve)
+✏️ *Corrigir* — alterar ou apagar um lançamento
 🆕 *Nova conversa* — limpa o ID VENDA ativo
 
 🔁 *ID VENDA na conversa*
@@ -184,7 +185,8 @@ Depois que informar um ID, o bot mantém para custos, pagamentos e entregas até
 MAIN_MENU_KEYBOARD = {
     "keyboard": [
         ["Prévia", "Resumo"],
-        ["Ajuda", "Nova conversa"],
+        ["✏️ Corrigir", "Ajuda"],
+        ["Nova conversa"],
     ],
     "resize_keyboard": True,
     "one_time_keyboard": False,
@@ -196,6 +198,20 @@ RESUMO_DETAILS_INLINE_KEYBOARD = {
     ],
 }
 
+CORRECT_CATEGORIES_KEYBOARD = {
+    "inline_keyboard": [
+        [
+            {"text": "🧾 Vendas", "callback_data": "corr:cat:vendas"},
+            {"text": "🧱 Materiais", "callback_data": "corr:cat:materiais"},
+        ],
+        [
+            {"text": "🏠 Gastos fixos", "callback_data": "corr:cat:fixos"},
+        ],
+        [{"text": "❌ Cancelar", "callback_data": "corr:cancel"}],
+    ],
+}
+
+
 def _reset_chat_session(
     chat_id: int | str,
     *,
@@ -204,6 +220,7 @@ def _reset_chat_session(
     pending_overdue_delivery: dict,
     last_sale_id_by_chat: dict,
     last_customer_by_chat: dict | None = None,
+    pending_correct: dict | None = None,
 ) -> None:
     """Limpa prévias e contexto de ID VENDA do chat."""
     pending_preview.pop(chat_id, None)
@@ -212,6 +229,476 @@ def _reset_chat_session(
     last_sale_id_by_chat.pop(chat_id, None)
     if last_customer_by_chat is not None:
         last_customer_by_chat.pop(chat_id, None)
+    if pending_correct is not None:
+        pending_correct.pop(chat_id, None)
+
+
+def _correct_intro_text(user_name: str = "") -> str:
+    name = (user_name or "").strip()
+    hello = f"Beleza, {name}! " if name else "Beleza! "
+    return (
+        f"{hello}Vamos *corrigir ou apagar* um lançamento.\n\n"
+        "1. Escolha a *categoria* abaixo\n"
+        "2. Toque no *lançamento*\n"
+        "3. Escolha *alterar* ou *apagar*\n"
+        "4. Confirme com *SIM* quando pedir\n\n"
+        "Para cancelar a qualquer momento: *NÃO* ou 🔄 *Nova conversa*."
+    )
+
+
+def _correct_money(value_txt: str) -> str:
+    try:
+        return format_brl(float(value_txt or 0))
+    except Exception:
+        return format_brl(0)
+
+
+def _correct_sale_button_label(item: dict[str, str]) -> str:
+    sid = item.get("sale_id") or "?"
+    cliente = (item.get("cliente") or "Sem cliente").strip()
+    produto = (item.get("produto") or "").strip()
+    label = f"{sid} · {cliente}"
+    if produto:
+        label += f" · {produto}"
+    return label[:60]
+
+
+def _correct_material_button_label(item: dict[str, str]) -> str:
+    desc = (item.get("desc") or "Material").strip()
+    valor = _correct_money(item.get("valor") or "0")
+    sid = (item.get("sale_id") or "").strip()
+    label = f"{desc} · {valor}"
+    if sid:
+        label = f"ID {sid} · {label}"
+    return label[:60]
+
+
+def _correct_fixed_button_label(item: dict[str, str]) -> str:
+    desc = (item.get("desc") or "Gasto").strip()
+    valor = _correct_money(item.get("valor") or "0")
+    return f"{desc} · {valor}"[:60]
+
+
+def _correct_entries_keyboard(category: str, items: list[dict[str, str]]) -> dict:
+    rows: list[list[dict[str, str]]] = []
+    for item in items:
+        if category == "vendas":
+            sid = item.get("sale_id") or ""
+            if not sid:
+                continue
+            rows.append(
+                [{"text": _correct_sale_button_label(item), "callback_data": f"corr:item:vendas:{sid}"}]
+            )
+        elif category == "materiais":
+            row_id = item.get("row") or ""
+            if not row_id:
+                continue
+            rows.append(
+                [{"text": _correct_material_button_label(item), "callback_data": f"corr:item:materiais:{row_id}"}]
+            )
+        else:
+            row_id = item.get("row") or ""
+            if not row_id:
+                continue
+            rows.append(
+                [{"text": _correct_fixed_button_label(item), "callback_data": f"corr:item:fixos:{row_id}"}]
+            )
+    rows.append(
+        [
+            {"text": "⬅️ Categorias", "callback_data": "corr:back:cats"},
+            {"text": "❌ Cancelar", "callback_data": "corr:cancel"},
+        ]
+    )
+    return {"inline_keyboard": rows}
+
+
+def _correct_actions_keyboard(category: str, item_key: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✏️ Alterar", "callback_data": f"corr:act:alt:{category}:{item_key}"},
+                {"text": "🗑️ Apagar", "callback_data": f"corr:act:del:{category}:{item_key}"},
+            ],
+            [
+                {"text": "⬅️ Voltar", "callback_data": f"corr:cat:{category}"},
+                {"text": "❌ Cancelar", "callback_data": "corr:cancel"},
+            ],
+        ]
+    }
+
+
+def _start_correct_flow(
+    chat_id: int | str,
+    *,
+    pending_correct: dict,
+    pending_preview: dict,
+    user_name: str = "",
+) -> None:
+    pending_preview.pop(chat_id, None)
+    pending_correct[chat_id] = {"step": "category"}
+    send_message(
+        chat_id,
+        _correct_intro_text(user_name),
+        parse_mode="Markdown",
+        reply_markup=CORRECT_CATEGORIES_KEYBOARD,
+    )
+
+
+def _correct_show_category(
+    chat_id: int | str,
+    category: str,
+    *,
+    pending_correct: dict,
+    message_id: int | None = None,
+) -> None:
+    if not _spreadsheet_ready_for_bot():
+        send_message(chat_id, "Planilha não encontrada.", reply_markup=MAIN_MENU_KEYBOARD)
+        return
+    try:
+        svc = _open_spreadsheet_for_bot()
+        if category == "vendas":
+            items = svc.list_recent_sales(limit=10)
+            title = "🧾 *Vendas recentes*\n\nToque no lançamento que deseja corrigir ou apagar:"
+        elif category == "materiais":
+            items = svc.list_recent_materials(limit=10)
+            title = "🧱 *Materiais recentes*\n\nToque no lançamento:"
+        else:
+            items = svc.list_recent_fixed_costs(limit=10)
+            title = "🏠 *Gastos fixos recentes*\n\nToque no lançamento:"
+    except Exception as exc:
+        send_message(chat_id, _spreadsheet_error_message(exc), reply_markup=MAIN_MENU_KEYBOARD)
+        return
+
+    pending_correct[chat_id] = {"step": "list", "category": category, "items": items}
+    if not items:
+        text = (
+            f"{title}\n\n_Nenhum lançamento encontrado nesta categoria._"
+        )
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "⬅️ Categorias", "callback_data": "corr:back:cats"}],
+                [{"text": "❌ Cancelar", "callback_data": "corr:cancel"}],
+            ]
+        }
+    else:
+        text = title
+        keyboard = _correct_entries_keyboard(category, items)
+
+    if message_id and edit_chat_message(
+        chat_id, message_id, text, parse_mode="Markdown", reply_markup=keyboard
+    ):
+        return
+    send_message(chat_id, text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+def _correct_find_item(pending: dict, category: str, item_key: str) -> dict[str, str] | None:
+    items = pending.get("items") or []
+    for item in items:
+        if category == "vendas" and str(item.get("sale_id") or "") == item_key:
+            return item
+        if category != "vendas" and str(item.get("row") or "") == item_key:
+            return item
+    return None
+
+
+def _correct_item_summary(category: str, item: dict[str, str]) -> str:
+    if category == "vendas":
+        lines = [
+            f"🧾 *Venda ID {item.get('sale_id') or '-'}*",
+            f"• Cliente: *{item.get('cliente') or '-'}*",
+            f"• Produto: *{item.get('produto') or '-'}*",
+            f"• Data venda: *{item.get('sale_date') or '-'}*",
+            f"• Data entrega: *{item.get('delivery') or '-'}*",
+            f"• Pago: *{_correct_money(item.get('pago') or '0')}*",
+            f"• Pendente: *{_correct_money(item.get('pendente') or '0')}*",
+            f"• Status: *{item.get('status') or '-'}*",
+        ]
+        return "\n".join(lines)
+    if category == "materiais":
+        sid = item.get("sale_id") or "-"
+        return "\n".join(
+            [
+                "🧱 *Material*",
+                f"• Descrição: *{item.get('desc') or '-'}*",
+                f"• Valor: *{_correct_money(item.get('valor') or '0')}*",
+                f"• ID VENDA: *{sid}*",
+                f"• Data: *{item.get('data') or '-'}*",
+            ]
+        )
+    return "\n".join(
+        [
+            "🏠 *Gasto fixo*",
+            f"• Descrição: *{item.get('desc') or '-'}*",
+            f"• Valor: *{_correct_money(item.get('valor') or '0')}*",
+            f"• Data: *{item.get('data') or '-'}*",
+        ]
+    )
+
+
+def _correct_show_item(
+    chat_id: int | str,
+    category: str,
+    item_key: str,
+    *,
+    pending_correct: dict,
+    message_id: int | None = None,
+) -> None:
+    pending = pending_correct.get(chat_id) or {}
+    item = _correct_find_item(pending, category, item_key)
+    if item is None:
+        # Lista pode ter expirado — recarrega categoria.
+        _correct_show_category(chat_id, category, pending_correct=pending_correct, message_id=message_id)
+        return
+    pending_correct[chat_id] = {
+        "step": "item",
+        "category": category,
+        "item_key": item_key,
+        "items": pending.get("items") or [item],
+        "item": item,
+    }
+    text = (
+        f"{_correct_item_summary(category, item)}\n\n"
+        "O que deseja fazer com este lançamento?"
+    )
+    keyboard = _correct_actions_keyboard(category, item_key)
+    if message_id and edit_chat_message(
+        chat_id, message_id, text, parse_mode="Markdown", reply_markup=keyboard
+    ):
+        return
+    send_message(chat_id, text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+def _correct_ask_alter(
+    chat_id: int | str,
+    category: str,
+    item_key: str,
+    *,
+    pending_correct: dict,
+    last_sale_id_by_chat: dict,
+    message_id: int | None = None,
+) -> None:
+    pending = pending_correct.get(chat_id) or {}
+    item = pending.get("item") or _correct_find_item(pending, category, item_key)
+    if item is None:
+        _correct_show_category(chat_id, category, pending_correct=pending_correct, message_id=message_id)
+        return
+
+    if category == "vendas":
+        sale_id = item.get("sale_id") or item_key
+        last_sale_id_by_chat[chat_id] = sale_id
+        pending_correct[chat_id] = {
+            "step": "await_alter",
+            "category": category,
+            "item_key": item_key,
+            "item": item,
+            "sale_id": sale_id,
+        }
+        text = (
+            f"{_correct_item_summary(category, item)}\n\n"
+            "✏️ *Envie o que deseja alterar*, por exemplo:\n"
+            f"`ID {sale_id} cliente: NOVO NOME`\n"
+            f"`ID {sale_id} pendente: 800`\n"
+            f"`ID {sale_id} data de entrega 20/07`\n"
+            f"`ID {sale_id} pagou`\n\n"
+            "Ou toque em *❌ Cancelar* / *Nova conversa*."
+        )
+    elif category == "materiais":
+        sale_id = (item.get("sale_id") or "").strip()
+        if sale_id:
+            last_sale_id_by_chat[chat_id] = sale_id
+        pending_correct[chat_id] = {
+            "step": "await_alter",
+            "category": category,
+            "item_key": item_key,
+            "item": item,
+            "sale_id": sale_id,
+        }
+        examples = (
+            f"`ID {sale_id} altera custo material para 900`\n"
+            if sale_id
+            else "`Gastei 350 na ID VENDA 012`\n"
+        )
+        text = (
+            f"{_correct_item_summary(category, item)}\n\n"
+            "✏️ *Envie a correção do material*, por exemplo:\n"
+            f"{examples}\n"
+            "Ou toque em *Nova conversa* para cancelar."
+        )
+    else:
+        pending_correct[chat_id] = {
+            "step": "await_alter",
+            "category": category,
+            "item_key": item_key,
+            "item": item,
+        }
+        text = (
+            f"{_correct_item_summary(category, item)}\n\n"
+            "✏️ *Envie a correção do gasto fixo por texto*\n"
+            "(ex.: descreva o ajuste que precisa).\n\n"
+            "Ou toque em *Nova conversa* para cancelar."
+        )
+
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "⬅️ Voltar", "callback_data": f"corr:item:{category}:{item_key}"},
+                {"text": "❌ Cancelar", "callback_data": "corr:cancel"},
+            ]
+        ]
+    }
+    if message_id and edit_chat_message(
+        chat_id, message_id, text, parse_mode="Markdown", reply_markup=keyboard
+    ):
+        return
+    send_message(chat_id, text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+def _correct_ask_delete(
+    chat_id: int | str,
+    category: str,
+    item_key: str,
+    *,
+    pending_correct: dict,
+    pending_preview: dict,
+    message_id: int | None = None,
+) -> None:
+    pending = pending_correct.get(chat_id) or {}
+    item = pending.get("item") or _correct_find_item(pending, category, item_key)
+    if item is None:
+        _correct_show_category(chat_id, category, pending_correct=pending_correct, message_id=message_id)
+        return
+
+    if category != "vendas":
+        text = (
+            f"{_correct_item_summary(category, item)}\n\n"
+            "Por enquanto a exclusão guiada está disponível para *Vendas*.\n"
+            "Para materiais/gastos, envie o ajuste por texto ou apague direto na planilha.\n\n"
+            "Toque em *⬅️ Voltar* para escolher outra ação."
+        )
+        keyboard = _correct_actions_keyboard(category, item_key)
+        if message_id and edit_chat_message(
+            chat_id, message_id, text, parse_mode="Markdown", reply_markup=keyboard
+        ):
+            return
+        send_message(chat_id, text, parse_mode="Markdown", reply_markup=keyboard)
+        return
+
+    sale_id = item.get("sale_id") or item_key
+    pr = parse_message(f"apagar id venda {sale_id}", reference_date=today_local())
+    pending_correct.pop(chat_id, None)
+    pending_preview[chat_id] = {
+        "parse_result": pr,
+        "original_text": f"apagar id venda {sale_id}",
+        "origin": "telegram",
+    }
+    preview = build_preview(pr)
+    text = (
+        f"{_correct_item_summary(category, item)}\n\n"
+        f"{preview}\n\n"
+        "Responda *SIM* para apagar ou *NÃO* para cancelar."
+    )
+    if message_id and edit_chat_message(
+        chat_id,
+        message_id,
+        text,
+        parse_mode="Markdown",
+        reply_markup={"inline_keyboard": []},
+    ):
+        send_message(chat_id, "Confirme com *SIM* ou *NÃO*.", parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+        return
+    send_message(chat_id, text, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+
+
+def _handle_correct_callback(
+    chat_id: int | str,
+    callback_query_id: str,
+    callback_data: str,
+    *,
+    pending_correct: dict,
+    pending_preview: dict,
+    last_sale_id_by_chat: dict,
+    message_id: int | None = None,
+) -> bool:
+    """Callbacks do fluxo Corrigir. Retorna True se tratou."""
+    if not callback_data.startswith("corr:"):
+        return False
+
+    answer_callback_query(callback_query_id)
+    parts = callback_data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "cancel":
+        pending_correct.pop(chat_id, None)
+        text = "❌ Correção cancelada. Pode continuar normalmente."
+        if message_id:
+            edit_chat_message(chat_id, message_id, text, parse_mode="Markdown", reply_markup={"inline_keyboard": []})
+        send_message(chat_id, text, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+        return True
+
+    if action == "back" and len(parts) > 2 and parts[2] == "cats":
+        pending_correct[chat_id] = {"step": "category"}
+        text = _correct_intro_text()
+        if message_id and edit_chat_message(
+            chat_id, message_id, text, parse_mode="Markdown", reply_markup=CORRECT_CATEGORIES_KEYBOARD
+        ):
+            return True
+        send_message(chat_id, text, parse_mode="Markdown", reply_markup=CORRECT_CATEGORIES_KEYBOARD)
+        return True
+
+    if action == "cat" and len(parts) > 2:
+        _correct_show_category(
+            chat_id, parts[2], pending_correct=pending_correct, message_id=message_id
+        )
+        return True
+
+    if action == "item" and len(parts) > 3:
+        _correct_show_item(
+            chat_id,
+            parts[2],
+            parts[3],
+            pending_correct=pending_correct,
+            message_id=message_id,
+        )
+        return True
+
+    if action == "act" and len(parts) > 4:
+        kind = parts[2]  # alt | del
+        category = parts[3]
+        item_key = parts[4]
+        if kind == "alt":
+            _correct_ask_alter(
+                chat_id,
+                category,
+                item_key,
+                pending_correct=pending_correct,
+                last_sale_id_by_chat=last_sale_id_by_chat,
+                message_id=message_id,
+            )
+        elif kind == "del":
+            _correct_ask_delete(
+                chat_id,
+                category,
+                item_key,
+                pending_correct=pending_correct,
+                pending_preview=pending_preview,
+                message_id=message_id,
+            )
+        return True
+
+    return True
+
+
+def _is_correct_menu_command(text: str) -> bool:
+    norm = (text or "").strip().lower()
+    return norm in {
+        "corrigir",
+        "✏️ corrigir",
+        "✏️corrigir",
+        "corrigir lançamento",
+        "corrigir lancamento",
+        "alterar lançamento",
+        "alterar lancamento",
+    }
 
 
 def _remember_sale_id_from_parse(
@@ -491,6 +978,10 @@ def _maybe_build_sales_snippet_image(
                     return ""
                 if key in ("total de vendas (pago)", "valor (pendente)"):
                     return format_brl(svc._to_float(v))
+                if key in ("data de venda", "data de entrega"):
+                    parsed = svc._parse_date_cell(v)
+                    if parsed is not None:
+                        return parsed.strftime("%d/%m/%Y")
                 if hasattr(v, "strftime"):
                     try:
                         return v.strftime("%d/%m/%Y")
@@ -572,11 +1063,11 @@ def _maybe_build_sales_snippet_image(
 
         return base_fill, cell_ink
 
-    meta_text = meta_line or f"Mostrando {len(rows_txt)} linha(s) mais recentes"
+    meta_text = (meta_line or "").strip()
     try:
         return render_data_table(
             title=title_main,
-            meta=meta_text,
+            meta=meta_text or None,
             headers=headers,
             rows=rows_txt,
             cell_style=_cell_style,
@@ -693,6 +1184,7 @@ def edit_chat_message(
     text: str,
     *,
     parse_mode: str | None = None,
+    reply_markup: dict | None = None,
 ) -> bool:
     """Atualiza texto de uma mensagem já enviada (ex.: cronômetro de aguarde)."""
     if not TELEGRAM_BOT_TOKEN or not message_id:
@@ -704,6 +1196,8 @@ def edit_chat_message(
     }
     if parse_mode:
         payload["parse_mode"] = parse_mode
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     try:
         r = requests.post(f"{BASE_URL}/editMessageText", json=payload, timeout=10)
         return r.status_code == 200
@@ -1332,7 +1826,6 @@ def _build_dashboard_reply(cmd_strip: str) -> tuple[str, str | None]:
                 wb=wb,
                 svc=svc,
                 title_main="TOTAL DE VENDAS - Visão atual",
-                meta_line="Pendências e entregas • Atualizado ao vivo com base na planilha",
             )
         elif cmd_strip.startswith(("detalhes", "detalhe")):
             # Detalhes vão como mensagem de texto (não imagem).
@@ -1904,6 +2397,7 @@ def run_polling() -> None:
     last_customer_by_chat: dict[int | str, str] = {}
     last_sale_id_by_chat: dict[int | str, str] = {}
     pending_overdue_delivery: dict[int | str, dict] = {}
+    pending_correct: dict[int | str, dict] = {}
     quick_menu_processing: set[int | str] = set()
     quick_menu_cooldown: dict[int | str, float] = {}
     last_reminder_check = 0.0
@@ -1957,6 +2451,17 @@ def run_polling() -> None:
                         pending_preview=pending_preview,
                         quick_menu_processing=quick_menu_processing,
                         quick_menu_cooldown=quick_menu_cooldown,
+                    )
+                elif callback_data.startswith("corr:") and callback_chat_id:
+                    msg_obj = callback.get("message") or {}
+                    _handle_correct_callback(
+                        callback_chat_id,
+                        str(callback_id or ""),
+                        callback_data,
+                        pending_correct=pending_correct,
+                        pending_preview=pending_preview,
+                        last_sale_id_by_chat=last_sale_id_by_chat,
+                        message_id=msg_obj.get("message_id"),
                     )
                 elif callback_id:
                     answer_callback_query(str(callback_id))
@@ -2054,6 +2559,7 @@ def run_polling() -> None:
             # Comandos especiais do Telegram: boas-vindas e ajuda (limpam prévia pendente) + menu
             if text in ("/start", "/help") or text.strip().lower() in ("ajuda", "start"):
                 pending_preview.pop(chat_id, None)
+                pending_correct.pop(chat_id, None)
                 send_message(
                     chat_id,
                     HELP_TEXT,
@@ -2072,6 +2578,7 @@ def run_polling() -> None:
                     pending_overdue_delivery=pending_overdue_delivery,
                     last_sale_id_by_chat=last_sale_id_by_chat,
                     last_customer_by_chat=last_customer_by_chat,
+                    pending_correct=pending_correct,
                 )
                 if lower_cmd.startswith("nova"):
                     msg = (
@@ -2086,6 +2593,33 @@ def run_polling() -> None:
                     )
                 send_message(chat_id, msg, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
                 continue
+
+            # Menu Corrigir: alterar ou apagar lançamentos
+            if _is_correct_menu_command(text):
+                user = msg.get("from", {})
+                user_name = user.get("first_name") or user.get("username") or ""
+                _start_correct_flow(
+                    chat_id,
+                    pending_correct=pending_correct,
+                    pending_preview=pending_preview,
+                    user_name=str(user_name),
+                )
+                continue
+
+            # Cancelar fluxo Corrigir com NÃO
+            if lower_cmd in ("não", "nao", "cancelar", "cancela") and chat_id in pending_correct:
+                pending_correct.pop(chat_id, None)
+                send_message(
+                    chat_id,
+                    "❌ Correção cancelada. Pode continuar normalmente.",
+                    parse_mode="Markdown",
+                    reply_markup=MAIN_MENU_KEYBOARD,
+                )
+                continue
+
+            # Texto livre durante o wizard Corrigir: libera o fluxo e processa normalmente
+            if chat_id in pending_correct:
+                pending_correct.pop(chat_id, None)
 
             user = msg.get("from", {})
             username = user.get("username") or user.get("first_name") or "?"
