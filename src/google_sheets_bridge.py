@@ -27,6 +27,9 @@ _MAX_SYNC_COL = 26  # A..Z
 _OPTIONAL_SHEETS = frozenset({"Log_Agente", "Lembretes"})
 # Reusa a planilha em memória entre leituras/gravações do bot (bem mais rápido).
 _CACHE_TTL_SEC = 90.0
+# NÃO baixar a planilha inteira: a linha-âncora 1048576 faz o batchGet demorar ~1 min.
+_MAX_FETCH_ROW = 800
+_MAX_FETCH_COL = "Z"
 # Só baixa abas usadas pelo robô (igual à ideia do Line: não varrer a planilha inteira).
 _CORE_SHEET_HINTS = (
     "total de vendas",
@@ -286,10 +289,14 @@ class GoogleSheetsBridge:
         for ws_meta in selected:
             self._worksheets[ws_meta.title] = ws_meta
 
-        ranges = [f"'{ws_meta.title}'" for ws_meta in selected]
+        ranges = [
+            f"'{ws_meta.title}'!A1:{_MAX_FETCH_COL}{_MAX_FETCH_ROW}"
+            for ws_meta in selected
+        ]
 
         def _batch_get():
-            return spreadsheet.values_batch_get(
+            t0 = time.monotonic()
+            payload = spreadsheet.values_batch_get(
                 ranges,
                 params={
                     # Números crus + datas como serial (evita "7/11/2026" ambíguo do locale US).
@@ -297,6 +304,11 @@ class GoogleSheetsBridge:
                     "dateTimeRenderOption": "SERIAL_NUMBER",
                 },
             )
+            print(
+                f"[GoogleSheets] batchGet {len(ranges)} aba(s) "
+                f"A1:{_MAX_FETCH_COL}{_MAX_FETCH_ROW} em {time.monotonic() - t0:.2f}s"
+            )
+            return payload
 
         try:
             payload = sheets_call(_batch_get)
@@ -424,6 +436,7 @@ class GoogleSheetsBridge:
             chunk_size = 400
             for i in range(0, len(remote_data), chunk_size):
                 chunk = remote_data[i : i + chunk_size]
+                t0 = time.monotonic()
 
                 def _write(c=chunk):
                     return spreadsheet.values_batch_update(
@@ -434,6 +447,10 @@ class GoogleSheetsBridge:
                     )
 
                 sheets_call(_write, is_write=True)
+                print(
+                    f"[GoogleSheets] batchUpdate {len(chunk)} célula(s) "
+                    f"em {time.monotonic() - t0:.2f}s"
+                )
 
         if optional_failures:
             print(
@@ -470,6 +487,78 @@ class GoogleSheetsBridge:
             if old_txt[:10] == new_txt[:10]:
                 return True
         return False
+
+    def format_font_colors(
+        self,
+        sheet_title: str,
+        cells: list[tuple[str, tuple[float, float, float]]],
+    ) -> None:
+        """Aplica cor de fonte via Sheets API (valores openpyxl de fonte não sobem sozinhos)."""
+        if not cells:
+            return
+        worksheet = self._worksheet(sheet_title, create_if_missing=False)
+        # Agrupa por cor para menos chamadas.
+        by_color: dict[tuple[float, float, float], list[str]] = {}
+        for a1, rgb in cells:
+            by_color.setdefault(rgb, []).append(a1)
+        for (r, g, b), ranges in by_color.items():
+            style = {
+                "textFormat": {
+                    "foregroundColor": {"red": r, "green": g, "blue": b},
+                    "bold": True,
+                }
+            }
+            # gspread format aceita range A1; para várias células, formata uma a uma (poucas).
+            for a1 in ranges:
+                sheets_call(
+                    lambda a1=a1, style=style, w=worksheet: w.format(a1, style),
+                    is_write=True,
+                )
+
+    def copy_row_format(
+        self,
+        sheet_title: str,
+        source_row: int,
+        target_row: int,
+        *,
+        start_col: str = "A",
+        end_col: str = "I",
+    ) -> None:
+        """Copia só a formatação da linha de cima para a nova (sem sobrescrever valores)."""
+        if source_row == target_row or source_row < 1 or target_row < 1:
+            return
+        from openpyxl.utils import column_index_from_string as _col_idx
+
+        worksheet = self._worksheet(sheet_title, create_if_missing=False)
+        sheet_id = worksheet.id
+        start_i = max(0, _col_idx(start_col) - 1)
+        end_i = max(start_i + 1, _col_idx(end_col))
+        body = {
+            "requests": [
+                {
+                    "copyPaste": {
+                        "source": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": source_row - 1,
+                            "endRowIndex": source_row,
+                            "startColumnIndex": start_i,
+                            "endColumnIndex": end_i,
+                        },
+                        "destination": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": target_row - 1,
+                            "endRowIndex": target_row,
+                            "startColumnIndex": start_i,
+                            "endColumnIndex": end_i,
+                        },
+                        "pasteType": "PASTE_FORMAT",
+                        "pasteOrientation": "NORMAL",
+                    }
+                }
+            ]
+        }
+        spreadsheet = self._spreadsheet_obj()
+        sheets_call(lambda: spreadsheet.batch_update(body), is_write=True)
 
 
 __all__ = ["GoogleSheetsBridge", "GoogleSheetsQuotaError"]

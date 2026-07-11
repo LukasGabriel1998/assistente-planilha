@@ -13,7 +13,7 @@ import zipfile
 
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
-from openpyxl.styles import PatternFill
+from openpyxl.styles import Font, PatternFill
 
 from .models import DeleteSaleCommand, FinancialCommand, RefundCommand, StatusUpdateCommand
 
@@ -52,6 +52,9 @@ SALES_REQUIRED_HEADERS = {
 
 FILL_PENDING = PatternFill(start_color="FFF59D", end_color="FFF59D", fill_type="solid")  # amarelo claro
 FILL_DONE = PatternFill(start_color="C8E6C9", end_color="C8E6C9", fill_type="solid")  # verde claro
+# Valor pendente em vermelho (ainda a receber / “negativizado”).
+FONT_PENDING_AMOUNT = Font(color="FFC62828", bold=True)
+FONT_PAID_AMOUNT = Font(color="FF2E7D32", bold=True)
 MATERIAL_HEADER_ROW = 2
 MATERIAL_REQUIRED_HEADERS = {
     "data": "Data",
@@ -77,6 +80,9 @@ class SpreadsheetService:
         google_bridge=None,
     ) -> None:
         self._google_bridge = google_bridge
+        self._pending_font_formats: list[tuple[str, str, tuple[float, float, float]]] = []
+        # (sheet, source_row, target_row, start_col, end_col) — copia layout no Google após save
+        self._pending_format_copies: list[tuple[str, int, int, str, str]] = []
         if google_bridge is not None:
             self.workbook_path = Path("__google_sheets__")
             return
@@ -143,9 +149,81 @@ class SpreadsheetService:
                 ) from exc
             raise
 
+    def _queue_pending_amount_font(
+        self,
+        sheet_title: str,
+        col: str,
+        row: int,
+        pending_amount: float,
+    ) -> None:
+        """Fila cor da fonte do valor pendente para o Google Sheets (após save)."""
+        if self._google_bridge is None or not col:
+            return
+        if abs(float(pending_amount or 0.0)) > 0.01:
+            rgb = (0.776, 0.157, 0.157)  # #C62828
+        else:
+            rgb = (0.180, 0.490, 0.196)  # #2E7D32
+        self._pending_font_formats.append((sheet_title, f"{col}{row}", rgb))
+
+    def _queue_row_format_copy(
+        self,
+        sheet_title: str,
+        source_row: int,
+        target_row: int,
+        cols: tuple[str, ...],
+    ) -> None:
+        """Fila cópia de layout (borda/fonte/fundo) da linha de cima → nova linha no Google."""
+        if self._google_bridge is None or source_row <= 0 or target_row <= 0:
+            return
+        if source_row == target_row or not cols:
+            return
+        start_col = min(cols, key=lambda c: column_index_from_string(c))
+        end_col = max(cols, key=lambda c: column_index_from_string(c))
+        self._pending_format_copies.append(
+            (sheet_title, int(source_row), int(target_row), start_col, end_col)
+        )
+
+    def _flush_row_format_copies(self) -> None:
+        if self._google_bridge is None or not self._pending_format_copies:
+            self._pending_format_copies = []
+            return
+        pending = list(self._pending_format_copies)
+        self._pending_format_copies = []
+        for sheet, src, dst, start_col, end_col in pending:
+            try:
+                self._google_bridge.copy_row_format(
+                    sheet, src, dst, start_col=start_col, end_col=end_col
+                )
+            except Exception as exc:
+                print(
+                    f"[GoogleSheets] aviso: falha ao copiar layout "
+                    f"{sheet}!{src}→{dst}: {exc}"
+                )
+
+    def _flush_pending_amount_fonts(self) -> None:
+        if self._google_bridge is None or not self._pending_font_formats:
+            self._pending_font_formats = []
+            return
+        by_sheet: dict[str, list[tuple[str, tuple[float, float, float]]]] = {}
+        for sheet, a1, rgb in self._pending_font_formats:
+            by_sheet.setdefault(sheet, []).append((a1, rgb))
+        self._pending_font_formats = []
+        for sheet, cells in by_sheet.items():
+            try:
+                self._google_bridge.format_font_colors(sheet, cells)
+            except Exception as exc:
+                print(f"[GoogleSheets] aviso: falha ao colorir pendente em '{sheet}': {exc}")
+
     def _save_workbook(self, wb, *, allow_clears: bool = False) -> None:
         if self._google_bridge is not None:
+            import time as _time
+
+            started = _time.monotonic()
             self._google_bridge.save_workbook(wb, allow_clears=allow_clears)
+            # 1) layout da linha de cima  2) cor do pendente (por cima do layout)
+            self._flush_row_format_copies()
+            self._flush_pending_amount_fonts()
+            print(f"[GoogleSheets] save+layout+cores em {_time.monotonic() - started:.2f}s")
             return
         try:
             wb.save(self.workbook_path)
@@ -307,10 +385,48 @@ class SpreadsheetService:
     def _preserve_user_layout() -> bool:
         """
         Quando ativo (padrão), evita normalizar/reformatar a planilha inteira e não mexe na coluna J.
-        Não impede copiar o padrão da linha 1048576 nem as cores de entrega/status.
+        O padrão visual vem das linhas de dados acima (não da antiga linha-âncora).
         """
         val = os.getenv("SPREADSHEET_PRESERVE_LAYOUT", "1").strip().lower()
         return val not in ("0", "false", "no", "off")
+
+    @classmethod
+    def _style_source_row_above(
+        cls,
+        ws,
+        target_row: int,
+        cols: tuple[str, ...],
+        *,
+        key_col: str | None = None,
+    ) -> int:
+        """
+        Encontra a linha de referência de layout acima da linha alvo.
+        Prioridade: última linha com dados → última com formatação → linha 3.
+        Ignora a antiga âncora 1048576.
+        """
+        scan_top = min(target_row - 1, cls._scan_row_cap(ws, DATA_START_ROW), 800)
+        if scan_top >= DATA_START_ROW:
+            # 1) Última linha com dado na coluna-chave (cliente/id/etc.)
+            if key_col:
+                for row in range(scan_top, DATA_START_ROW - 1, -1):
+                    if ws[f"{key_col}{row}"].value not in (None, ""):
+                        return row
+            # 2) Última linha com qualquer valor nas colunas da tabela
+            for row in range(scan_top, DATA_START_ROW - 1, -1):
+                if cls._row_has_values(ws, row, cols):
+                    return row
+            # 3) Última linha com formatação/bordas (mesmo vazia)
+            for row in range(scan_top, DATA_START_ROW - 1, -1):
+                if (
+                    cls._row_has_padrao(ws, row, cols)
+                    or cls._row_has_any_border(ws, row, cols)
+                ):
+                    return row
+        if cls._row_has_padrao(ws, TEMPLATE_ROW, cols) or cls._row_has_any_border(
+            ws, TEMPLATE_ROW, cols
+        ):
+            return TEMPLATE_ROW
+        return TEMPLATE_ROW
 
     @classmethod
     def _apply_anchor_row_style(
@@ -320,16 +436,23 @@ class SpreadsheetService:
         row: int,
         logical_sheet_name: str,
         cols: tuple[str, ...],
+        *,
+        key_col: str | None = None,
     ) -> tuple:
-        """Replica o padrão visual da linha 1048576 (ou template oculto) na linha alvo."""
-        anchor = cls._anchor_template_row_for(logical_sheet_name)
-        if anchor and (
-            cls._row_has_padrao(ws, anchor, cols)
-            or cls._row_has_values(ws, anchor, cols)
-            or cls._row_has_any_border(ws, anchor, cols)
+        """
+        Replica o layout da planilha na linha alvo a partir das linhas de cima.
+        Não usa mais a linha-âncora 1048576.
+        """
+        source_row = cls._style_source_row_above(ws, row, cols, key_col=key_col)
+        if source_row != row and (
+            cls._row_has_padrao(ws, source_row, cols)
+            or cls._row_has_values(ws, source_row, cols)
+            or cls._row_has_any_border(ws, source_row, cols)
         ):
-            cls._copy_row_style_between(ws, anchor, ws, row, cols, apply_row_dimensions=False)
-            return ws, anchor
+            cls._copy_row_style_between(
+                ws, source_row, ws, row, cols, apply_row_dimensions=False
+            )
+            return ws, source_row
         template_ws, template_row = cls._template_source(wb, ws, logical_sheet_name, cols)
         if not (template_ws is ws and template_row == row):
             cls._copy_row_style_between(
@@ -383,6 +506,7 @@ class SpreadsheetService:
         Aplica cores conforme o padrão da planilha:
         - Status de valor (H): amarelo se pendente, verde se pago.
         - Data de Entrega (B): amarelo até entregar, verde quando entregue.
+        - Valor (pendente): fonte vermelha se ainda há saldo; verde se zerado.
         """
         if service_delivered is None:
             service_delivered = cls._is_service_delivered(ws, sales_cols, row)
@@ -396,6 +520,15 @@ class SpreadsheetService:
         delivery_col = sales_cols.get("data de entrega")
         if delivery_col:
             ws[f"{delivery_col}{row}"].fill = FILL_DONE if service_delivered else FILL_PENDING
+
+        pending_col = sales_cols.get("valor (pendente)")
+        if pending_col:
+            cell = ws[f"{pending_col}{row}"]
+            cell.font = (
+                FONT_PENDING_AMOUNT
+                if abs(float(pending_amount or 0.0)) > 0.01
+                else FONT_PAID_AMOUNT
+            )
 
     @classmethod
     def _maybe_set_cell_fill(cls, cell, fill) -> None:
@@ -823,7 +956,7 @@ class SpreadsheetService:
 
     @staticmethod
     def _copy_cell_style(source_cell, target_cell) -> None:
-        """Copia o estilo da célula de origem para a de destino (ex.: da linha 1048576).
+        """Copia o estilo da célula de origem para a de destino (linha de cima → nova).
         Mantém exatamente o padrão: negrito, cor da fonte, fundo, número/data, bordas, alinhamento."""
         if getattr(source_cell, "style_id", 0):
             target_cell._style = copy(source_cell._style)
@@ -1080,13 +1213,7 @@ class SpreadsheetService:
 
     @classmethod
     def _anchor_template_row_for(cls, logical_sheet_name: str) -> int | None:
-        """Linha 1048576 como padrão para TOTAL DE VENDAS e Compras Matéria-Prima."""
-        logical_norm = cls._normalize_name(logical_sheet_name)
-        if logical_norm in (
-            cls._normalize_name(SHEET_SALES),
-            cls._normalize_name(SHEET_MATERIAL),
-        ):
-            return ANCHOR_TEMPLATE_ROW
+        """Âncora 1048576 desativada — o padrão vem das linhas de dados acima."""
         return None
 
     @classmethod
@@ -1197,9 +1324,9 @@ class SpreadsheetService:
         # Hidden template sheets should keep only layout/style, never previous business data.
         for row in range(DATA_START_ROW, min(template_ws.max_row, 12) + 1):
             cls._clear_row_values(template_ws, row, style_cols)
-        # Guardar o padrão também na última linha da planilha (só estilo, sem valores), como referência permanente.
-        # O robô nunca escreve dados lá; usa só para copiar o padrão e não sobrescrever fora dele.
-        if (
+        # Guardar o padrão também na última linha da planilha — DESATIVADO.
+        # A antiga linha-âncora 1048576 deixava o Google Sheets lento e não é mais usada.
+        if False and (
             not cls._preserve_user_layout()
             and source_row == TEMPLATE_ROW
             and cls._anchor_template_row_for(logical_sheet_name) is not None
@@ -1209,62 +1336,28 @@ class SpreadsheetService:
 
     @classmethod
     def _template_source(cls, wb, ws, logical_sheet_name: str, cols: tuple[str, ...]):
-        anchored_sheet = cls._anchor_template_row_for(logical_sheet_name) is not None
-        anchor_row = cls._anchor_template_row_for(logical_sheet_name)
-
-        if cls._preserve_user_layout():
-            result = cls._load_padrao_from_anchor_row(wb, ws, logical_sheet_name, cols)
-            if result is not None:
-                return result
-            if anchored_sheet and anchor_row:
-                return ws, anchor_row
-            if cls._row_3_has_padrao(ws, cols):
-                return ws, TEMPLATE_ROW
+        """Fonte de layout: linhas de dados / linha 3 / template oculto (sem âncora 1048576)."""
+        # 1) Linha 3 da própria aba (padrão visível da planilha)
+        if cls._row_3_has_padrao(ws, cols) or cls._row_has_any_border(ws, TEMPLATE_ROW, cols):
             return ws, TEMPLATE_ROW
 
+        # 2) Qualquer linha de dados recente com formatação
+        source = cls._style_source_row_above(ws, 800, cols)
+        if source and (
+            cls._row_has_padrao(ws, source, cols) or cls._row_has_any_border(ws, source, cols)
+        ):
+            return ws, source
+
+        if cls._preserve_user_layout():
+            return ws, TEMPLATE_ROW
+
+        # 3) Template oculto (legado), só se preserve_layout estiver off
         template_ws = cls._ensure_template_sheet(wb, logical_sheet_name)
-        anchored_sheet = cls._anchor_template_row_for(logical_sheet_name) is not None
-        # Importante: em abas "ancoradas", o padrão é a linha 1048576.
-        # O robô nunca deve tentar "atualizar" esse padrão automaticamente a partir da linha 3,
-        # para não alterar bordas/layout que o usuário considera como referência fixa.
-        # Padrão único: linha 1048576. Replicar esse estilo em todas as linhas que o robô preencher.
-        # TOTAL DE VENDAS DE 2026 e Compras Matéria-Prima: mesma regra — usar só a linha 1048576 quando tiver conteúdo ou formatação.
-        result = cls._load_padrao_from_anchor_row(wb, ws, logical_sheet_name, cols)
-        if result is not None:
-            return result
-
-        # Em abas ancoradas, nunca cair para linha 3 visível como fonte.
-        if anchored_sheet:
-            if any(getattr(template_ws[f"{col}{TEMPLATE_ROW}"], "style_id", 0) for col in cols):
-                return template_ws, TEMPLATE_ROW
-            return ws, ANCHOR_TEMPLATE_ROW
-
-        # Fallback: template já tem o padrão salvo (linha 3 com estilo).
         if cls._row_3_has_padrao(template_ws, cols):
             return template_ws, TEMPLATE_ROW
-
-        # Prioridade 3: linha 3 visível tiver o padrão (salvar quando o usuário formatar a linha 3).
-        if cls._row_3_has_padrao(ws, cols):
-            cls._sync_template_store(wb, ws, logical_sheet_name, source_row=TEMPLATE_ROW)
-            return template_ws, TEMPLATE_ROW
-
         visible_template_row = cls._visible_template_row_for(ws, cols)
         if visible_template_row is not None:
-            # Só sincronizar se for a linha 3 (não sobrescrever o template com outras linhas)
-            if visible_template_row == TEMPLATE_ROW:
-                cls._sync_template_store(wb, ws, logical_sheet_name, source_row=TEMPLATE_ROW)
             return ws, visible_template_row
-
-        anchor_row = cls._anchor_template_row_for(logical_sheet_name)
-        if anchor_row and cls._row_has_padrao(ws, anchor_row, cols):
-            all_cols = cls._sheet_style_cols(ws)
-            template_ready = cls._row_has_any_style(template_ws, TEMPLATE_ROW, cols)
-            if cls._row_has_values(ws, anchor_row, all_cols) or not template_ready:
-                cls._sync_template_store(wb, ws, logical_sheet_name, source_row=anchor_row)
-            return template_ws, TEMPLATE_ROW
-        if any(getattr(template_ws[f"{col}{TEMPLATE_ROW}"], "style_id", 0) for col in cols):
-            return template_ws, TEMPLATE_ROW
-        cls._sync_template_store(wb, ws, logical_sheet_name)
         return ws, TEMPLATE_ROW
 
     @classmethod
@@ -2171,13 +2264,15 @@ class SpreadsheetService:
             wb.close()
 
     def _append_sale(self, wb, ws, cmd: FinancialCommand) -> tuple[int, str, float]:
-        """Adiciona uma linha de venda. Só preenche valores; layout (fonte, cor, borda) fica como na planilha."""
+        """Adiciona uma linha de venda. Só preenche valores; layout segue as linhas de cima."""
         sales_cols = self._sales_columns(ws)
         style_cols = self._sales_style_cols(ws)
         row = self._next_sale_data_row(ws, sales_cols)
+        key_col = sales_cols.get("cliente") or sales_cols.get("id venda")
         template_ws, template_row = self._apply_anchor_row_style(
-            wb, ws, row, SHEET_SALES, style_cols
+            wb, ws, row, SHEET_SALES, style_cols, key_col=key_col
         )
+        self._queue_row_format_copy(ws.title, template_row, row, style_cols)
 
         paid_amount = round(sum(p.value for p in cmd.payments if p.status == "pago"), 2)
         pending_amount = round(sum(p.value for p in cmd.payments if p.status != "pago"), 2)
@@ -2225,6 +2320,9 @@ class SpreadsheetService:
             pending_amount=pending_amount,
             service_delivered=service_delivered,
         )
+        pending_col = sales_cols.get("valor (pendente)")
+        if pending_col:
+            self._queue_pending_amount_font(ws.title, pending_col, row, pending_amount)
         return row, sale_id, paid_amount
 
     def _append_material(
@@ -2237,7 +2335,7 @@ class SpreadsheetService:
         ref_date,
         sale_id: str | None = None,
     ) -> int:
-        """Adiciona linha na aba Compras Matéria-Prima. Formatação = linha 1048576 dessa aba (Data, Fornecedor, Descrição, ID VENDA, Valor)."""
+        """Adiciona linha na aba Compras Matéria-Prima. Layout = linhas de cima (sem âncora)."""
         material_cols = self._material_columns(ws)
         style_cols = (
             material_cols["data"],
@@ -2252,14 +2350,15 @@ class SpreadsheetService:
         if material_cols.get("id venda"):
             empty_cols = empty_cols + (material_cols["id venda"],)
         row = self._next_row_for_empty_cols(ws, empty_cols, start_row=DATA_START_ROW)
-        self._prepare_row_from_template(
+        _tw, template_row = self._apply_anchor_row_style(
             wb,
             ws,
             row,
             SHEET_MATERIAL,
             style_cols,
-            start_row=TEMPLATE_ROW,
+            key_col=material_cols.get("descricao"),
         )
+        self._queue_row_format_copy(ws.title, template_row, row, style_cols)
         ws[f"{material_cols['data']}{row}"] = self._excel_date_value(ref_date)
         if material_cols.get("fornecedor"):
             ws[f"{material_cols['fornecedor']}{row}"] = supplier
@@ -2529,8 +2628,14 @@ class SpreadsheetService:
             amount = -abs(float(refund.amount))
             sale_id = self._generate_sale_id(ws_sales, sales_cols["id venda"])
             template_ws, template_row = self._apply_anchor_row_style(
-                wb, ws_sales, row, SHEET_SALES, style_cols
+                wb,
+                ws_sales,
+                row,
+                SHEET_SALES,
+                style_cols,
+                key_col=sales_cols.get("cliente"),
             )
+            self._queue_row_format_copy(ws_sales.title, template_row, row, style_cols)
             status_paid = self._match_text_case(
                 template_ws[f"{sales_cols['status de valor']}{template_row}"].value,
                 "pago",
@@ -2605,6 +2710,9 @@ class SpreadsheetService:
             self._apply_sales_row_visual_status(
                 ws_sales, sales_cols, row, pending_amount=current_pending
             )
+            self._queue_pending_amount_font(
+                ws_sales.title, pending_col, row, current_pending
+            )
 
             customer = status_update.customer or str(ws_sales[f"{sales_cols['cliente']}{row}"].value or "")
             product = str(ws_sales[f"{sales_cols['id produto']}{row}"].value or "")
@@ -2675,6 +2783,9 @@ class SpreadsheetService:
             self._apply_sales_row_visual_status(
                 ws_sales, sales_cols, target_row, pending_amount=current_pending
             )
+            self._queue_pending_amount_font(
+                ws_sales.title, pending_col, target_row, current_pending
+            )
             self._save_workbook(wb)
         finally:
             wb.close()
@@ -2708,6 +2819,9 @@ class SpreadsheetService:
             )
             self._apply_sales_row_visual_status(
                 ws_sales, sales_cols, row, pending_amount=current_pending
+            )
+            self._queue_pending_amount_font(
+                ws_sales.title, pending_col, row, current_pending
             )
 
             customer = str(ws_sales[f"{sales_cols['cliente']}{row}"].value or "")

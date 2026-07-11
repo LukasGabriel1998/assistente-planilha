@@ -1,48 +1,22 @@
 # -*- coding: utf-8 -*-
-"""Chamadas seguras à API do Google Sheets (evita erro 429 / quota exceeded)."""
+"""Chamadas à API do Google Sheets com retry só em 429 real (sem espera artificial)."""
 from __future__ import annotations
 
-import threading
 import time
 from collections.abc import Callable
 from typing import TypeVar
 
 T = TypeVar("T")
 
-# Margem abaixo do limite oficial (~60 leituras/min por usuário).
-# Com batchGet o bot faz poucas chamadas; limite folgado evita espera artificial de ~1 min.
-_READS_PER_MINUTE = 58
-_WRITES_PER_MINUTE = 58
+# Só backoff quando o Google devolve 429 de verdade.
+# (O limitador preventivo de ~60s fazia o bot “travar” 1 minuto sem necessidade —
+#  o Assistente_Line não tem isso e por isso salva rápido.)
 _MAX_RETRIES = 4
-_BASE_BACKOFF_SEC = 0.5
-
-_lock = threading.Lock()
-_read_timestamps: list[float] = []
-_write_timestamps: list[float] = []
+_BASE_BACKOFF_SEC = 0.4
 
 
 class GoogleSheetsQuotaError(RuntimeError):
     """Planilha temporariamente indisponível por excesso de requisições."""
-
-
-def _prune(timestamps: list[float], now: float) -> None:
-    cutoff = now - 60.0
-    while timestamps and timestamps[0] < cutoff:
-        timestamps.pop(0)
-
-
-def _wait_for_slot(*, is_write: bool) -> None:
-    limit = _WRITES_PER_MINUTE if is_write else _READS_PER_MINUTE
-    bucket = _write_timestamps if is_write else _read_timestamps
-    while True:
-        with _lock:
-            now = time.monotonic()
-            _prune(bucket, now)
-            if len(bucket) < limit:
-                bucket.append(now)
-                return
-            wait = 60.0 - (now - bucket[0]) + 0.05
-        time.sleep(max(0.1, wait))
 
 
 def _is_quota_error(exc: BaseException) -> bool:
@@ -52,23 +26,23 @@ def _is_quota_error(exc: BaseException) -> bool:
 
 def sheets_call(fn: Callable[[], T], *, is_write: bool = False) -> T:
     """
-    Executa uma chamada à API com limite de taxa e retry exponencial em 429.
-    Uma operação típica deve usar poucas chamadas (export/batch_get + batch_update).
+    Executa uma chamada à API. Retry curto só em erro 429/quota.
+    `is_write` mantido por compatibilidade com os call sites.
     """
+    del is_write  # API pública estável; não usamos mais bucket preventivo
     last_exc: BaseException | None = None
     for attempt in range(_MAX_RETRIES):
-        _wait_for_slot(is_write=is_write)
         try:
             return fn()
         except Exception as exc:
             last_exc = exc
             if not _is_quota_error(exc) or attempt >= _MAX_RETRIES - 1:
                 break
-            time.sleep(min(60.0, _BASE_BACKOFF_SEC * (2**attempt)))
+            time.sleep(min(8.0, _BASE_BACKOFF_SEC * (2**attempt)))
     if last_exc and _is_quota_error(last_exc):
         raise GoogleSheetsQuotaError(
-            "Google Sheets temporariamente sobrecarregado (limite de leituras). "
-            "Aguarde ~1 minuto e tente novamente."
+            "Google Sheets temporariamente sobrecarregado (limite da API). "
+            "Aguarde alguns segundos e tente novamente."
         ) from last_exc
     assert last_exc is not None
     raise last_exc
