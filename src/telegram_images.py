@@ -31,7 +31,7 @@ class ImageTheme:
     header_sub: tuple[int, int, int] = (191, 219, 254)
     profit: tuple[int, int, int] = (5, 150, 105)
     loss: tuple[int, int, int] = (220, 38, 38)
-    pending: tuple[int, int, int] = (217, 119, 6)
+    pending: tuple[int, int, int] = (198, 40, 40)  # #C62828 — vermelho (a receber)
     table_header_bg: tuple[int, int, int] = (241, 245, 249)
     table_header_ink: tuple[int, int, int] = (30, 41, 59)
     zebra: tuple[int, int, int] = (248, 250, 252)

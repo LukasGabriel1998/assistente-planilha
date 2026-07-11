@@ -81,6 +81,7 @@ class SpreadsheetService:
     ) -> None:
         self._google_bridge = google_bridge
         self._pending_font_formats: list[tuple[str, str, tuple[float, float, float]]] = []
+        self._pending_fill_formats: list[tuple[str, str, tuple[float, float, float]]] = []
         # (sheet, source_row, target_row, start_col, end_col) — copia layout no Google após save
         self._pending_format_copies: list[tuple[str, int, int, str, str]] = []
         if google_bridge is not None:
@@ -165,6 +166,40 @@ class SpreadsheetService:
             rgb = (0.180, 0.490, 0.196)  # #2E7D32
         self._pending_font_formats.append((sheet_title, f"{col}{row}", rgb))
 
+    @staticmethod
+    def _fill_rgb(fill) -> tuple[float, float, float] | None:
+        """Converte PatternFill openpyxl → RGB 0..1 para a Sheets API."""
+        if fill is None or getattr(fill, "fill_type", None) != "solid":
+            return None
+        for attr in ("start_color", "fgColor"):
+            color = getattr(fill, attr, None)
+            if color is None:
+                continue
+            raw = str(getattr(color, "rgb", "") or getattr(color, "value", "") or "").upper()
+            raw = raw.replace("#", "")
+            if len(raw) == 8:
+                raw = raw[2:]
+            if len(raw) != 6:
+                continue
+            try:
+                return (
+                    int(raw[0:2], 16) / 255.0,
+                    int(raw[2:4], 16) / 255.0,
+                    int(raw[4:6], 16) / 255.0,
+                )
+            except ValueError:
+                continue
+        return None
+
+    def _queue_cell_fill(self, sheet_title: str, col: str, row: int, fill) -> None:
+        """Fila cor de fundo de uma célula para o Google Sheets (após save)."""
+        if self._google_bridge is None or not col:
+            return
+        rgb = self._fill_rgb(fill)
+        if rgb is None:
+            return
+        self._pending_fill_formats.append((sheet_title, f"{col}{row}", rgb))
+
     def _queue_row_format_copy(
         self,
         sheet_title: str,
@@ -214,14 +249,29 @@ class SpreadsheetService:
             except Exception as exc:
                 print(f"[GoogleSheets] aviso: falha ao colorir pendente em '{sheet}': {exc}")
 
+    def _flush_cell_fills(self) -> None:
+        if self._google_bridge is None or not self._pending_fill_formats:
+            self._pending_fill_formats = []
+            return
+        by_sheet: dict[str, list[tuple[str, tuple[float, float, float]]]] = {}
+        for sheet, a1, rgb in self._pending_fill_formats:
+            by_sheet.setdefault(sheet, []).append((a1, rgb))
+        self._pending_fill_formats = []
+        for sheet, cells in by_sheet.items():
+            try:
+                self._google_bridge.format_cell_fills(sheet, cells)
+            except Exception as exc:
+                print(f"[GoogleSheets] aviso: falha ao colorir fundo em '{sheet}': {exc}")
+
     def _save_workbook(self, wb, *, allow_clears: bool = False) -> None:
         if self._google_bridge is not None:
             import time as _time
 
             started = _time.monotonic()
             self._google_bridge.save_workbook(wb, allow_clears=allow_clears)
-            # 1) layout da linha de cima  2) cor do pendente (por cima do layout)
+            # 1) layout da linha de cima  2) fundos (status/entrega)  3) cor do pendente
             self._flush_row_format_copies()
+            self._flush_cell_fills()
             self._flush_pending_amount_fonts()
             print(f"[GoogleSheets] save+layout+cores em {_time.monotonic() - started:.2f}s")
             return
@@ -461,7 +511,17 @@ class SpreadsheetService:
         return template_ws, template_row
 
     @classmethod
-    def _is_service_delivered(cls, ws, sales_cols: dict[str, str], row: int) -> bool:
+    def _is_service_delivered(
+        cls,
+        ws,
+        sales_cols: dict[str, str],
+        row: int,
+        *,
+        service_status: str = "",
+    ) -> bool:
+        """True só quando a entrega foi confirmada (lembrete FINALIZADO ou fundo verde)."""
+        if cls._normalize_name(service_status) == "finalizado":
+            return True
         delivery_col = sales_cols.get("data de entrega")
         if delivery_col:
             cell = ws[f"{delivery_col}{row}"]
@@ -475,7 +535,7 @@ class SpreadsheetService:
         return False
 
     def is_sale_delivered(self, sale_id: str) -> bool:
-        """True quando a venda já está marcada como entregue (Data de Entrega verde)."""
+        """True quando a venda já está marcada como entregue (Data de Entrega verde / lembrete)."""
         sale_id = str(sale_id or "").strip()
         if not sale_id:
             return False
@@ -488,38 +548,50 @@ class SpreadsheetService:
                 row = self._find_sale_row(ws_sales, sales_cols["id venda"], sale_id)
             except ValueError:
                 return False
-            return self._is_service_delivered(ws_sales, sales_cols, row)
+            rem = self._reminder_meta_by_sale_id(wb).get(self._format_sale_id(sale_id), {})
+            return self._is_service_delivered(
+                ws_sales,
+                sales_cols,
+                row,
+                service_status=rem.get("status_servico", ""),
+            )
         finally:
             wb.close()
 
-    @classmethod
     def _apply_sales_row_visual_status(
-        cls,
+        self,
         ws,
         sales_cols: dict[str, str],
         row: int,
         *,
         pending_amount: float = 0.0,
         service_delivered: bool | None = None,
+        service_status: str = "",
     ) -> None:
         """
         Aplica cores conforme o padrão da planilha:
         - Status de valor (H): amarelo se pendente, verde se pago.
-        - Data de Entrega (B): amarelo até entregar, verde quando entregue.
+        - Data de Entrega (B): amarelo até entregar (mesmo se já pago), verde quando entregue.
         - Valor (pendente): fonte vermelha se ainda há saldo; verde se zerado.
         """
         if service_delivered is None:
-            service_delivered = cls._is_service_delivered(ws, sales_cols, row)
+            service_delivered = self._is_service_delivered(
+                ws, sales_cols, row, service_status=service_status
+            )
 
         status_col = sales_cols.get("status de valor")
         if status_col:
-            ws[f"{status_col}{row}"].fill = (
+            status_fill = (
                 FILL_PENDING if abs(float(pending_amount or 0.0)) > 0.01 else FILL_DONE
             )
+            ws[f"{status_col}{row}"].fill = status_fill
+            self._queue_cell_fill(ws.title, status_col, row, status_fill)
 
         delivery_col = sales_cols.get("data de entrega")
         if delivery_col:
-            ws[f"{delivery_col}{row}"].fill = FILL_DONE if service_delivered else FILL_PENDING
+            delivery_fill = FILL_DONE if service_delivered else FILL_PENDING
+            ws[f"{delivery_col}{row}"].fill = delivery_fill
+            self._queue_cell_fill(ws.title, delivery_col, row, delivery_fill)
 
         pending_col = sales_cols.get("valor (pendente)")
         if pending_col:
@@ -529,6 +601,7 @@ class SpreadsheetService:
                 if abs(float(pending_amount or 0.0)) > 0.01
                 else FONT_PAID_AMOUNT
             )
+            self._queue_pending_amount_font(ws.title, pending_col, row, pending_amount)
 
     @classmethod
     def _maybe_set_cell_fill(cls, cell, fill) -> None:
@@ -751,11 +824,6 @@ class SpreadsheetService:
     @staticmethod
     def _status_text(pending_amount: float) -> str:
         return "pago" if abs(float(pending_amount or 0.0)) < 0.01 else "pendente"
-
-    @staticmethod
-    def _delivery_fill_for_pending(pending_amount: float):
-        """Data de entrega segue status financeiro: pendente=amarelo, pago=verde."""
-        return FILL_DONE if abs(float(pending_amount or 0.0)) < 0.01 else FILL_PENDING
 
     @staticmethod
     def _parse_date_cell(value):
@@ -1824,7 +1892,9 @@ class SpreadsheetService:
                 return False
             if cls._cell_fill_matches(cell, "FFF59D"):
                 return True
-        return not cls._is_service_delivered(ws, sales_cols, row)
+        return not cls._is_service_delivered(
+            ws, sales_cols, row, service_status=service_status
+        )
 
     def _reminder_meta_by_sale_id(self, wb) -> dict[str, dict[str, str]]:
         """Mapa sale_id -> {chat_id, status_servico} na aba Lembretes."""
@@ -1882,9 +1952,14 @@ class SpreadsheetService:
             # Ignora entrega anterior à data da venda (dado inconsistente na planilha).
             if sale_dt is not None and delivery_dt < sale_dt:
                 continue
-            if not self._delivery_date_is_yellow(ws_sales, sales_cols, row):
-                continue
             rem = reminder_meta.get(sale_id, {})
+            if not self._delivery_still_pending(
+                ws_sales,
+                sales_cols,
+                row,
+                service_status=rem.get("status_servico", ""),
+            ):
+                continue
             customer = str(ws_sales[f"{col_customer}{row}"].value or "").strip() if col_customer else ""
             product = str(ws_sales[f"{col_product}{row}"].value or "").strip() if col_product else ""
             days_overdue = (today - delivery_dt).days
@@ -2181,12 +2256,13 @@ class SpreadsheetService:
                 value_status,
             )
             ws_sales[f"{sales_cols['status de valor']}{row}"] = value_status_display
+            rem = self._reminder_meta_by_sale_id(wb).get(self._format_sale_id(sale_id), {})
             self._apply_sales_row_visual_status(
                 ws_sales,
                 sales_cols,
                 row,
                 pending_amount=pending_amount,
-                service_delivered=False,
+                service_status=rem.get("status_servico", ""),
             )
             self._save_workbook(wb)
             return True
@@ -2320,9 +2396,6 @@ class SpreadsheetService:
             pending_amount=pending_amount,
             service_delivered=service_delivered,
         )
-        pending_col = sales_cols.get("valor (pendente)")
-        if pending_col:
-            self._queue_pending_amount_font(ws.title, pending_col, row, pending_amount)
         return row, sale_id, paid_amount
 
     def _append_material(
@@ -2707,11 +2780,15 @@ class SpreadsheetService:
             ws_sales[f"{paid_col}{row}"] = current_paid
             ws_sales[f"{pending_col}{row}"] = current_pending
             ws_sales[f"{value_status_col}{row}"] = status_display
-            self._apply_sales_row_visual_status(
-                ws_sales, sales_cols, row, pending_amount=current_pending
+            rem = self._reminder_meta_by_sale_id(wb).get(
+                self._format_sale_id(status_update.sale_id), {}
             )
-            self._queue_pending_amount_font(
-                ws_sales.title, pending_col, row, current_pending
+            self._apply_sales_row_visual_status(
+                ws_sales,
+                sales_cols,
+                row,
+                pending_amount=current_pending,
+                service_status=rem.get("status_servico", ""),
             )
 
             customer = status_update.customer or str(ws_sales[f"{sales_cols['cliente']}{row}"].value or "")
@@ -2780,11 +2857,13 @@ class SpreadsheetService:
             ws_sales[f"{col_delivery}{target_row}"] = self._excel_date_value(delivery_date)
             pending_col = sales_cols["valor (pendente)"]
             current_pending = self._to_float(ws_sales[f"{pending_col}{target_row}"].value)
+            rem = self._reminder_meta_by_sale_id(wb).get(self._format_sale_id(needle), {})
             self._apply_sales_row_visual_status(
-                ws_sales, sales_cols, target_row, pending_amount=current_pending
-            )
-            self._queue_pending_amount_font(
-                ws_sales.title, pending_col, target_row, current_pending
+                ws_sales,
+                sales_cols,
+                target_row,
+                pending_amount=current_pending,
+                service_status=rem.get("status_servico", ""),
             )
             self._save_workbook(wb)
         finally:
@@ -2817,11 +2896,13 @@ class SpreadsheetService:
                 ws_sales[f"{status_col}{row}"].value,
                 self._status_text(current_pending),
             )
+            rem = self._reminder_meta_by_sale_id(wb).get(self._format_sale_id(sale_id), {})
             self._apply_sales_row_visual_status(
-                ws_sales, sales_cols, row, pending_amount=current_pending
-            )
-            self._queue_pending_amount_font(
-                ws_sales.title, pending_col, row, current_pending
+                ws_sales,
+                sales_cols,
+                row,
+                pending_amount=current_pending,
+                service_status=rem.get("status_servico", ""),
             )
 
             customer = str(ws_sales[f"{sales_cols['cliente']}{row}"].value or "")

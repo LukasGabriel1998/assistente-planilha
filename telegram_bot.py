@@ -592,19 +592,14 @@ def _correct_ask_delete(
         "origin": "telegram",
     }
     preview = build_preview(pr)
-    text = (
-        f"{_correct_item_summary(category, item)}\n\n"
-        f"{preview}\n\n"
-        "Responda *SIM* para apagar ou *NÃO* para cancelar."
-    )
+    text = f"{_correct_item_summary(category, item)}\n\n{preview}"
     if message_id and edit_chat_message(
         chat_id,
         message_id,
         text,
         parse_mode="Markdown",
-        reply_markup={"inline_keyboard": []},
+        reply_markup=MAIN_MENU_KEYBOARD,
     ):
-        send_message(chat_id, "Confirme com *SIM* ou *NÃO*.", parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
         return
     send_message(chat_id, text, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
 
@@ -989,15 +984,26 @@ def _maybe_build_sales_snippet_image(
 
             rows_txt = [[_cell_txt(c, key, r) for c, _label, key in col_pairs] for r in last_rows]
             if snippet_mode != "details":
+                reminder_meta = svc._reminder_meta_by_sale_id(wb)
                 for r in last_rows:
                     delivery_col = cols.get("data de entrega")
                     state: bool | None = None
-                    if delivery_col:
+                    sale_key = (
+                        svc._format_sale_id(ws[f"{id_col}{r}"].value) if id_col else ""
+                    )
+                    rem_status = (reminder_meta.get(sale_key) or {}).get("status_servico", "")
+                    if svc._normalize_name(rem_status) == "finalizado":
+                        state = False
+                    elif delivery_col:
                         cell = ws[f"{delivery_col}{r}"]
-                        if svc._cell_fill_matches(cell, "FFF59D"):
-                            state = True
-                        elif svc._cell_fill_matches(cell, "C8E6C9"):
+                        if svc._cell_fill_matches(cell, "C8E6C9"):
                             state = False
+                        elif svc._cell_fill_matches(cell, "FFF59D"):
+                            state = True
+                        elif cell.value not in (None, ""):
+                            # Sem fill na nuvem: enquanto não confirmou entrega, fica amarelo
+                            # (mesmo se o status financeiro já for "pago").
+                            state = True
                     delivery_cell_states.append(state)
             else:
                 delivery_cell_states = [None] * len(last_rows)

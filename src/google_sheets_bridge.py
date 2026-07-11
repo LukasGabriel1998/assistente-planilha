@@ -515,6 +515,28 @@ class GoogleSheetsBridge:
                     is_write=True,
                 )
 
+    def format_cell_fills(
+        self,
+        sheet_title: str,
+        cells: list[tuple[str, tuple[float, float, float]]],
+    ) -> None:
+        """Aplica cor de fundo via Sheets API (fills openpyxl não sobem sozinhos)."""
+        if not cells:
+            return
+        worksheet = self._worksheet(sheet_title, create_if_missing=False)
+        by_color: dict[tuple[float, float, float], list[str]] = {}
+        for a1, rgb in cells:
+            by_color.setdefault(rgb, []).append(a1)
+        for (r, g, b), ranges in by_color.items():
+            style = {
+                "backgroundColor": {"red": r, "green": g, "blue": b},
+            }
+            for a1 in ranges:
+                sheets_call(
+                    lambda a1=a1, style=style, w=worksheet: w.format(a1, style),
+                    is_write=True,
+                )
+
     def copy_row_format(
         self,
         sheet_title: str,
