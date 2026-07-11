@@ -132,27 +132,32 @@ class GoogleSheetsBridge:
         if isinstance(value, (int, float)):
             return value
         if isinstance(value, datetime):
-            # Texto DD/MM/YYYY (Brasil). Apóstrofo evita o Google reinterpretar como MM/DD.
-            return f"'{value.strftime('%d/%m/%Y')}"
+            d = value.date()
+            # Fórmula DATE: valor absoluto, independente do locale MM/DD vs DD/MM.
+            return f"=DATE({d.year},{d.month},{d.day})"
         if isinstance(value, date):
-            return f"'{value.strftime('%d/%m/%Y')}"
-        text = str(value)
+            return f"=DATE({value.year},{value.month},{value.day})"
+        text = str(value).strip()
         # USER_ENTERED transforma "001" em número 1 — força texto para IDs com zero à esquerda.
         if text.isdigit() and len(text) >= 2 and text.startswith("0"):
             return f"'{text}"
-        # Datas já no formato BR: força texto para não inverter dia/mês no locale US.
-        if len(text) >= 8:
-            m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", text.strip())
-            if m:
-                day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
-                if year < 100:
-                    year += 2000
-                try:
-                    date(year, month, day)  # valida
-                    return f"'{day:02d}/{month:02d}/{year}"
-                except ValueError:
-                    pass
-        return text
+        # Datas texto DD/MM/YYYY → fórmula DATE (evita inversão no locale americano).
+        if text.startswith("'"):
+            text = text[1:].strip()
+        m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", text)
+        if m:
+            day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if year < 100:
+                year += 2000
+            try:
+                date(year, month, day)  # valida dia/mês BR
+                return f"=DATE({year},{month},{day})"
+            except ValueError:
+                pass
+        # Já veio como fórmula DATE — mantém.
+        if text.upper().startswith("=DATE("):
+            return text
+        return str(value)
 
     @staticmethod
     def _cell_key(row: int, col: int) -> str:
@@ -160,18 +165,14 @@ class GoogleSheetsBridge:
 
     @staticmethod
     def _coerce_cell_value(value: Any) -> Any:
-        """Normaliza valores do batchGet (números crus; datas serial → date)."""
+        """Normaliza valores do batchGet (números crus; datas serial ficam numéricas)."""
         if value in (None, ""):
             return None
         if isinstance(value, bool):
             return value
         if isinstance(value, (int, float)):
             serial = float(value)
-            # Serial típico de data (anos ~1950–2100); valores monetários ficam como número.
-            # Datas de planilha financeira costumam estar nessa faixa e raramente coincidem
-            # com totais de venda (que são < 20000 na prática do bot). Preferimos manter
-            # número; a conversão de data fica a cargo de _parse_date_cell no excel_store
-            # quando a coluna é de data e o valor formatado/ISO chega como texto.
+            # Mantém número. Colunas de data usam _parse_date_cell (serial → date).
             return serial if serial != int(serial) else int(serial) if abs(serial) < 1e15 else serial
         if isinstance(value, str):
             text = value.strip()
@@ -245,8 +246,9 @@ class GoogleSheetsBridge:
             return spreadsheet.values_batch_get(
                 ranges,
                 params={
+                    # Números crus + datas como serial (evita "7/11/2026" ambíguo do locale US).
                     "valueRenderOption": "UNFORMATTED_VALUE",
-                    "dateTimeRenderOption": "FORMATTED_STRING",
+                    "dateTimeRenderOption": "SERIAL_NUMBER",
                 },
             )
 

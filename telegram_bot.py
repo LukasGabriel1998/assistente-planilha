@@ -979,9 +979,7 @@ def _maybe_build_sales_snippet_image(
                 if key in ("total de vendas (pago)", "valor (pendente)"):
                     return format_brl(svc._to_float(v))
                 if key in ("data de venda", "data de entrega"):
-                    parsed = svc._parse_date_cell(v)
-                    if parsed is not None:
-                        return parsed.strftime("%d/%m/%Y")
+                    return svc._format_date_br(v) or ""
                 if hasattr(v, "strftime"):
                     try:
                         return v.strftime("%d/%m/%Y")

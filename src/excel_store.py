@@ -598,7 +598,7 @@ class SpreadsheetService:
 
     @staticmethod
     def _parse_date_cell(value):
-        """Interpreta célula como data (prioriza dia/mês/ano — padrão Brasil)."""
+        """Interpreta célula como data (serial Sheets, ISO ou DD/MM — padrão Brasil)."""
         if value in (None, ""):
             return None
         if isinstance(value, datetime):
@@ -612,7 +612,7 @@ class SpreadsheetService:
                 if 20000 <= serial <= 80000:
                     from datetime import timedelta
 
-                    return date(1899, 12, 30) + timedelta(days=int(serial))
+                    return date(1899, 12, 30) + timedelta(days=int(round(serial)))
             except Exception:
                 return None
         if hasattr(value, "strftime"):
@@ -625,7 +625,18 @@ class SpreadsheetService:
             s = s[1:].strip()
         if not s:
             return None
-        # ISO (gravação segura) e depois DD/MM (Brasil)
+        # Fórmula =DATE(y,m,d) gravada como texto
+        m_date = re.fullmatch(
+            r"=?DATE\((\d{4})\s*,\s*(\d{1,2})\s*,\s*(\d{1,2})\)",
+            s,
+            flags=re.IGNORECASE,
+        )
+        if m_date:
+            try:
+                return date(int(m_date.group(1)), int(m_date.group(2)), int(m_date.group(3)))
+            except ValueError:
+                return None
+        # ISO primeiro (não ambíguo), depois DD/MM (Brasil)
         for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"):
             try:
                 return datetime.strptime(s, fmt).date()
@@ -633,14 +644,26 @@ class SpreadsheetService:
                 continue
         m = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", s)
         if m:
-            day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            a, b, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
             if year < 100:
                 year += 2000
+            # Sempre interpreta como dia/mês (Brasil). Se inválido, tenta mês/dia.
             try:
-                return date(year, month, day)
+                return date(year, b, a)
             except ValueError:
-                return None
+                try:
+                    return date(year, a, b)
+                except ValueError:
+                    return None
         return None
+
+    @staticmethod
+    def _format_date_br(value) -> str:
+        """Formata data sempre como DD/MM/YYYY para exibição no bot."""
+        parsed = SpreadsheetService._parse_date_cell(value)
+        if parsed is None:
+            return str(value or "").strip()
+        return parsed.strftime("%d/%m/%Y")
 
     @staticmethod
     def _match_text_case(template_value, text: str) -> str:
