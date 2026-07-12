@@ -102,7 +102,29 @@ def _acquire_single_instance_lock() -> None:
 
     atexit.register(_cleanup)
 
-HELP_TEXT = """👋 *Olá! Eu sou o assistente da sua planilha.*
+def _escape_md(text: str) -> str:
+    """Evita que _, *, ` ou [ no nome quebrem o Markdown do Telegram."""
+    return (
+        str(text)
+        .replace("\\", "\\\\")
+        .replace("_", "\\_")
+        .replace("*", "\\*")
+        .replace("`", "\\`")
+        .replace("[", "\\[")
+    )
+
+
+def _user_display_name(user: dict | None) -> str:
+    """Nome do perfil Telegram (first_name), sem @username."""
+    if not user:
+        return ""
+    return str(user.get("first_name") or "").strip()
+
+
+def _help_text(user_name: str = "") -> str:
+    name = _escape_md((user_name or "").strip())
+    hello = f"Olá, {name}!" if name else "Olá!"
+    return f"""👋 *{hello} Eu sou o assistente da sua planilha.*
 
 ⚙️ *Como funciona*
 1️⃣ Você manda *áudio*, *texto* ou o *formulário* abaixo
@@ -181,6 +203,9 @@ Depois que informar um ID, o bot mantém para custos, pagamentos e entregas até
 👍 Certo → *SIM* ou *OK*
 ✏️ Ajustar → mande só o que mudou: `Entrada: 2000`"""
 
+
+# Compatível com imports/testes que ainda esperam HELP_TEXT.
+HELP_TEXT = _help_text()
 # Teclado de menu (botões que aparecem abaixo do campo de digitação)
 MAIN_MENU_KEYBOARD = {
     "keyboard": [
@@ -234,7 +259,7 @@ def _reset_chat_session(
 
 
 def _correct_intro_text(user_name: str = "") -> str:
-    name = (user_name or "").strip()
+    name = _escape_md((user_name or "").strip())
     hello = f"Beleza, {name}! " if name else "Beleza! "
     return (
         f"{hello}Vamos *corrigir ou apagar* um lançamento.\n\n"
@@ -2564,9 +2589,10 @@ def run_polling() -> None:
             if text in ("/start", "/help") or text.strip().lower() in ("ajuda", "start"):
                 pending_preview.pop(chat_id, None)
                 pending_correct.pop(chat_id, None)
+                user_name = _user_display_name(msg.get("from"))
                 send_message(
                     chat_id,
-                    HELP_TEXT,
+                    _help_text(user_name),
                     parse_mode="Markdown",
                     reply_markup=MAIN_MENU_KEYBOARD,
                 )
@@ -2591,29 +2617,30 @@ def run_polling() -> None:
                     last_customer_by_chat=last_customer_by_chat,
                     pending_correct=pending_correct,
                 )
+                user_name = _escape_md(_user_display_name(msg.get("from")))
+                hello = f"Pronto, {user_name}! " if user_name else ""
                 if lower_cmd_clean.startswith("nova") or lower_cmd.startswith("nova"):
-                    msg = (
-                        "🔄 *Nova conversa iniciada.*\n\n"
+                    msg_txt = (
+                        f"🔄 {hello}*Nova conversa iniciada.*\n\n"
                         "O contexto do ID VENDA foi limpo. Pode registrar uma venda nova "
                         "ou informar outro ID quando quiser."
                     )
                 else:
-                    msg = (
-                        "🔄 *Nova conversa iniciada.*\n\n"
+                    msg_txt = (
+                        f"🔄 {hello}*Nova conversa iniciada.*\n\n"
                         "Contexto limpo. Pode enviar um novo comando ou tocar em *Prévia*."
                     )
-                send_message(chat_id, msg, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+                send_message(chat_id, msg_txt, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
                 continue
 
             # Menu Corrigir: alterar ou apagar lançamentos
             if _is_correct_menu_command(text):
-                user = msg.get("from", {})
-                user_name = user.get("first_name") or user.get("username") or ""
+                user_name = _user_display_name(msg.get("from"))
                 _start_correct_flow(
                     chat_id,
                     pending_correct=pending_correct,
                     pending_preview=pending_preview,
-                    user_name=str(user_name),
+                    user_name=user_name,
                 )
                 continue
 
