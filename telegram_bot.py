@@ -59,6 +59,7 @@ from src.transcription import TranscriptionError, transcribe_audio
 from src.llm_parser import llm_fallback_enabled, try_llm_parse
 from src.monthly_report_pdf import build_planilha_report_pdf, collect_planilha_stats
 from src import bot_health
+from src.chat_security import MENU_ENCERRAR_SESSAO, ChatSecurity
 
 # Carregar .env
 def _load_dotenv() -> None:
@@ -84,6 +85,8 @@ _load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+_chat_security = ChatSecurity(_PROJECT_DIR)
 
 
 def _norm_chat_id(chat_id: int | str | None) -> str:
@@ -132,11 +135,24 @@ def _handle_hub_migration(msg: dict) -> None:
         _adopt_admin_chat_id(to_id, reason="migrate_to_chat_id")
 
 
+def _notify_admin_password(text: str, reply_markup: dict | None = None) -> bool:
+    hub = _admin_notify_chat_id()
+    if hub is None or not TELEGRAM_BOT_TOKEN:
+        return False
+    send_message(hub, text, parse_mode="Markdown", reply_markup=reply_markup, track=False)
+    return True
+
+
 def _health_notify_send(text: str) -> bool:
     hub = _admin_notify_chat_id()
     if hub is None or not TELEGRAM_BOT_TOKEN:
         return False
-    return send_message(hub, text, parse_mode="Markdown") is not None
+    return send_message(hub, text, parse_mode="Markdown", track=False) is not None
+
+
+def _security_clear_chat_state(chat_id: int | str) -> None:
+    """Callback para o módulo de segurança limpar estado da conversa."""
+    pass
 
 
 def _report_user_error_to_admin(
@@ -409,15 +425,24 @@ Depois que informar um ID, o bot mantém para custos, pagamentos e entregas até
 # Compatível com imports/testes que ainda esperam HELP_TEXT.
 HELP_TEXT = _help_text()
 # Teclado de menu (botões que aparecem abaixo do campo de digitação)
-MAIN_MENU_KEYBOARD = {
-    "keyboard": [
+def _main_menu_keyboard() -> dict:
+    rows = [
         ["📋 Prévia", "📊 Resumo"],
         ["📄 Relatório PDF", "✏️ Corrigir"],
-        ["❓ Ajuda", "🔄 Nova conversa"],
-    ],
-    "resize_keyboard": True,
-    "one_time_keyboard": False,
-}
+    ]
+    if _chat_security.auth_enabled():
+        rows.append(["❓ Ajuda", MENU_ENCERRAR_SESSAO])
+        rows.append(["🔄 Nova conversa"])
+    else:
+        rows.append(["❓ Ajuda", "🔄 Nova conversa"])
+    return {
+        "keyboard": rows,
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
+
+
+MAIN_MENU_KEYBOARD = _main_menu_keyboard()
 
 RESUMO_DETAILS_INLINE_KEYBOARD = {
     "inline_keyboard": [
@@ -476,7 +501,7 @@ def _correct_intro_text(user_name: str = "") -> str:
 def _normalize_menu_button(text: str) -> str:
     """Remove emojis dos botões do menu para reconhecer o comando."""
     cleaned = (text or "").strip().lower()
-    for ch in ("📄", "📊", "📋", "✏️", "🔄", "❓", "💡"):
+    for ch in ("📄", "📊", "📋", "✏️", "🔄", "❓", "💡", "🔒"):
         cleaned = cleaned.replace(ch, "")
     return cleaned.strip()
 
@@ -606,7 +631,7 @@ def _try_handle_correct_alter_input(
             send_message(
                 chat_id,
                 f"⚠️ Não consegui aplicar a correção: {_spreadsheet_error_message(exc)}",
-                reply_markup=MAIN_MENU_KEYBOARD,
+                reply_markup=_main_menu_keyboard(),
             )
             return True
 
@@ -617,7 +642,7 @@ def _try_handle_correct_alter_input(
             "✅ *Planilha atualizada!*\n\n"
             + "\n".join(f"• {label}" for label in applied_labels),
             parse_mode="Markdown",
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=_main_menu_keyboard(),
         )
         return True
 
@@ -636,7 +661,7 @@ def _try_handle_correct_alter_input(
             build_missing_fields_message(parse_result.missing_fields, parse_result.intent)
             + "\n\n_Tente copiar uma linha do modelo e editar só o que precisa._",
             parse_mode="Markdown",
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=_main_menu_keyboard(),
         )
         return True
 
@@ -671,7 +696,7 @@ def _try_handle_correct_alter_input(
             original_text=alter_text,
             chat_id=str(chat_id),
         )
-    send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+    send_message(chat_id, reply, parse_mode="Markdown", reply_markup=_main_menu_keyboard())
     _remember_sale_id_from_parse(parse_result, last_sale_id_by_chat, chat_id)
     return True
 
@@ -802,7 +827,7 @@ def _correct_show_category(
     message_id: int | None = None,
 ) -> None:
     if not _spreadsheet_ready_for_bot():
-        send_message(chat_id, "Planilha não encontrada.", reply_markup=MAIN_MENU_KEYBOARD)
+        send_message(chat_id, "Planilha não encontrada.", reply_markup=_main_menu_keyboard())
         return
     try:
         svc = _open_spreadsheet_for_bot()
@@ -816,7 +841,7 @@ def _correct_show_category(
             items = svc.list_recent_fixed_costs(limit=10)
             title = "🏠 *Gastos fixos recentes*\n\nToque no lançamento:"
     except Exception as exc:
-        send_message(chat_id, _spreadsheet_error_message(exc), reply_markup=MAIN_MENU_KEYBOARD)
+        send_message(chat_id, _spreadsheet_error_message(exc), reply_markup=_main_menu_keyboard())
         return
 
     pending_correct[chat_id] = {"step": "list", "category": category, "items": items}
@@ -1018,10 +1043,10 @@ def _correct_ask_delete(
         message_id,
         text,
         parse_mode="Markdown",
-        reply_markup=MAIN_MENU_KEYBOARD,
+        reply_markup=_main_menu_keyboard(),
     ):
         return
-    send_message(chat_id, text, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+    send_message(chat_id, text, parse_mode="Markdown", reply_markup=_main_menu_keyboard())
 
 
 def _handle_correct_callback(
@@ -1047,7 +1072,7 @@ def _handle_correct_callback(
         text = "❌ Correção cancelada. Pode continuar normalmente."
         if message_id:
             edit_chat_message(chat_id, message_id, text, parse_mode="Markdown", reply_markup={"inline_keyboard": []})
-        send_message(chat_id, text, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+        send_message(chat_id, text, parse_mode="Markdown", reply_markup=_main_menu_keyboard())
         return True
 
     if action == "back" and len(parts) > 2 and parts[2] == "cats":
@@ -1583,6 +1608,8 @@ def send_message(
     text: str,
     parse_mode: str | None = None,
     reply_markup: dict | None = None,
+    *,
+    track: bool = True,
 ) -> int | None:
     """Envia mensagem de texto para o chat. Retorna message_id em caso de sucesso."""
     if not TELEGRAM_BOT_TOKEN:
@@ -1609,7 +1636,14 @@ def send_message(
         message_id = result.get("message_id")
         if not _is_notify_hub_chat(chat_id):
             bot_health.record_outbound_ok()
-        return int(message_id) if isinstance(message_id, int) else None
+        mid = int(message_id) if isinstance(message_id, int) else None
+        if (
+            mid is not None
+            and _chat_security.auth_enabled()
+            and not _is_notify_hub_chat(chat_id)
+        ):
+            _chat_security.track_message(chat_id, mid, durable=not track)
+        return mid
     except Exception as e:
         print(f"[Telegram] Erro ao enviar: {e}")
         _report_outbound_network_failure(
@@ -2175,10 +2209,10 @@ def _try_handle_overdue_delivery_reply(
                     chat_id,
                     "\n".join(lines) or "Nenhuma entrega atualizada.",
                     parse_mode="Markdown",
-                    reply_markup=MAIN_MENU_KEYBOARD,
+                    reply_markup=_main_menu_keyboard(),
                 )
             except Exception as exc:
-                send_message(chat_id, f"Erro ao atualizar: {exc}", reply_markup=MAIN_MENU_KEYBOARD)
+                send_message(chat_id, f"Erro ao atualizar: {exc}", reply_markup=_main_menu_keyboard())
             return True
 
     sale_id = _resolve_overdue_sale_id(text, bucket)
@@ -2198,7 +2232,7 @@ def _try_handle_overdue_delivery_reply(
                 "`NÃO ID VENDA 003` — ainda não entregue",
             ]
         )
-        send_message(chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+        send_message(chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=_main_menu_keyboard())
         return True
 
     if negative and not positive:
@@ -2207,7 +2241,7 @@ def _try_handle_overdue_delivery_reply(
             f"Ok, ID VENDA *{sale_id}* continua *amarelo* (não entregue).\n"
             f"Quando entregar, responda *SIM* ou `ID VENDA {sale_id} foi entregue`.",
             parse_mode="Markdown",
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=_main_menu_keyboard(),
         )
         return True
 
@@ -2226,17 +2260,17 @@ def _try_handle_overdue_delivery_reply(
                 chat_id,
                 f"✅ *Entrega confirmada!*\n\nID VENDA *{sale_id}* marcado como entregue — *verde* na planilha.",
                 parse_mode="Markdown",
-                reply_markup=MAIN_MENU_KEYBOARD,
+                reply_markup=_main_menu_keyboard(),
             )
         else:
             send_message(
                 chat_id,
                 f"Não achei ID VENDA *{sale_id}* na planilha.",
                 parse_mode="Markdown",
-                reply_markup=MAIN_MENU_KEYBOARD,
+                reply_markup=_main_menu_keyboard(),
             )
     except Exception as exc:
-        send_message(chat_id, f"Erro ao atualizar: {exc}", reply_markup=MAIN_MENU_KEYBOARD)
+        send_message(chat_id, f"Erro ao atualizar: {exc}", reply_markup=_main_menu_keyboard())
     return True
 
 
@@ -2385,7 +2419,7 @@ def _send_planilha_pdf(
         send_message(
             chat_id,
             spreadsheet_setup_hint(),
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=_main_menu_keyboard(),
         )
         return
     send_chat_action(chat_id, "typing")
@@ -2395,12 +2429,12 @@ def _send_planilha_pdf(
         send_message(
             chat_id,
             _spreadsheet_error_message(exc),
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=_main_menu_keyboard(),
         )
         print(f"[Telegram] Erro no relatório PDF: {exc}")
         return
     if not stats:
-        send_message(chat_id, "Planilha não encontrada.", reply_markup=MAIN_MENU_KEYBOARD)
+        send_message(chat_id, "Planilha não encontrada.", reply_markup=_main_menu_keyboard())
         return
     resolved_name = (user_name or "").strip() or _resolve_reply_user_name(user)
     pdf_path = build_planilha_report_pdf(stats, user_name=resolved_name)
@@ -2408,7 +2442,7 @@ def _send_planilha_pdf(
         send_message(
             chat_id,
             "⚠️ Não consegui gerar o PDF. Rode `python run_project.py` para instalar fpdf2 e matplotlib.",
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=_main_menu_keyboard(),
         )
         return
     month_label = str(stats.get("mes_label") or "mês atual")
@@ -2419,7 +2453,7 @@ def _send_planilha_pdf(
             caption=f"📄 *Relatório da planilha — {month_label}*",
             filename=f"relatorio_{month_label.replace(' ', '_').lower()}.pdf",
             parse_mode="Markdown",
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=_main_menu_keyboard(),
         )
     finally:
         try:
@@ -2481,7 +2515,7 @@ def _handle_quick_dashboard_command(
             "⏳ *Ainda preparando a resposta anterior...*\n"
             "Aguarde alguns segundos — não precisa tocar no botão de novo.",
             parse_mode="Markdown",
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=_main_menu_keyboard(),
         )
         send_chat_action(chat_id, "typing")
         return True
@@ -2508,7 +2542,7 @@ def _handle_quick_dashboard_command(
                 chat_id,
                 caption or "Nenhum detalhe disponível.",
                 parse_mode="Markdown",
-                reply_markup=MAIN_MENU_KEYBOARD,
+                reply_markup=_main_menu_keyboard(),
             )
         else:
             wait_message_id = _notify_dashboard_loading(chat_id, cmd_strip)
@@ -2532,7 +2566,7 @@ def _handle_quick_dashboard_command(
         send_message(
             chat_id,
             _spreadsheet_error_message(exc),
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=_main_menu_keyboard(),
         )
     finally:
         delete_chat_message(chat_id, wait_message_id)
@@ -2583,13 +2617,13 @@ def _handle_resumo_detalhes_callback(
             chat_id,
             caption or "Nenhum detalhe disponível.",
             parse_mode="Markdown",
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=_main_menu_keyboard(),
         )
     except Exception as exc:
         send_message(
             chat_id,
             f"Erro ao gerar detalhes: {exc}",
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=_main_menu_keyboard(),
         )
     finally:
         delete_chat_message(chat_id, wait_message_id)
@@ -2718,7 +2752,7 @@ def _try_handle_batch_sale_updates(
         send_message(
             chat_id,
             f"Não consegui montar o lote de {kind} para os IDs: {', '.join(ids)}.",
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=_main_menu_keyboard(),
         )
         return True
 
@@ -2760,7 +2794,7 @@ def _try_handle_batch_delete(
         send_message(
             chat_id,
             f"Não consegui montar a exclusão em lote para os IDs: {', '.join(ids)}.",
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=_main_menu_keyboard(),
         )
         return True
 
@@ -3020,6 +3054,19 @@ def run_polling() -> None:
     bot_health.configure_bot_label(bot_display)
     bot_health.configure_sender(_health_notify_send)
 
+    _security_state: dict[str, object] = {}
+
+    def _clear_state_for_security(chat_id: int | str) -> None:
+        _reset_chat_session(
+            chat_id,
+            pending_preview=_security_state["pending_preview"],  # type: ignore[arg-type]
+            pending_delivery=_security_state["pending_delivery"],  # type: ignore[arg-type]
+            pending_overdue_delivery=_security_state["pending_overdue_delivery"],  # type: ignore[arg-type]
+            last_sale_id_by_chat=_security_state["last_sale_id_by_chat"],  # type: ignore[arg-type]
+            last_customer_by_chat=_security_state["last_customer_by_chat"],  # type: ignore[arg-type]
+            pending_correct=_security_state["pending_correct"],  # type: ignore[arg-type]
+        )
+
     hub = _admin_notify_chat_id()
     if hub is not None and bot_health.alerts_enabled():
         print(f"[Telegram] Alertas de saúde no grupo admin: {hub}", flush=True)
@@ -3057,6 +3104,38 @@ def run_polling() -> None:
     pending_overdue_delivery: dict[int | str, dict] = {}
     pending_correct: dict[int | str, dict] = {}
     user_names_by_chat: dict[int | str, str] = {}
+    _security_state.update(
+        {
+            "pending_preview": pending_preview,
+            "pending_delivery": pending_delivery,
+            "pending_overdue_delivery": pending_overdue_delivery,
+            "last_sale_id_by_chat": last_sale_id_by_chat,
+            "last_customer_by_chat": last_customer_by_chat,
+            "pending_correct": pending_correct,
+        }
+    )
+    _chat_security.configure(
+        base_url=BASE_URL,
+        send_message=send_message,
+        delete_message=delete_chat_message,
+        edit_message=edit_chat_message,
+        is_hub_chat=_is_notify_hub_chat,
+        notify_admin=_notify_admin_password,
+        clear_chat_state=_clear_state_for_security,
+        menu_keyboard=_main_menu_keyboard,
+    )
+    if _chat_security.auth_enabled():
+        ttl = _chat_security.session_ttl_seconds()
+        ttl_label = "até reiniciar o bot" if ttl is None else f"{ttl / 60:.0f} min sem uso"
+        print(f"[Telegram] Senha de acesso ativa ({ttl_label}).", flush=True)
+        if hub:
+            print(f"[Telegram] Pedidos de troca de senha vão para o grupo admin: {hub}", flush=True)
+    else:
+        print(
+            "[Telegram] Senha desligada (defina BOT_ACCESS_PASSWORD no .env para ativar).",
+            flush=True,
+        )
+    _chat_security.start_watcher(user_names_by_chat)
     quick_menu_processing: set[int | str] = set()
     quick_menu_cooldown: dict[int | str, float] = {}
     last_reminder_check = 0.0
@@ -3110,25 +3189,55 @@ def run_polling() -> None:
                     user_names_by_chat[callback_chat_id] = cb_user
                 cb_token = _active_reply_user_name.set(cb_user or "")
                 try:
-                    if callback_data == "resumo_detalhes" and callback_chat_id:
-                        _handle_resumo_detalhes_callback(
+                    if (
+                        callback_data.startswith("admin:pw:")
+                        and callback_chat_id
+                        and _is_notify_hub_chat(callback_chat_id)
+                    ):
+                        _chat_security.handle_admin_password_callback(
                             callback_chat_id,
-                            str(callback_id or ""),
-                            pending_preview=pending_preview,
-                            quick_menu_processing=quick_menu_processing,
-                            quick_menu_cooldown=quick_menu_cooldown,
-                        )
-                    elif callback_data.startswith("corr:") and callback_chat_id:
-                        msg_obj = callback.get("message") or {}
-                        _handle_correct_callback(
-                            callback_chat_id,
-                            str(callback_id or ""),
                             callback_data,
-                            pending_correct=pending_correct,
-                            pending_preview=pending_preview,
-                            last_sale_id_by_chat=last_sale_id_by_chat,
-                            message_id=msg_obj.get("message_id"),
+                            message_id=(callback.get("message") or {}).get("message_id"),
                         )
+                        if callback_id:
+                            answer_callback_query(str(callback_id))
+                    elif (
+                        callback_chat_id
+                        and _chat_security.auth_enabled()
+                        and not _is_notify_hub_chat(callback_chat_id)
+                        and not _chat_security.is_unlocked(callback_chat_id)
+                    ):
+                        if callback_id:
+                            answer_callback_query(str(callback_id), "🔐 Digite a senha para continuar.")
+                    elif callback_data == "resumo_detalhes" and callback_chat_id:
+                        if not _chat_security.is_unlocked(callback_chat_id):
+                            if callback_id:
+                                answer_callback_query(str(callback_id), "🔐 Digite a senha para continuar.")
+                        else:
+                            _chat_security.touch_session(callback_chat_id)
+                            _handle_resumo_detalhes_callback(
+                                callback_chat_id,
+                                str(callback_id or ""),
+                                pending_preview=pending_preview,
+                                quick_menu_processing=quick_menu_processing,
+                                quick_menu_cooldown=quick_menu_cooldown,
+                            )
+                    elif callback_data.startswith("corr:") and callback_chat_id:
+                        if not _chat_security.is_unlocked(callback_chat_id):
+                            if callback_id:
+                                answer_callback_query(str(callback_id), "🔐 Digite a senha para continuar.")
+                        else:
+                            _chat_security.touch_session(callback_chat_id)
+                            msg_obj = callback.get("message") or {}
+                            _handle_correct_callback(
+                                callback_chat_id,
+                                str(callback_id or ""),
+                                callback_data,
+                                pending_correct=pending_correct,
+                                pending_preview=pending_preview,
+                                last_sale_id_by_chat=last_sale_id_by_chat,
+                                message_id=msg_obj.get("message_id"),
+                            )
                     elif callback_id:
                         answer_callback_query(str(callback_id))
                 finally:
@@ -3155,6 +3264,21 @@ def run_polling() -> None:
             if chat_id and _reply_user:
                 user_names_by_chat[chat_id] = _reply_user
             _active_reply_user_name.set(_reply_user or "")
+
+            if (
+                chat_id
+                and _chat_security.auth_enabled()
+                and not _is_notify_hub_chat(chat_id)
+                and not _chat_security.is_unlocked(chat_id)
+            ):
+                if message_id:
+                    _chat_security.track_message(chat_id, message_id)
+                if not text and not (msg.get("voice") or msg.get("audio")):
+                    _chat_security.prompt_password(chat_id, _reply_user)
+                    continue
+                if not text and (msg.get("voice") or msg.get("audio")):
+                    _chat_security.prompt_password(chat_id, _reply_user)
+                    continue
 
             # Áudio: baixar, transcrever e usar o texto como se fosse mensagem digitada
             voice_payload = msg.get("voice") or msg.get("audio")
@@ -3198,7 +3322,7 @@ def run_polling() -> None:
                                     "Agora vou montar a prévia do lançamento. Confira os campos e responda *SIM* para salvar, "
                                     "ou envie a correção por texto.",
                                     parse_mode="Markdown",
-                                    reply_markup=MAIN_MENU_KEYBOARD,
+                                    reply_markup=_main_menu_keyboard(),
                                 )
                     except TranscriptionError as e:
                         send_message(chat_id, f"Não consegui transcrever o áudio: {e}")
@@ -3249,6 +3373,28 @@ def run_polling() -> None:
                     )
                 continue
 
+            if _chat_security.auth_enabled() and not _is_notify_hub_chat(chat_id):
+                if message_id:
+                    _chat_security.track_message(chat_id, message_id)
+                username = str((msg.get("from") or {}).get("username") or "")
+                if not _chat_security.is_unlocked(chat_id):
+                    had_session = _chat_security.had_active_session(chat_id)
+                    if _chat_security.handle_locked_message(
+                        chat_id,
+                        text,
+                        message_id=message_id,
+                        display_name=_reply_user,
+                        username=username,
+                        had_session=had_session,
+                    ):
+                        continue
+                elif text and _chat_security.handle_unlocked_lock_command(
+                    chat_id, text, display_name=_reply_user
+                ):
+                    continue
+                else:
+                    _chat_security.touch_session(chat_id)
+
             if text and _try_handle_overdue_delivery_reply(
                 chat_id, text, pending_overdue_delivery, pending_preview
             ):
@@ -3258,7 +3404,7 @@ def run_polling() -> None:
                 send_message(
                     chat_id,
                     "Envie um texto (ex.: vendi placa para o João por 2000), um áudio, ou toque em 📊 *Resumo*.",
-                    reply_markup=MAIN_MENU_KEYBOARD,
+                    reply_markup=_main_menu_keyboard(),
                 )
                 continue
 
@@ -3273,7 +3419,7 @@ def run_polling() -> None:
                     chat_id,
                     _help_text(user_name),
                     parse_mode="Markdown",
-                    reply_markup=MAIN_MENU_KEYBOARD,
+                    reply_markup=_main_menu_keyboard(),
                 )
                 continue
 
@@ -3301,7 +3447,7 @@ def run_polling() -> None:
                         f"🔄 {hello}*Nova conversa iniciada.*\n\n"
                         "Contexto limpo. Pode enviar um novo comando ou tocar em *Prévia*."
                     )
-                send_message(chat_id, msg_txt, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+                send_message(chat_id, msg_txt, parse_mode="Markdown", reply_markup=_main_menu_keyboard())
                 continue
 
             # Menu Corrigir: alterar ou apagar lançamentos
@@ -3322,7 +3468,7 @@ def run_polling() -> None:
                     chat_id,
                     "❌ Correção cancelada. Pode continuar normalmente.",
                     parse_mode="Markdown",
-                    reply_markup=MAIN_MENU_KEYBOARD,
+                    reply_markup=_main_menu_keyboard(),
                 )
                 continue
 
@@ -3352,7 +3498,7 @@ def run_polling() -> None:
                     if sale_digits:
                         sale_id = sale_digits[-1].zfill(3) if len(sale_digits[-1]) <= 3 else sale_digits[-1]
                         if not _spreadsheet_ready_for_bot():
-                            send_message(chat_id, "Planilha não encontrada.", reply_markup=MAIN_MENU_KEYBOARD)
+                            send_message(chat_id, "Planilha não encontrada.", reply_markup=_main_menu_keyboard())
                             continue
                         try:
                             svc = _open_spreadsheet_for_bot()
@@ -3361,7 +3507,7 @@ def run_polling() -> None:
                             send_message(
                                 chat_id,
                                 _spreadsheet_error_message(exc),
-                                reply_markup=MAIN_MENU_KEYBOARD,
+                                reply_markup=_main_menu_keyboard(),
                             )
                             continue
                         if ok:
@@ -3369,7 +3515,7 @@ def run_polling() -> None:
                                 chat_id,
                                 f"✅ *Entrega confirmada!*\n\nID VENDA *{sale_id}* salvo na planilha — marcado como *entregue* (verde).",
                                 parse_mode="Markdown",
-                                reply_markup=MAIN_MENU_KEYBOARD,
+                                reply_markup=_main_menu_keyboard(),
                             )
                         else:
                             send_message(
@@ -3429,7 +3575,7 @@ def run_polling() -> None:
                                 f"Atualização em lote concluída: {applied}/{len(batch_results)} item(ns).\n\n"
                                 + "\n".join(replies[:6])
                             )
-                        send_message(chat_id, msg_out, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+                        send_message(chat_id, msg_out, parse_mode="Markdown", reply_markup=_main_menu_keyboard())
                         continue
                     parse_result = pending["parse_result"]
                     original_text = pending.get("original_text", "")
@@ -3509,7 +3655,7 @@ def run_polling() -> None:
                             chat_id,
                             reply,
                             parse_mode="Markdown",
-                            reply_markup=MAIN_MENU_KEYBOARD,
+                            reply_markup=_main_menu_keyboard(),
                             image_path=img_path,
                         )
                     finally:
@@ -3525,7 +3671,7 @@ def run_polling() -> None:
                 cancel_words = ("não", "nao", "cancelar", "cancela")
                 if text.strip().lower() in cancel_words and chat_id in pending_preview:
                     pending_preview.pop(chat_id, None)
-                    send_message(chat_id, "❌ Cancelado. Pode enviar os dados de novo quando quiser.", reply_markup=MAIN_MENU_KEYBOARD)
+                    send_message(chat_id, "❌ Cancelado. Pode enviar os dados de novo quando quiser.", reply_markup=_main_menu_keyboard())
                     continue
 
                 # Relatório PDF
@@ -3687,7 +3833,7 @@ def run_polling() -> None:
                                         _open_spreadsheet_for_bot().finalize_service(str(sale_id))
                                     except Exception:
                                         pass
-                        send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+                        send_message(chat_id, reply, parse_mode="Markdown", reply_markup=_main_menu_keyboard())
                         pending_delivery.pop(chat_id, None)
                         continue
                     except Exception:
@@ -3706,7 +3852,7 @@ def run_polling() -> None:
                                 chat_id,
                                 "Não entendi a data, então vou salvar sem Data de Entrega.",
                             )
-                            send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+                            send_message(chat_id, reply, parse_mode="Markdown", reply_markup=_main_menu_keyboard())
                         continue
 
                 # Lote: vários ID VENDA — exclusão, entrega ou pagamento na mesma mensagem
@@ -3923,12 +4069,12 @@ def run_polling() -> None:
 
                 # Outros casos (ex.: só texto que não é venda/estorno): processar direto
                 reply = process_command(text, origin="telegram")
-                send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+                send_message(chat_id, reply, parse_mode="Markdown", reply_markup=_main_menu_keyboard())
             except Exception as e:
                 from src.bot_processor import _spreadsheet_error_message
 
                 reply = f"⚠️ Não consegui processar essa mensagem:\n{_spreadsheet_error_message(e)}"
-                send_message(chat_id, reply, reply_markup=MAIN_MENU_KEYBOARD)
+                send_message(chat_id, reply, reply_markup=_main_menu_keyboard())
                 _report_user_error_to_admin(
                     e,
                     chat_id=chat_id,
