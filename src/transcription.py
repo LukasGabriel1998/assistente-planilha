@@ -53,6 +53,21 @@ _COMMON_TRANSCRIPTION_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\borcamento\b", re.I), "orçamento"),
     (re.compile(r"\bmateria\s+prima\b", re.I), "matéria-prima"),
     (re.compile(r"\bbander\b", re.I), "banner"),
+    (re.compile(r"\bbaner\b", re.I), "banner"),
+    (re.compile(r"\bfachata\b", re.I), "fachada"),
+    (re.compile(r"\bfaxada\b", re.I), "fachada"),
+    (re.compile(r"\bplaca\b", re.I), "placa"),
+    (re.compile(r"\bentradas\b", re.I), "entrada"),
+    (re.compile(r"\bsaldos\b", re.I), "saldo"),
+    (re.compile(r"\bentreguei\b", re.I), "entregue"),
+    (re.compile(r"\bentrego\b", re.I), "entregue"),
+    (re.compile(r"\bid\s+vendas\b", re.I), "id venda"),
+    (re.compile(r"\bide\s+venda\b", re.I), "id venda"),
+    (re.compile(r"\bzero\s+zero\s+(\d)\b", re.I), r"00\1"),
+    (re.compile(r"\bmil\s+reais\b", re.I), "mil reais"),
+    (re.compile(r"\bquinhentos\b", re.I), "quinhentos"),
+    (re.compile(r"\bdois\s+mil\b", re.I), "dois mil"),
+    (re.compile(r"\bcinco\s+mil\b", re.I), "cinco mil"),
 )
 
 
@@ -319,28 +334,74 @@ def _get_whisper_model(WhisperModel: type, model_source: str, cache_root: Path):
         return model
 
 
-def _build_transcribe_kwargs() -> dict:
-    beam_size = _resolve_beam_size()
-    kwargs = {
+def _build_transcribe_kwargs(
+    *,
+    vad_filter: bool = True,
+    temperature: float = 0.0,
+    beam_size: int | None = None,
+    use_initial_prompt: bool = True,
+) -> dict:
+    resolved_beam = beam_size if beam_size is not None else _resolve_beam_size()
+    kwargs: dict = {
         "language": "pt",
         "task": "transcribe",
-        "beam_size": beam_size,
-        "best_of": beam_size,
-        "temperature": 0.0,
-        "vad_filter": True,
+        "beam_size": resolved_beam,
+        "best_of": resolved_beam,
+        "temperature": temperature,
+        "vad_filter": vad_filter,
         "condition_on_previous_text": False,
-        "initial_prompt": _resolve_initial_prompt(),
         "compression_ratio_threshold": 2.4,
         "log_prob_threshold": -1.0,
         "no_speech_threshold": 0.5,
     }
-    if _env_flag("WHISPER_VAD_PARAMETERS", default=True):
+    if use_initial_prompt:
+        kwargs["initial_prompt"] = _resolve_initial_prompt()
+    if vad_filter and _env_flag("WHISPER_VAD_PARAMETERS", default=True):
         kwargs["vad_parameters"] = {
             "min_silence_duration_ms": 400,
             "speech_pad_ms": 300,
             "threshold": 0.45,
         }
     return kwargs
+
+
+def _segments_to_text(segments) -> str:
+    return _fix_common_transcription_errors(
+        _cleanup_transcription_text(" ".join(seg.text.strip() for seg in segments))
+    )
+
+
+def _run_transcribe(model, transcribe_path: Path, kwargs: dict) -> str:
+    try:
+        segments, _ = model.transcribe(str(transcribe_path), **kwargs)
+    except TypeError:
+        segments, _ = model.transcribe(str(transcribe_path), language="pt")
+    return _segments_to_text(segments)
+
+
+def _transcribe_with_fallbacks(model, transcribe_path: Path) -> str:
+    """Tenta transcricao com VAD; se falhar ou sair vazio, repete sem VAD e com temperatura leve."""
+    primary_kwargs = _build_transcribe_kwargs()
+    text = _run_transcribe(model, transcribe_path, primary_kwargs)
+    if text and len(text.strip()) >= 3:
+        return text
+
+    fallback_kwargs = _build_transcribe_kwargs(
+        vad_filter=False,
+        temperature=0.15,
+        beam_size=max(5, _resolve_beam_size()),
+    )
+    retry = _run_transcribe(model, transcribe_path, fallback_kwargs)
+    if retry and len(retry.strip()) >= 3:
+        return retry
+
+    last_resort = _build_transcribe_kwargs(
+        vad_filter=False,
+        temperature=0.25,
+        beam_size=max(3, _resolve_beam_size() - 2),
+        use_initial_prompt=False,
+    )
+    return _run_transcribe(model, transcribe_path, last_resort)
 
 
 def transcribe_audio(audio_path: str | Path, model_size: str = "small") -> str:
@@ -367,15 +428,7 @@ def transcribe_audio(audio_path: str | Path, model_size: str = "small") -> str:
 
     try:
         model = _get_whisper_model(WhisperModel, model_source, cache_root)
-        transcribe_kwargs = _build_transcribe_kwargs()
-        try:
-            segments, _ = model.transcribe(str(transcribe_path), **transcribe_kwargs)
-        except TypeError:
-            # Compatibilidade com versoes antigas de faster-whisper.
-            segments, _ = model.transcribe(str(transcribe_path), language="pt")
-        text = _fix_common_transcription_errors(
-            _cleanup_transcription_text(" ".join(seg.text.strip() for seg in segments))
-        )
+        text = _transcribe_with_fallbacks(model, transcribe_path)
     except Exception as exc:  # pragma: no cover - runtime branch
         raise TranscriptionError(f"Erro ao transcrever audio: {exc}") from exc
     finally:

@@ -105,7 +105,24 @@ Fica em `dist_novo/AssistentePlanilha/` montada como volume. Os dados que o bot 
 
 ### Posso usar intervalo menor que 5 minutos?
 
-Sim. `*/2` = a cada 2 minutos.
+Sim. Rode o setup com intervalo customizado:
+
+```bash
+DEPLOY_INTERVAL_MIN=2 ./scripts/setup-server.sh
+```
+
+Ou edite o cron manualmente (`*/2` = a cada 2 minutos).
+
+### O cron ja esta configurado?
+
+No Mini PC:
+
+```bash
+crontab -l | grep deploy.sh
+tail -20 logs/deploy.log
+```
+
+Se nao aparecer nada, rode `./scripts/setup-server.sh` uma vez no Mini PC.
 
 ---
 

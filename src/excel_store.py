@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import copy
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from .dates import today_local
@@ -3383,6 +3383,99 @@ class SpreadsheetService:
             return "\n".join(lines)
         except Exception as e:
             return f"Erro ao ler detalhes da planilha: {e}"
+        finally:
+            if own_wb:
+                wb.close()
+
+    def get_summary_stats(self, max_rows_scan: int = 500, wb=None) -> dict[str, float | int | str]:
+        """Totais estruturados para relatório PDF e integrações."""
+        own_wb = wb is None
+        if own_wb:
+            wb = self._open_workbook(data_only=True)
+        try:
+            today = today_local()
+            month_start = date(today.year, today.month, 1)
+            if today.month == 12:
+                month_end = date(today.year, 12, 31)
+            else:
+                month_end = date(today.year, today.month + 1, 1) - timedelta(days=1)
+
+            sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
+            ws_sales = wb[sales_name]
+            sales_cols = self._sales_columns(ws_sales)
+            col_pago = sales_cols.get("total de vendas (pago)")
+            col_pendente = sales_cols.get("valor (pendente)")
+            col_id = sales_cols.get("id venda")
+            col_sale_date = sales_cols.get("data de venda")
+            sales_end = (
+                self._effective_data_end_row(ws_sales, col_id, max_rows_scan=max_rows_scan)
+                if col_id
+                else self._scan_row_cap(ws_sales, max_rows_scan=max_rows_scan)
+            )
+            n_sales = self._count_filled_rows(ws_sales, col_id, DATA_START_ROW, sales_end)
+            total_pago = self._sum_column_range(ws_sales, col_pago, DATA_START_ROW, sales_end)
+            total_pendente = self._sum_column_range(ws_sales, col_pendente, DATA_START_ROW, sales_end)
+
+            mes_pago = 0.0
+            mes_pendente = 0.0
+            mes_vendas = 0
+            if col_id and col_sale_date:
+                for row in range(DATA_START_ROW, sales_end + 1):
+                    sale_id = str(ws_sales[f"{col_id}{row}"].value or "").strip()
+                    if not sale_id:
+                        continue
+                    sale_dt = self._parse_date_cell(ws_sales[f"{col_sale_date}{row}"].value)
+                    if sale_dt is None or sale_dt < month_start or sale_dt > month_end:
+                        continue
+                    mes_vendas += 1
+                    mes_pago += self._to_float(ws_sales[f"{col_pago}{row}"].value) if col_pago else 0.0
+                    mes_pendente += self._to_float(ws_sales[f"{col_pendente}{row}"].value) if col_pendente else 0.0
+
+            material_name = self._resolve_sheet_name(wb, SHEET_MATERIAL)
+            ws_mat = wb[material_name]
+            mat_cols = self._material_columns(ws_mat)
+            col_mat_val = mat_cols.get("valor")
+            col_mat_desc = mat_cols.get("descricao")
+            mat_end = (
+                self._effective_data_end_row(ws_mat, col_mat_desc, max_rows_scan=max_rows_scan)
+                if col_mat_desc
+                else self._scan_row_cap(ws_mat, max_rows_scan=max_rows_scan)
+            )
+            n_mat = self._count_filled_rows(ws_mat, col_mat_desc, DATA_START_ROW, mat_end)
+            total_mat = self._sum_column_range(ws_mat, col_mat_val, DATA_START_ROW, mat_end)
+
+            fixed_name = self._resolve_sheet_name(wb, SHEET_FIXED)
+            ws_fixed = wb[fixed_name]
+            fix_end = self._effective_data_end_row(ws_fixed, "D", max_rows_scan=max_rows_scan)
+            total_fixos = self._sum_column_range(ws_fixed, "D", DATA_START_ROW, fix_end)
+
+            total_vendas = total_pago + total_pendente
+            lucro = total_vendas - total_mat - total_fixos
+            mes_total = mes_pago + mes_pendente
+            mes_lucro = mes_total - total_mat - total_fixos
+
+            month_names = (
+                "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+                "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro",
+            )
+            mes_label = f"{month_names[today.month - 1]} {today.year}"
+
+            return {
+                "n_sales": n_sales,
+                "n_mat": n_mat,
+                "total_vendas": total_vendas,
+                "total_pago": total_pago,
+                "total_pendente": total_pendente,
+                "total_mat": total_mat,
+                "total_fixos": total_fixos,
+                "lucro": lucro,
+                "mes_label": mes_label,
+                "mes_vendas": mes_vendas,
+                "mes_pago": mes_pago,
+                "mes_pendente": mes_pendente,
+                "mes_total": mes_total,
+                "mes_lucro": mes_lucro,
+            }
         finally:
             if own_wb:
                 wb.close()

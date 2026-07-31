@@ -27,6 +27,8 @@ REQUIRED_IMPORTS: tuple[tuple[str, str], ...] = (
     ("fastapi", "fastapi"),
     ("faster_whisper", "faster-whisper"),
     ("numpy", "numpy"),
+    ("fpdf", "fpdf2"),
+    ("matplotlib", "matplotlib"),
 )
 
 

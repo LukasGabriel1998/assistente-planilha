@@ -50,10 +50,13 @@ from src.bot_processor import (
     get_default_workbook,
     process_command,
     sale_id_from_parse_result,
+    spreadsheet_setup_hint,
     _spreadsheet_error_message,
 )
 from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer, apply_multi_field_corrections, apply_preview_corrections, apply_batch_preview_corrections, extract_supplemental_sale_id, _extract_target_sale_id_for_updates, extract_sale_ids_list_for_updates, extract_delete_sale_ids_list, _is_sale_delete_request, parse_multi_sales_message, detect_intent, sanitize_new_sale_identity
 from src.transcription import TranscriptionError, transcribe_audio
+from src.llm_parser import llm_fallback_enabled, try_llm_parse
+from src.monthly_report_pdf import build_planilha_report_pdf, collect_planilha_stats
 
 # Carregar .env
 def _load_dotenv() -> None:
@@ -193,6 +196,7 @@ Ao salvar, a planilha gera o 🧾 *ID VENDA* (ex.: 012). *Guarde esse código.*
 ⚡ *Botões rápidos*
 📋 *Prévia* — pendências e entregas
 📊 *Resumo* — totais gerais (use *Ver detalhes* na mensagem para quem pagou/deve)
+📄 *Relatório PDF* — relatório com gráfico da planilha
 ✏️ *Corrigir* — alterar ou apagar um lançamento
 🔄 *Nova conversa* — limpa o ID VENDA ativo
 
@@ -210,8 +214,8 @@ HELP_TEXT = _help_text()
 MAIN_MENU_KEYBOARD = {
     "keyboard": [
         ["Prévia", "Resumo"],
-        ["✏️ Corrigir", "Ajuda"],
-        ["🔄 Nova conversa"],
+        ["📄 Relatório PDF", "✏️ Corrigir"],
+        ["Ajuda", "🔄 Nova conversa"],
     ],
     "resize_keyboard": True,
     "one_time_keyboard": False,
@@ -1132,6 +1136,35 @@ def send_photo(
         return False
 
 
+def send_document(
+    chat_id: int | str,
+    file_path: str,
+    caption: str = "",
+    filename: str | None = None,
+    parse_mode: str | None = None,
+    reply_markup: dict | None = None,
+) -> bool:
+    """Envia um documento (ex.: PDF) para o chat."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    try:
+        doc_name = filename or Path(file_path).name
+        with open(file_path, "rb") as f:
+            files = {"document": (doc_name, f)}
+            data: dict[str, str] = {"chat_id": str(chat_id)}
+            if caption:
+                data["caption"] = caption[:1024]
+            if parse_mode:
+                data["parse_mode"] = parse_mode
+            if reply_markup:
+                data["reply_markup"] = json.dumps(reply_markup)
+            r = requests.post(f"{BASE_URL}/sendDocument", data=data, files=files, timeout=60)
+            return r.status_code == 200
+    except Exception as e:
+        print(f"[Telegram] Erro ao enviar documento: {e}")
+        return False
+
+
 def send_reply(
     chat_id: int | str,
     text: str,
@@ -1436,6 +1469,28 @@ def _requests_get_with_retry(
         f"Falha ao conectar com o Telegram apos {max_attempts} tentativas ({label}). "
         "Verifique sua internet e tente enviar o audio novamente."
     ) from last_exc
+
+
+def _transcribe_voice_file_id(
+    file_id: str,
+    *,
+    duration_sec: int = 0,
+    hinted_file_size: int = 0,
+) -> str:
+    """Baixa e transcreve áudio do Telegram. Levanta TranscriptionError."""
+    audio_path = download_telegram_voice(
+        file_id,
+        duration_sec=duration_sec,
+        hinted_file_size=hinted_file_size,
+    )
+    try:
+        whisper_model = os.getenv("WHISPER_MODEL", "small").strip() or "small"
+        return (transcribe_audio(audio_path, model_size=whisper_model) or "").strip()
+    finally:
+        try:
+            Path(audio_path).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def download_telegram_voice(
@@ -1872,6 +1927,107 @@ def _build_dashboard_reply(cmd_strip: str) -> tuple[str, str | None]:
         if img_path:
             return "", img_path
     return reply, img_path
+
+
+def _normalize_menu_text(text: str) -> str:
+    cleaned = (text or "").strip().lower()
+    for ch in ("📄", "📊", "📋", "✏️", "🔄"):
+        cleaned = cleaned.replace(ch, "")
+    return cleaned.strip()
+
+
+def _is_pdf_report_request(text: str) -> bool:
+    normalized = _normalize_menu_text(text)
+    return normalized in {
+        "/relatorio",
+        "/relatório",
+        "relatorio",
+        "relatório",
+        "relatorio pdf",
+        "relatório pdf",
+        "pdf do mes",
+        "pdf do mês",
+        "relatorio mensal",
+        "relatório mensal",
+    }
+
+
+def _send_planilha_pdf(chat_id: int | str, display_name: str = "") -> None:
+    if not _spreadsheet_ready_for_bot():
+        send_message(
+            chat_id,
+            spreadsheet_setup_hint(),
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+        return
+    send_chat_action(chat_id, "typing")
+    try:
+        stats = collect_planilha_stats()
+    except Exception as exc:
+        send_message(
+            chat_id,
+            _spreadsheet_error_message(exc),
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+        print(f"[Telegram] Erro no relatório PDF: {exc}")
+        return
+    if not stats:
+        send_message(chat_id, "Planilha não encontrada.", reply_markup=MAIN_MENU_KEYBOARD)
+        return
+    pdf_path = build_planilha_report_pdf(stats, user_name=display_name)
+    if not pdf_path:
+        send_message(
+            chat_id,
+            "⚠️ Não consegui gerar o PDF. Rode `python run_project.py` para instalar fpdf2 e matplotlib.",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+        return
+    month_label = str(stats.get("mes_label") or "mês atual")
+    try:
+        send_document(
+            chat_id,
+            pdf_path,
+            caption=f"📄 *Relatório da planilha — {month_label}*",
+            filename=f"relatorio_{month_label.replace(' ', '_').lower()}.pdf",
+            parse_mode="Markdown",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+    finally:
+        try:
+            Path(pdf_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _maybe_enhance_parse_with_llm(
+    text: str,
+    parse_result,
+    *,
+    last_sale_id: str | None = None,
+):
+    if not parse_result.missing_fields or not llm_fallback_enabled():
+        return parse_result
+    partial: dict[str, str] = {}
+    if last_sale_id:
+        partial["sale_id"] = last_sale_id
+    cmd = getattr(parse_result, "command", None)
+    if cmd and getattr(cmd, "customer", None):
+        partial["customer"] = str(cmd.customer)
+    if cmd and getattr(cmd, "product_id", None):
+        partial["product"] = str(cmd.product_id)
+    llm_result = try_llm_parse(
+        text,
+        reference_date=today_local(),
+        partial=partial or None,
+        last_sale_id=last_sale_id,
+    )
+    if llm_result and not llm_result.missing_fields:
+        print("[Telegram] Parser LLM fallback interpretou a frase.")
+        return llm_result
+    if llm_result and len(llm_result.missing_fields) < len(parse_result.missing_fields):
+        print("[Telegram] Parser LLM fallback reduziu campos faltantes.")
+        return llm_result
+    return parse_result
 
 
 def _handle_quick_dashboard_command(
@@ -2415,6 +2571,15 @@ def run_polling() -> None:
         print(f"[Telegram] Planilha ativa: {workbook}", flush=True)
     _print_bot_identity()
     print(f"[Telegram] {time.strftime('%H:%M:%S')} — polling ativo (atualiza a cada ~2 min)", flush=True)
+    if llm_fallback_enabled():
+        model = os.getenv("LLM_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+        print(f"[Telegram] Parser LLM fallback ligado ({model}) — usado quando o regex falha.", flush=True)
+    else:
+        print(
+            "[Telegram] Parser LLM fallback desligado "
+            "(defina LLM_FALLBACK_ENABLED=1 e LLM_API_KEY no .env para ativar).",
+            flush=True,
+        )
 
     next_offset = None
     seen_update_ids: set[int] = set()
@@ -2522,37 +2687,29 @@ def run_polling() -> None:
                         duration_sec = int(voice_payload.get("duration") or 0)
                         hinted_size = int(voice_payload.get("file_size") or 0)
                         with _audio_processing_timer(chat_id, duration_sec):
-                            audio_path = download_telegram_voice(
-                                file_id,
+                            if duration_sec >= 60:
+                                print(
+                                    f"[Telegram] Transcrevendo audio longo ({duration_sec}s) "
+                                    f"com modelo {os.getenv('WHISPER_MODEL', 'small')}..."
+                                )
+                            text = _transcribe_voice_file_id(
+                                str(file_id),
                                 duration_sec=duration_sec,
                                 hinted_file_size=hinted_size,
                             )
-                            try:
-                                whisper_model = os.getenv("WHISPER_MODEL", "small")
-                                if duration_sec >= 60:
-                                    print(
-                                        f"[Telegram] Transcrevendo audio longo ({duration_sec}s) "
-                                        f"com modelo {whisper_model}..."
-                                    )
-                                text = transcribe_audio(audio_path, model_size=whisper_model)
-                                from_voice = True
-                                preview_text = text
-                                if len(preview_text) > 3500:
-                                    preview_text = preview_text[:3500] + "\n\n… _(texto truncado na exibição)_"
-                                send_message(
-                                    chat_id,
-                                    "🎤 *Áudio entendido!*\n\n"
-                                    f"{preview_text}\n\n"
-                                    "Agora vou montar a prévia do lançamento. Confira os campos e responda *SIM* para salvar, "
-                                    "ou envie a correção por texto.",
-                                    parse_mode="Markdown",
-                                    reply_markup=MAIN_MENU_KEYBOARD,
-                                )
-                            finally:
-                                try:
-                                    Path(audio_path).unlink(missing_ok=True)
-                                except Exception:
-                                    pass
+                            from_voice = True
+                            preview_text = text
+                            if len(preview_text) > 3500:
+                                preview_text = preview_text[:3500] + "\n\n… _(texto truncado na exibição)_"
+                            send_message(
+                                chat_id,
+                                "🎤 *Áudio entendido!*\n\n"
+                                f"{preview_text}\n\n"
+                                "Agora vou montar a prévia do lançamento. Confira os campos e responda *SIM* para salvar, "
+                                "ou envie a correção por texto.",
+                                parse_mode="Markdown",
+                                reply_markup=MAIN_MENU_KEYBOARD,
+                            )
                     except TranscriptionError as e:
                         send_message(chat_id, f"Não consegui transcrever o áudio: {e}")
                         continue
@@ -2847,6 +3004,12 @@ def run_polling() -> None:
                     send_message(chat_id, "❌ Cancelado. Pode enviar os dados de novo quando quiser.", reply_markup=MAIN_MENU_KEYBOARD)
                     continue
 
+                # Relatório PDF
+                if _is_pdf_report_request(text):
+                    display_name = (msg.get("from") or {}).get("first_name") or ""
+                    _send_planilha_pdf(chat_id, display_name)
+                    continue
+
                 # Menu rápido (Prévia/Resumo): feedback imediato + anti clique duplo
                 if _handle_quick_dashboard_command(
                     chat_id,
@@ -3037,6 +3200,11 @@ def run_polling() -> None:
                     print(f"[Telegram] Contexto: último ID VENDA {last_sale_id_by_chat.get(chat_id)} aplicado no chat {chat_id}")
                 parse_result = parse_message(parse_text, reference_date=today_local())
                 _normalize_material_only_sale(parse_result)
+                parse_result = _maybe_enhance_parse_with_llm(
+                    text,
+                    parse_result,
+                    last_sale_id=last_sale_id_by_chat.get(chat_id),
+                )
 
                 # Atualiza cache quando conseguir extrair cliente.
                 parsed_customer = (getattr(parse_result.command, "customer", "") or "").strip()
