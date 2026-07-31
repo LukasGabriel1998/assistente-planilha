@@ -53,7 +53,7 @@ from src.bot_processor import (
     spreadsheet_setup_hint,
     _spreadsheet_error_message,
 )
-from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer, apply_multi_field_corrections, apply_preview_corrections, apply_batch_preview_corrections, extract_supplemental_sale_id, _extract_target_sale_id_for_updates, extract_sale_ids_list_for_updates, extract_delete_sale_ids_list, _is_sale_delete_request, parse_multi_sales_message, detect_intent, sanitize_new_sale_identity
+from src.parser import parse_message, _parse_pt_date, _is_service_delivery_finalized, should_replace_pending_preview, _extract_total_value, _currency_candidates, enrich_with_last_sale_context, recalculate_payments_for_total, parse_money_value, _extract_customer, apply_multi_field_corrections, apply_preview_corrections, apply_batch_preview_corrections, extract_supplemental_sale_id, _extract_target_sale_id_for_updates, extract_sale_ids_list_for_updates, extract_delete_sale_ids_list, _is_sale_delete_request, parse_multi_sales_message, detect_intent, sanitize_new_sale_identity, _extract_preview_correction_fields
 from src.transcription import TranscriptionError, transcribe_audio
 from src.llm_parser import llm_fallback_enabled, try_llm_parse
 from src.monthly_report_pdf import build_planilha_report_pdf, collect_planilha_stats
@@ -213,9 +213,9 @@ HELP_TEXT = _help_text()
 # Teclado de menu (botões que aparecem abaixo do campo de digitação)
 MAIN_MENU_KEYBOARD = {
     "keyboard": [
-        ["Prévia", "Resumo"],
+        ["📋 Prévia", "📊 Resumo"],
         ["📄 Relatório PDF", "✏️ Corrigir"],
-        ["Ajuda", "🔄 Nova conversa"],
+        ["❓ Ajuda", "🔄 Nova conversa"],
     ],
     "resize_keyboard": True,
     "one_time_keyboard": False,
@@ -275,7 +275,230 @@ def _correct_intro_text(user_name: str = "") -> str:
     )
 
 
-def _correct_money(value_txt: str) -> str:
+def _normalize_menu_button(text: str) -> str:
+    """Remove emojis dos botões do menu para reconhecer o comando."""
+    cleaned = (text or "").strip().lower()
+    for ch in ("📄", "📊", "📋", "✏️", "🔄", "❓", "💡"):
+        cleaned = cleaned.replace(ch, "")
+    return cleaned.strip()
+
+
+def _copyable_codeblock(body: str) -> str:
+    return f"```\n{body.strip()}\n```"
+
+
+def _build_correct_copy_template(category: str, item: dict[str, str]) -> str:
+    if category == "vendas":
+        sid = str(item.get("sale_id") or "003").strip()
+        cliente = (item.get("cliente") or "NOVO NOME").strip()
+        pendente_raw = item.get("pendente") or "0"
+        try:
+            pendente_txt = f"{float(pendente_raw):.0f}".replace(".0", "")
+        except Exception:
+            pendente_txt = "800"
+        delivery = (item.get("delivery") or "20/07").strip()
+        if delivery == "-":
+            delivery = "20/07"
+        return (
+            f"ID {sid} cliente: {cliente}\n"
+            f"ID {sid} pendente: {pendente_txt}\n"
+            f"ID {sid} data de entrega {delivery}\n"
+            f"ID {sid} pagou"
+        )
+    if category == "materiais":
+        sid = (item.get("sale_id") or "012").strip()
+        valor = item.get("valor") or "900"
+        try:
+            valor_txt = f"{float(valor):.0f}".replace(".0", "")
+        except Exception:
+            valor_txt = "900"
+        if sid and sid != "-":
+            return f"ID {sid} altera custo material para {valor_txt}"
+        return f"Gastei {valor_txt} na ID VENDA 012"
+    desc = (item.get("desc") or "Descrição").strip()
+    valor = item.get("valor") or "280"
+    try:
+        valor_txt = f"{float(valor):.0f}".replace(".0", "")
+    except Exception:
+        valor_txt = "280"
+    return f"Gasto fixo descrição: {desc}\nGasto fixo valor: {valor_txt}"
+
+
+def _correct_copy_keyboard(
+    template_body: str,
+    category: str,
+    item_key: str,
+) -> dict:
+    copy_text = (template_body or "").strip()[:256]
+    return {
+        "inline_keyboard": [
+            [{"text": "📋 Copiar modelo", "copy_text": {"text": copy_text}}],
+            [
+                {"text": "⬅️ Voltar", "callback_data": f"corr:item:{category}:{item_key}"},
+                {"text": "❌ Cancelar", "callback_data": "corr:cancel"},
+            ],
+        ]
+    }
+
+
+def _correct_ask_alter_message(category: str, item: dict[str, str]) -> tuple[str, str]:
+    template_body = _build_correct_copy_template(category, item)
+    copy_block = _copyable_codeblock(template_body)
+    if category == "vendas":
+        guide = (
+            "✏️ *Copie o modelo abaixo*, edite no celular e envie.\n"
+            "🎤 *Ou mande por áudio* falando o que quer mudar.\n\n"
+            f"{copy_block}\n\n"
+            "_Envie uma linha por vez ou o bloco inteiro editado._"
+        )
+    elif category == "materiais":
+        guide = (
+            "✏️ *Copie o modelo*, edite o valor/ID e envie.\n"
+            "🎤 *Ou mande por áudio* descrevendo a correção.\n\n"
+            f"{copy_block}"
+        )
+    else:
+        guide = (
+            "✏️ *Copie o modelo*, edite e envie.\n"
+            "🎤 *Ou mande por áudio* com o ajuste do gasto fixo.\n\n"
+            f"{copy_block}"
+        )
+    return f"{_correct_item_summary(category, item)}\n\n{guide}", template_body
+
+
+def _try_handle_correct_alter_input(
+    chat_id: int | str,
+    text: str,
+    *,
+    pending_correct: dict,
+    pending_preview: dict,
+    last_sale_id_by_chat: dict,
+    origin: str = "telegram",
+) -> bool:
+    pending = pending_correct.get(chat_id)
+    if not pending or pending.get("step") != "await_alter":
+        return False
+
+    category = str(pending.get("category") or "")
+    item_key = str(pending.get("item_key") or "")
+    sale_id = str(pending.get("sale_id") or item_key or "").strip()
+    alter_text = (text or "").strip()
+    if not alter_text:
+        return True
+
+    if sale_id:
+        last_sale_id_by_chat[chat_id] = sale_id
+
+    lower = alter_text.lower()
+    if "pagou" in lower and sale_id and category == "vendas":
+        if not re.search(r"\bid\s+venda\b", lower) and not re.search(r"\bid\s+\d", lower):
+            alter_text = f"ID {sale_id} {alter_text}"
+
+    fields = _extract_preview_correction_fields(alter_text)
+    applied_labels: list[str] = []
+    if category == "vendas" and sale_id and fields:
+        try:
+            svc = _open_spreadsheet_for_bot()
+            applied_labels = svc.apply_sale_field_corrections(
+                sale_id,
+                fields,
+                reference_date=today_local(),
+            )
+        except Exception as exc:
+            send_message(
+                chat_id,
+                f"⚠️ Não consegui aplicar a correção: {_spreadsheet_error_message(exc)}",
+                reply_markup=MAIN_MENU_KEYBOARD,
+            )
+            return True
+
+    if applied_labels and "pagou" not in lower:
+        pending_correct.pop(chat_id, None)
+        send_message(
+            chat_id,
+            "✅ *Planilha atualizada!*\n\n"
+            + "\n".join(f"• {label}" for label in applied_labels),
+            parse_mode="Markdown",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+        return True
+
+    parse_text = enrich_with_last_sale_context(alter_text, sale_id or last_sale_id_by_chat.get(chat_id))
+    parse_result = parse_message(parse_text, reference_date=today_local())
+    _normalize_material_only_sale(parse_result)
+    parse_result = _maybe_enhance_parse_with_llm(
+        alter_text,
+        parse_result,
+        last_sale_id=sale_id or last_sale_id_by_chat.get(chat_id),
+    )
+
+    if parse_result.missing_fields:
+        send_message(
+            chat_id,
+            build_missing_fields_message(parse_result.missing_fields, parse_result.intent)
+            + "\n\n_Tente copiar uma linha do modelo e editar só o que precisa._",
+            parse_mode="Markdown",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+        return True
+
+    preview_intents = {
+        "sale",
+        "mixed_update",
+        "refund",
+        "status_update",
+        "delivery_update",
+        "delivery_finalize",
+        "material_update",
+        "sale_delete",
+        "sale_value_update",
+    }
+    if parse_result.intent in preview_intents:
+        pending_correct.pop(chat_id, None)
+        preview_text = build_preview(parse_result)
+        send_message(chat_id, preview_text, parse_mode="Markdown")
+        pending_preview[chat_id] = {
+            "parse_result": parse_result,
+            "original_text": alter_text,
+            "origin": origin,
+        }
+        _remember_sale_id_from_parse(parse_result, last_sale_id_by_chat, chat_id)
+        return True
+
+    pending_correct.pop(chat_id, None)
+    with _spreadsheet_saving_timer(chat_id, getattr(parse_result, "intent", "sale")):
+        reply = apply_parse_result(
+            parse_result,
+            origin=origin,
+            original_text=alter_text,
+            chat_id=str(chat_id),
+        )
+    send_message(chat_id, reply, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+    _remember_sale_id_from_parse(parse_result, last_sale_id_by_chat, chat_id)
+    return True
+
+
+def _try_handle_correct_wizard_text(
+    chat_id: int | str,
+    text: str,
+    *,
+    pending_correct: dict,
+) -> bool:
+    """Evita que texto solto quebre o wizard Corrigir (antes de alterar/apagar)."""
+    if chat_id not in pending_correct:
+        return False
+    step = pending_correct[chat_id].get("step")
+    if step == "await_alter":
+        return False
+    send_message(
+        chat_id,
+        "Use os *botões* da mensagem acima para escolher o lançamento,\n"
+        "ou toque em *❌ Cancelar* / 🔄 *Nova conversa*.",
+        parse_mode="Markdown",
+    )
+    return True
+
+
     try:
         return format_brl(float(value_txt or 0))
     except Exception:
@@ -522,15 +745,7 @@ def _correct_ask_alter(
             "item": item,
             "sale_id": sale_id,
         }
-        text = (
-            f"{_correct_item_summary(category, item)}\n\n"
-            "✏️ *Envie o que deseja alterar*, por exemplo:\n"
-            f"`ID {sale_id} cliente: NOVO NOME`\n"
-            f"`ID {sale_id} pendente: 800`\n"
-            f"`ID {sale_id} data de entrega 20/07`\n"
-            f"`ID {sale_id} pagou`\n\n"
-            "Ou toque em *❌ Cancelar* / *Nova conversa*."
-        )
+        text, template_body = _correct_ask_alter_message(category, item)
     elif category == "materiais":
         sale_id = (item.get("sale_id") or "").strip()
         if sale_id:
@@ -542,17 +757,7 @@ def _correct_ask_alter(
             "item": item,
             "sale_id": sale_id,
         }
-        examples = (
-            f"`ID {sale_id} altera custo material para 900`\n"
-            if sale_id
-            else "`Gastei 350 na ID VENDA 012`\n"
-        )
-        text = (
-            f"{_correct_item_summary(category, item)}\n\n"
-            "✏️ *Envie a correção do material*, por exemplo:\n"
-            f"{examples}\n"
-            "Ou toque em *Nova conversa* para cancelar."
-        )
+        text, template_body = _correct_ask_alter_message(category, item)
     else:
         pending_correct[chat_id] = {
             "step": "await_alter",
@@ -560,21 +765,9 @@ def _correct_ask_alter(
             "item_key": item_key,
             "item": item,
         }
-        text = (
-            f"{_correct_item_summary(category, item)}\n\n"
-            "✏️ *Envie a correção do gasto fixo por texto*\n"
-            "(ex.: descreva o ajuste que precisa).\n\n"
-            "Ou toque em *Nova conversa* para cancelar."
-        )
+        text, template_body = _correct_ask_alter_message(category, item)
 
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "⬅️ Voltar", "callback_data": f"corr:item:{category}:{item_key}"},
-                {"text": "❌ Cancelar", "callback_data": "corr:cancel"},
-            ]
-        ]
-    }
+    keyboard = _correct_copy_keyboard(template_body, category, item_key)
     if message_id and edit_chat_message(
         chat_id, message_id, text, parse_mode="Markdown", reply_markup=keyboard
     ):
@@ -713,11 +906,9 @@ def _handle_correct_callback(
 
 
 def _is_correct_menu_command(text: str) -> bool:
-    norm = (text or "").strip().lower()
+    norm = _normalize_menu_button(text)
     return norm in {
         "corrigir",
-        "✏️ corrigir",
-        "✏️corrigir",
         "corrigir lançamento",
         "corrigir lancamento",
         "alterar lançamento",
@@ -815,7 +1006,7 @@ def _run_with_chat_action(chat_id: int | str, action: str, func):
 
 
 def _is_quick_dashboard_command(text: str) -> bool:
-    cmd_strip = (text or "").strip().lower()
+    cmd_strip = _normalize_menu_button(text)
     return any(cmd_strip == kw or cmd_strip.startswith(kw) for kw in QUICK_DASHBOARD_KEYWORDS)
 
 
@@ -1929,15 +2120,8 @@ def _build_dashboard_reply(cmd_strip: str) -> tuple[str, str | None]:
     return reply, img_path
 
 
-def _normalize_menu_text(text: str) -> str:
-    cleaned = (text or "").strip().lower()
-    for ch in ("📄", "📊", "📋", "✏️", "🔄"):
-        cleaned = cleaned.replace(ch, "")
-    return cleaned.strip()
-
-
 def _is_pdf_report_request(text: str) -> bool:
-    normalized = _normalize_menu_text(text)
+    normalized = _normalize_menu_button(text)
     return normalized in {
         "/relatorio",
         "/relatório",
@@ -2039,7 +2223,7 @@ def _handle_quick_dashboard_command(
     quick_menu_cooldown: dict[int | str, float],
 ) -> bool:
     """Prévia / Resumo do menu rápido. Retorna True se tratou o comando."""
-    cmd_strip = (text or "").strip().lower()
+    cmd_strip = _normalize_menu_button(text)
     if not _is_quick_dashboard_command(cmd_strip):
         return False
     if not cmd_strip.startswith(("status", "resumo", "planilha", "prévia", "previa", "detalhes", "detalhe")):
@@ -2680,6 +2864,11 @@ def run_polling() -> None:
 
             # Áudio: baixar, transcrever e usar o texto como se fosse mensagem digitada
             voice_payload = msg.get("voice") or msg.get("audio")
+            in_correct_alter = (
+                chat_id
+                and chat_id in pending_correct
+                and pending_correct[chat_id].get("step") == "await_alter"
+            )
             if not text and voice_payload:
                 file_id = voice_payload.get("file_id")
                 if file_id:
@@ -2701,15 +2890,22 @@ def run_polling() -> None:
                             preview_text = text
                             if len(preview_text) > 3500:
                                 preview_text = preview_text[:3500] + "\n\n… _(texto truncado na exibição)_"
-                            send_message(
-                                chat_id,
-                                "🎤 *Áudio entendido!*\n\n"
-                                f"{preview_text}\n\n"
-                                "Agora vou montar a prévia do lançamento. Confira os campos e responda *SIM* para salvar, "
-                                "ou envie a correção por texto.",
-                                parse_mode="Markdown",
-                                reply_markup=MAIN_MENU_KEYBOARD,
-                            )
+                            if in_correct_alter:
+                                send_message(
+                                    chat_id,
+                                    f"🎤 *Áudio entendido para correção:*\n_{preview_text}_",
+                                    parse_mode="Markdown",
+                                )
+                            else:
+                                send_message(
+                                    chat_id,
+                                    "🎤 *Áudio entendido!*\n\n"
+                                    f"{preview_text}\n\n"
+                                    "Agora vou montar a prévia do lançamento. Confira os campos e responda *SIM* para salvar, "
+                                    "ou envie a correção por texto.",
+                                    parse_mode="Markdown",
+                                    reply_markup=MAIN_MENU_KEYBOARD,
+                                )
                     except TranscriptionError as e:
                         send_message(chat_id, f"Não consegui transcrever o áudio: {e}")
                         continue
@@ -2737,13 +2933,15 @@ def run_polling() -> None:
             if not text:
                 send_message(
                     chat_id,
-                    "Envie um texto (ex.: vendi placa para o João por 2000), um áudio, ou toque em Resumo.",
+                    "Envie um texto (ex.: vendi placa para o João por 2000), um áudio, ou toque em 📊 *Resumo*.",
                     reply_markup=MAIN_MENU_KEYBOARD,
                 )
                 continue
 
+            lower_cmd = _normalize_menu_button(text)
+
             # Comandos especiais do Telegram: boas-vindas e ajuda (limpam prévia pendente) + menu
-            if text in ("/start", "/help") or text.strip().lower() in ("ajuda", "start"):
+            if text in ("/start", "/help") or _normalize_menu_button(text) in ("ajuda", "start"):
                 pending_preview.pop(chat_id, None)
                 pending_correct.pop(chat_id, None)
                 user_name = _user_display_name(msg.get("from"))
@@ -2756,15 +2954,7 @@ def run_polling() -> None:
                 continue
 
             # Nova conversa: limpa prévia e contexto de ID VENDA
-            lower_cmd = text.strip().lower()
-            # Remove emoji do botão "🔄 Nova conversa" para o match.
-            lower_cmd_clean = lower_cmd.replace("🔄", "").strip()
-            if lower_cmd_clean in ("nova conversa", "novo atendimento", "novo chat", "reiniciar") or lower_cmd in (
-                "nova conversa",
-                "novo atendimento",
-                "novo chat",
-                "reiniciar",
-            ):
+            if lower_cmd in ("nova conversa", "novo atendimento", "novo chat", "reiniciar"):
                 _reset_chat_session(
                     chat_id,
                     pending_preview=pending_preview,
@@ -2776,7 +2966,7 @@ def run_polling() -> None:
                 )
                 user_name = _escape_md(_user_display_name(msg.get("from")))
                 hello = f"Pronto, {user_name}! " if user_name else ""
-                if lower_cmd_clean.startswith("nova") or lower_cmd.startswith("nova"):
+                if lower_cmd.startswith("nova"):
                     msg_txt = (
                         f"🔄 {hello}*Nova conversa iniciada.*\n\n"
                         "O contexto do ID VENDA foi limpo. Pode registrar uma venda nova "
@@ -2812,9 +3002,19 @@ def run_polling() -> None:
                 )
                 continue
 
-            # Texto livre durante o wizard Corrigir: libera o fluxo e processa normalmente
-            if chat_id in pending_correct:
-                pending_correct.pop(chat_id, None)
+            # Correção por texto ou áudio (copiar modelo e editar)
+            if _try_handle_correct_alter_input(
+                chat_id,
+                text,
+                pending_correct=pending_correct,
+                pending_preview=pending_preview,
+                last_sale_id_by_chat=last_sale_id_by_chat,
+                origin="audio" if from_voice else "telegram",
+            ):
+                continue
+
+            if _try_handle_correct_wizard_text(chat_id, text, pending_correct=pending_correct):
+                continue
 
             user = msg.get("from", {})
             username = user.get("username") or user.get("first_name") or "?"

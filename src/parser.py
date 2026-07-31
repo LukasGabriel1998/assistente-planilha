@@ -3647,6 +3647,7 @@ _PREVIEW_CORRECTION_FIELD_RE = re.compile(
     r"|valor"
     r"|entrada(?:\s+paga)?"
     r"|saldo"
+    r"|pendente"
     r"|restante"
     r"|resto"
     r"|entrega"
@@ -3729,7 +3730,7 @@ def _preview_correction_label_to_key(label: str) -> Optional[str]:
         return "valor"
     if label in ("entrada", "entrada paga"):
         return "entrada"
-    if label in ("saldo", "restante", "resto"):
+    if label in ("saldo", "restante", "resto", "pendente", "valor pendente"):
         return "saldo"
     if label.startswith("data") and "entrega" in label:
         return "data_entrega"

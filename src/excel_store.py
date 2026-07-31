@@ -2269,6 +2269,72 @@ class SpreadsheetService:
         finally:
             wb.close()
 
+    def apply_sale_field_corrections(
+        self,
+        sale_id: str,
+        fields: dict[str, str],
+        *,
+        reference_date: date | None = None,
+    ) -> list[str]:
+        """Aplica correções pontuais de campos (fluxo Copiar e editar)."""
+        from .parser import _parse_pt_date, parse_money_value
+
+        sale_id = str(sale_id or "").strip()
+        if not sale_id or not fields:
+            return []
+
+        ref = reference_date or today_local()
+        applied: list[str] = []
+        wb = self._open_workbook()
+        try:
+            sales_name = self._resolve_sheet_name(wb, SHEET_SALES)
+            ws_sales = wb[sales_name]
+            sales_cols = self._sales_columns(ws_sales)
+            try:
+                row = self._find_sale_row(ws_sales, sales_cols["id venda"], sale_id)
+            except ValueError:
+                return []
+
+            if fields.get("cliente"):
+                ws_sales[f"{sales_cols['cliente']}{row}"] = fields["cliente"].strip()
+                applied.append("Cliente")
+
+            col_prod = sales_cols.get("id produto")
+            if fields.get("produto") and col_prod:
+                ws_sales[f"{col_prod}{row}"] = fields["produto"].strip()
+                applied.append("Produto")
+
+            col_sale_date = sales_cols.get("data de venda")
+            if fields.get("data_venda") and col_sale_date:
+                sale_dt = _parse_pt_date(fields["data_venda"], ref, full_text=fields["data_venda"])
+                if sale_dt:
+                    ws_sales[f"{col_sale_date}{row}"] = self._excel_date_value(sale_dt)
+                    applied.append("Data da venda")
+
+            if fields.get("data_entrega") or fields.get("entrega"):
+                raw_delivery = fields.get("data_entrega") or fields.get("entrega") or ""
+                delivery_dt = _parse_pt_date(raw_delivery, ref, full_text=raw_delivery)
+                if delivery_dt:
+                    col_delivery = sales_cols.get("data de entrega")
+                    if col_delivery:
+                        ws_sales[f"{col_delivery}{row}"] = self._excel_date_value(delivery_dt)
+                        applied.append("Data de entrega")
+
+            if fields.get("saldo") or fields.get("pendente"):
+                raw_pending = fields.get("saldo") or fields.get("pendente") or ""
+                pending_val = parse_money_value(raw_pending)
+                if pending_val is not None and pending_val >= 0:
+                    col_pending = sales_cols.get("valor (pendente)")
+                    if col_pending:
+                        ws_sales[f"{col_pending}{row}"] = float(pending_val)
+                        applied.append("Pendente")
+
+            if applied:
+                self._save_workbook(wb)
+            return applied
+        finally:
+            wb.close()
+
     def delete_sale(
         self,
         delete_cmd: DeleteSaleCommand,
