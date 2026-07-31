@@ -21,6 +21,7 @@ relaunch_in_project_venv()
 
 import atexit
 import argparse
+import contextvars
 import json
 import os
 import re
@@ -57,6 +58,7 @@ from src.parser import parse_message, _parse_pt_date, _is_service_delivery_final
 from src.transcription import TranscriptionError, transcribe_audio
 from src.llm_parser import llm_fallback_enabled, try_llm_parse
 from src.monthly_report_pdf import build_planilha_report_pdf, collect_planilha_stats
+from src import bot_health
 
 # Carregar .env
 def _load_dotenv() -> None:
@@ -82,6 +84,128 @@ _load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+
+def _norm_chat_id(chat_id: int | str | None) -> str:
+    return str(chat_id or "").strip()
+
+
+def _admin_notify_chat_id() -> int | str | None:
+    raw = os.getenv("ADMIN_CHAT_ID", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+def _is_notify_hub_chat(chat_id: int | str) -> bool:
+    hub = _admin_notify_chat_id()
+    if hub is None:
+        return False
+    return _norm_chat_id(chat_id) == _norm_chat_id(hub)
+
+
+def _adopt_admin_chat_id(new_chat_id: int | str, *, reason: str = "") -> None:
+    try:
+        nid = int(new_chat_id)
+    except (TypeError, ValueError):
+        return
+    cur = _admin_notify_chat_id()
+    if cur is not None and _norm_chat_id(cur) == str(nid):
+        return
+    os.environ["ADMIN_CHAT_ID"] = str(nid)
+    note = f" ({reason})" if reason else ""
+    print(f"[Telegram] ADMIN_CHAT_ID atualizado para {nid}{note}.", flush=True)
+
+
+def _handle_hub_migration(msg: dict) -> None:
+    to_id = msg.get("migrate_to_chat_id")
+    from_id = (msg.get("chat") or {}).get("id")
+    if to_id is None:
+        return
+    hub = _admin_notify_chat_id()
+    if hub is None:
+        return
+    if from_id is not None and _norm_chat_id(from_id) == _norm_chat_id(hub):
+        _adopt_admin_chat_id(to_id, reason="migrate_to_chat_id")
+
+
+def _health_notify_send(text: str) -> bool:
+    hub = _admin_notify_chat_id()
+    if hub is None or not TELEGRAM_BOT_TOKEN:
+        return False
+    return send_message(hub, text, parse_mode="Markdown") is not None
+
+
+def _report_user_error_to_admin(
+    exc: Exception,
+    *,
+    chat_id: int | str | None = None,
+    user_name: str = "",
+    message_text: str = "",
+    context: str = "processar mensagem",
+) -> None:
+    if chat_id is not None and _is_notify_hub_chat(chat_id):
+        return
+    try:
+        bot_health.notify_processing_error(
+            _PROJECT_DIR,
+            exc,
+            user_name=user_name,
+            chat_id=chat_id,
+            message_text=message_text,
+            context=context,
+        )
+    except Exception:
+        pass
+
+
+def _is_network_error(exc: BaseException) -> bool:
+    text = str(exc or "").lower()
+    markers = (
+        "timeout",
+        "timed out",
+        "connection",
+        "network",
+        "unreachable",
+        "name resolution",
+        "nameresolution",
+        "dns",
+        "api.telegram.org",
+        "connection aborted",
+        "remotedisconnected",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _report_outbound_network_failure(
+    exc: BaseException,
+    *,
+    context: str,
+    chat_id: int | str | None = None,
+) -> None:
+    if chat_id is not None and _is_notify_hub_chat(chat_id):
+        return
+    if not _is_network_error(exc):
+        return
+    try:
+        bot_health.record_outbound_error(_PROJECT_DIR, exc, context=context)
+    except Exception:
+        pass
+
+
+def _build_hub_status_message() -> str:
+    from src.spreadsheet_config import spreadsheet_config_status, uses_google_sheets
+
+    status = spreadsheet_config_status()
+    backend = "Google Sheets" if uses_google_sheets() else "Excel"
+    if status.ready:
+        sheet_line = f"🟢 *Planilha* ({backend}): ok"
+    else:
+        sheet_line = f"🟡 *Planilha* ({backend}): {status.message[:120]}"
+    return bot_health.format_status_report(spreadsheet_line=sheet_line)
 
 
 def _lock_path() -> Path:
@@ -118,10 +242,84 @@ def _escape_md(text: str) -> str:
 
 
 def _user_display_name(user: dict | None) -> str:
-    """Nome do perfil Telegram (first_name), sem @username."""
+    """Nome do perfil Telegram: first_name (+ last_name) ou @username."""
     if not user:
         return ""
-    return str(user.get("first_name") or "").strip()
+    first = str(user.get("first_name") or "").strip()
+    last = str(user.get("last_name") or "").strip()
+    if first and last:
+        return f"{first} {last}"
+    if first:
+        return first
+    username = str(user.get("username") or "").strip().lstrip("@")
+    return username
+
+
+def _resolve_reply_user_name(user: dict | None = None) -> str:
+    """Nome do usuário para personalizar respostas (mensagem atual ou cache da sessão)."""
+    from_user = _user_display_name(user)
+    if from_user:
+        return from_user
+    return _active_reply_user_name.get("").strip()
+
+
+def _user_first_name(user_name: str) -> str:
+    return (user_name or "").strip().split()[0] if (user_name or "").strip() else ""
+
+
+_active_reply_user_name: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "reply_user_name", default=""
+)
+
+
+def _message_already_personalized(text: str, first_name: str) -> bool:
+    if not first_name:
+        return True
+    head = (text or "")[:160].lower()
+    fl = first_name.lower()
+    return any(
+        marker in head
+        for marker in (
+            f"{fl},",
+            f"olá, {fl}",
+            f"ola, {fl}",
+            f"beleza, {fl}",
+            f"pronto, {fl}",
+            f"*{fl}*",
+        )
+    )
+
+
+def _personalize_for_user(
+    text: str,
+    user_name: str,
+    *,
+    parse_mode: str | None = None,
+) -> str:
+    """Prefixa a mensagem com o primeiro nome do usuário (quando ainda não personalizada)."""
+    text = (text or "").strip()
+    first = _user_first_name(user_name)
+    if not first or not text:
+        return text
+    if _message_already_personalized(text, first):
+        return text
+    if parse_mode == "Markdown":
+        return f"*{_escape_md(first)}*, {text}"
+    return f"{first}, {text}"
+
+
+def _apply_reply_personalization(
+    chat_id: int | str,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+) -> str:
+    if _is_notify_hub_chat(chat_id):
+        return text
+    user_name = _active_reply_user_name.get("").strip()
+    if not user_name:
+        return text
+    return _personalize_for_user(text, user_name, parse_mode=parse_mode)
 
 
 def _help_text(user_name: str = "") -> str:
@@ -1315,7 +1513,9 @@ def send_photo(
             files = {"photo": f}
             data: dict[str, str] = {"chat_id": str(chat_id)}
             if caption:
-                data["caption"] = caption[:1024]
+                data["caption"] = _apply_reply_personalization(
+                    chat_id, caption[:1024], parse_mode=parse_mode
+                )
             if parse_mode:
                 data["parse_mode"] = parse_mode
             if reply_markup:
@@ -1344,7 +1544,9 @@ def send_document(
             files = {"document": (doc_name, f)}
             data: dict[str, str] = {"chat_id": str(chat_id)}
             if caption:
-                data["caption"] = caption[:1024]
+                data["caption"] = _apply_reply_personalization(
+                    chat_id, caption[:1024], parse_mode=parse_mode
+                )
             if parse_mode:
                 data["parse_mode"] = parse_mode
             if reply_markup:
@@ -1385,7 +1587,9 @@ def send_message(
     """Envia mensagem de texto para o chat. Retorna message_id em caso de sucesso."""
     if not TELEGRAM_BOT_TOKEN:
         return None
-    text = (text or "")[:4096]
+    text = _apply_reply_personalization(
+        chat_id, (text or "")[:4096], parse_mode=parse_mode
+    )
     payload: dict = {"chat_id": chat_id, "text": text}
     if parse_mode:
         payload["parse_mode"] = parse_mode
@@ -1393,14 +1597,26 @@ def send_message(
         payload["reply_markup"] = reply_markup
     try:
         r = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=15)
+        if r.status_code != 200 and parse_mode:
+            fallback = {"chat_id": chat_id, "text": text}
+            if reply_markup:
+                fallback["reply_markup"] = reply_markup
+            r = requests.post(f"{BASE_URL}/sendMessage", json=fallback, timeout=15)
         if r.status_code != 200:
             return None
         data = r.json()
         result = data.get("result") or {}
         message_id = result.get("message_id")
+        if not _is_notify_hub_chat(chat_id):
+            bot_health.record_outbound_ok()
         return int(message_id) if isinstance(message_id, int) else None
     except Exception as e:
         print(f"[Telegram] Erro ao enviar: {e}")
+        _report_outbound_network_failure(
+            e,
+            context="enviar mensagem ao usuário",
+            chat_id=chat_id,
+        )
         return None
 
 
@@ -1442,10 +1658,13 @@ def edit_chat_message(
     """Atualiza texto de uma mensagem já enviada (ex.: cronômetro de aguarde)."""
     if not TELEGRAM_BOT_TOKEN or not message_id:
         return False
+    text = _apply_reply_personalization(
+        chat_id, (text or "")[:4096], parse_mode=parse_mode
+    )
     payload: dict = {
         "chat_id": str(chat_id),
         "message_id": int(message_id),
-        "text": (text or "")[:4096],
+        "text": text,
     }
     if parse_mode:
         payload["parse_mode"] = parse_mode
@@ -1722,44 +1941,64 @@ def download_telegram_voice(
     return tmp.name
 
 
-def get_updates(offset: int | None = None) -> list[dict]:
+def get_updates(offset: int | None = None) -> tuple[list[dict], float]:
     """Long polling: busca novas mensagens (timeout 30s)."""
     if not TELEGRAM_BOT_TOKEN:
-        return []
+        return [], 0.0
     params = {"timeout": 30}
     if offset is not None:
         params["offset"] = offset
     try:
         r = requests.get(f"{BASE_URL}/getUpdates", params=params, timeout=35)
         if r.status_code != 200:
-            return []
+            wait = bot_health.record_poll_error(_PROJECT_DIR, f"HTTP {r.status_code}")
+            return [], wait
         data = r.json()
         if not data.get("ok"):
-            return []
-        return data.get("result", [])
+            desc = str((data or {}).get("description") or "getUpdates ok=false")
+            wait = bot_health.record_poll_error(_PROJECT_DIR, desc)
+            print(f"[Telegram] getUpdates recusado: {desc[:160]}", flush=True)
+            return [], wait
+        bot_health.record_poll_ok(_PROJECT_DIR)
+        return data.get("result", []), 0.0
     except Exception as e:
-        print(f"[Telegram] Erro getUpdates: {e}")
-        return []
+        err = str(e)
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN in err:
+            err = err.replace(TELEGRAM_BOT_TOKEN, "***")
+        short = err
+        if (
+            "api.telegram.org" in err.lower()
+            or "nameresolution" in err.lower()
+            or "unreachable" in err.lower()
+        ):
+            short = "rede/DNS inacessível (api.telegram.org)"
+        elif len(short) > 160:
+            short = short[:157] + "..."
+        print(f"[Telegram] Erro getUpdates: {short}", flush=True)
+        wait = bot_health.record_poll_error(_PROJECT_DIR, short)
+        return [], wait
 
 
-def _print_bot_identity() -> None:
-    """Mostra no terminal qual bot esta conectado."""
+def _print_bot_identity() -> str:
+    """Mostra no terminal qual bot esta conectado. Retorna o @username."""
     try:
         r = requests.get(f"{BASE_URL}/getMe", timeout=10)
         if r.status_code != 200:
             print(f"[Telegram] Aviso: API retornou HTTP {r.status_code}", flush=True)
-            return
+            return ""
         data = r.json()
         if not data.get("ok"):
             print(f"[Telegram] Aviso: token invalido ou bot inacessivel.", flush=True)
-            return
+            return ""
         bot = data.get("result", {})
         name = bot.get("first_name", "?")
         username = bot.get("username", "")
         label = f"@{username}" if username else name
         print(f"[Telegram] Conectado: {label} ({name})", flush=True)
+        return username
     except Exception as e:
         print(f"[Telegram] Aviso: nao foi possivel validar bot na API: {e}", flush=True)
+        return ""
 
 
 def _format_currency_pt(value: float) -> str:
@@ -2136,7 +2375,12 @@ def _is_pdf_report_request(text: str) -> bool:
     }
 
 
-def _send_planilha_pdf(chat_id: int | str, display_name: str = "") -> None:
+def _send_planilha_pdf(
+    chat_id: int | str,
+    *,
+    user: dict | None = None,
+    user_name: str = "",
+) -> None:
     if not _spreadsheet_ready_for_bot():
         send_message(
             chat_id,
@@ -2158,7 +2402,8 @@ def _send_planilha_pdf(chat_id: int | str, display_name: str = "") -> None:
     if not stats:
         send_message(chat_id, "Planilha não encontrada.", reply_markup=MAIN_MENU_KEYBOARD)
         return
-    pdf_path = build_planilha_report_pdf(stats, user_name=display_name)
+    resolved_name = (user_name or "").strip() or _resolve_reply_user_name(user)
+    pdf_path = build_planilha_report_pdf(stats, user_name=resolved_name)
     if not pdf_path:
         send_message(
             chat_id,
@@ -2604,7 +2849,10 @@ def _resend_multi_sales_batch_preview(
     pending_preview[chat_id] = pending
 
 
-def _process_scheduled_reminders(tracker) -> None:
+def _process_scheduled_reminders(
+    tracker,
+    user_names_by_chat: dict[int | str, str] | None = None,
+) -> None:
     """Envia lembretes no dia da entrega: a partir das 6h, a cada 2h."""
     from src.excel_store import SpreadsheetService
     from src.reminder_scheduler import current_reminder_slot
@@ -2633,6 +2881,7 @@ def _process_scheduled_reminders(tracker) -> None:
         return
 
     admin_chat = os.getenv("ADMIN_CHAT_ID", "").strip()
+    names = user_names_by_chat or {}
     for item in due[:20]:
         sale_id = str(item.get("id venda") or "").strip()
         if not sale_id:
@@ -2657,7 +2906,11 @@ def _process_scheduled_reminders(tracker) -> None:
         chat_target = (item.get("chat id") or "").strip()
         sent = False
         if chat_target:
-            sent = send_message(chat_target, msg_txt, parse_mode="Markdown")
+            token = _active_reply_user_name.set(names.get(chat_target, ""))
+            try:
+                sent = send_message(chat_target, msg_txt, parse_mode="Markdown")
+            finally:
+                _active_reply_user_name.reset(token)
         if admin_chat:
             send_message(admin_chat, msg_txt, parse_mode="Markdown")
             sent = True
@@ -2673,7 +2926,11 @@ def _process_scheduled_reminders(tracker) -> None:
         )
 
 
-def _process_overdue_deliveries(tracker, pending_overdue_delivery: dict) -> None:
+def _process_overdue_deliveries(
+    tracker,
+    pending_overdue_delivery: dict,
+    user_names_by_chat: dict[int | str, str] | None = None,
+) -> None:
     """
     Cobra entregas amarelas cuja data já passou em relação a hoje (today_local()).
     Roda a cada ~1 min; na subida do bot já verifica na hora.
@@ -2707,6 +2964,7 @@ def _process_overdue_deliveries(tracker, pending_overdue_delivery: dict) -> None
     )
 
     admin_chat = os.getenv("ADMIN_CHAT_ID", "").strip()
+    names = user_names_by_chat or {}
     for item in overdue[:15]:
         sale_id = str(item.get("id venda") or "").strip()
         if not sale_id or tracker.was_sent("atraso", sale_id, today, slot_hour):
@@ -2716,14 +2974,18 @@ def _process_overdue_deliveries(tracker, pending_overdue_delivery: dict) -> None
         chat_target = (item.get("chat id") or "").strip()
         sent = False
         if chat_target:
-            if send_message(chat_target, msg_txt, parse_mode="Markdown"):
-                _register_overdue_pending(
-                    pending_overdue_delivery,
-                    chat_target,
-                    sale_id,
-                    str(item.get("cliente") or ""),
-                )
-                sent = True
+            token = _active_reply_user_name.set(names.get(chat_target, ""))
+            try:
+                if send_message(chat_target, msg_txt, parse_mode="Markdown"):
+                    _register_overdue_pending(
+                        pending_overdue_delivery,
+                        chat_target,
+                        sale_id,
+                        str(item.get("cliente") or ""),
+                    )
+                    sent = True
+            finally:
+                _active_reply_user_name.reset(token)
         if admin_chat:
             send_message(admin_chat, msg_txt, parse_mode="Markdown")
             _register_overdue_pending(
@@ -2749,11 +3011,29 @@ def run_polling() -> None:
         print("[Telegram] Configure TELEGRAM_BOT_TOKEN no .env (token do @BotFather).")
         return
 
+    bot_username = _print_bot_identity()
+    bot_display = os.getenv("BOT_DISPLAY_NAME", "").strip()
+    if not bot_display and bot_username:
+        bot_display = f"@{bot_username}"
+    elif not bot_display:
+        bot_display = "Meu Bot Planilha"
+    bot_health.configure_bot_label(bot_display)
+    bot_health.configure_sender(_health_notify_send)
+
+    hub = _admin_notify_chat_id()
+    if hub is not None and bot_health.alerts_enabled():
+        print(f"[Telegram] Alertas de saúde no grupo admin: {hub}", flush=True)
+    else:
+        print(
+            "[Telegram] ADMIN_CHAT_ID vazio ou BOT_HEALTH_ALERTS=0 — alertas no grupo desligados.",
+            flush=True,
+        )
+
     workbook = get_default_workbook()
     print("[Telegram] Bot iniciado. Aguardando mensagens... (Ctrl+C para parar)", flush=True)
     if workbook:
         print(f"[Telegram] Planilha ativa: {workbook}", flush=True)
-    _print_bot_identity()
+    bot_health.notify_startup(_PROJECT_DIR, bot_username=bot_username)
     print(f"[Telegram] {time.strftime('%H:%M:%S')} — polling ativo (atualiza a cada ~2 min)", flush=True)
     if llm_fallback_enabled():
         model = os.getenv("LLM_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
@@ -2776,6 +3056,7 @@ def run_polling() -> None:
     last_sale_id_by_chat: dict[int | str, str] = {}
     pending_overdue_delivery: dict[int | str, dict] = {}
     pending_correct: dict[int | str, dict] = {}
+    user_names_by_chat: dict[int | str, str] = {}
     quick_menu_processing: set[int | str] = set()
     quick_menu_cooldown: dict[int | str, float] = {}
     last_reminder_check = 0.0
@@ -2790,12 +3071,14 @@ def run_polling() -> None:
         f"(data de hoje: {today_local().strftime('%d/%m/%Y')})..."
     )
     try:
-        _process_overdue_deliveries(reminder_tracker, pending_overdue_delivery)
+        _process_overdue_deliveries(reminder_tracker, pending_overdue_delivery, user_names_by_chat)
     except Exception as e:
         print(f"[Telegram] Erro na verificação inicial de entregas: {e}")
 
     while True:
-        updates = get_updates(offset=next_offset)
+        updates, poll_wait = get_updates(offset=next_offset)
+        if poll_wait > 0:
+            time.sleep(poll_wait)
         now = time.time()
         if not updates and now - last_status_ping >= status_interval_s:
             print(
@@ -2822,27 +3105,34 @@ def run_polling() -> None:
                 callback_id = callback.get("id")
                 callback_data = str(callback.get("data") or "").strip()
                 callback_chat_id = (callback.get("message") or {}).get("chat", {}).get("id")
-                if callback_data == "resumo_detalhes" and callback_chat_id:
-                    _handle_resumo_detalhes_callback(
-                        callback_chat_id,
-                        str(callback_id or ""),
-                        pending_preview=pending_preview,
-                        quick_menu_processing=quick_menu_processing,
-                        quick_menu_cooldown=quick_menu_cooldown,
-                    )
-                elif callback_data.startswith("corr:") and callback_chat_id:
-                    msg_obj = callback.get("message") or {}
-                    _handle_correct_callback(
-                        callback_chat_id,
-                        str(callback_id or ""),
-                        callback_data,
-                        pending_correct=pending_correct,
-                        pending_preview=pending_preview,
-                        last_sale_id_by_chat=last_sale_id_by_chat,
-                        message_id=msg_obj.get("message_id"),
-                    )
-                elif callback_id:
-                    answer_callback_query(str(callback_id))
+                cb_user = _user_display_name(callback.get("from"))
+                if callback_chat_id and cb_user:
+                    user_names_by_chat[callback_chat_id] = cb_user
+                cb_token = _active_reply_user_name.set(cb_user or "")
+                try:
+                    if callback_data == "resumo_detalhes" and callback_chat_id:
+                        _handle_resumo_detalhes_callback(
+                            callback_chat_id,
+                            str(callback_id or ""),
+                            pending_preview=pending_preview,
+                            quick_menu_processing=quick_menu_processing,
+                            quick_menu_cooldown=quick_menu_cooldown,
+                        )
+                    elif callback_data.startswith("corr:") and callback_chat_id:
+                        msg_obj = callback.get("message") or {}
+                        _handle_correct_callback(
+                            callback_chat_id,
+                            str(callback_id or ""),
+                            callback_data,
+                            pending_correct=pending_correct,
+                            pending_preview=pending_preview,
+                            last_sale_id_by_chat=last_sale_id_by_chat,
+                            message_id=msg_obj.get("message_id"),
+                        )
+                    elif callback_id:
+                        answer_callback_query(str(callback_id))
+                finally:
+                    _active_reply_user_name.reset(cb_token)
                 continue
 
             msg = update.get("message") or update.get("edited_message")
@@ -2861,6 +3151,10 @@ def run_polling() -> None:
                         seen_message_keys.discard(old)
             text = (msg.get("text") or "").strip()
             from_voice = False
+            _reply_user = _user_display_name(msg.get("from"))
+            if chat_id and _reply_user:
+                user_names_by_chat[chat_id] = _reply_user
+            _active_reply_user_name.set(_reply_user or "")
 
             # Áudio: baixar, transcrever e usar o texto como se fosse mensagem digitada
             voice_payload = msg.get("voice") or msg.get("audio")
@@ -2923,6 +3217,36 @@ def run_polling() -> None:
                         continue
 
             if not chat_id:
+                continue
+
+            _handle_hub_migration(msg)
+
+            if _is_notify_hub_chat(chat_id):
+                hub_text = (text or "").strip()
+                hub_lower = hub_text.lower()
+                if hub_lower in {"/chatid", "/id", "chatid"}:
+                    send_message(
+                        chat_id,
+                        f"🆔 *Chat ID deste chat:* `{chat_id}`\n\n"
+                        "Cole no `.env`:\n"
+                        f"`ADMIN_CHAT_ID={chat_id}`",
+                        parse_mode="Markdown",
+                    )
+                elif hub_lower in {"/status", "status", "/estado", "estado"}:
+                    send_message(
+                        chat_id,
+                        _build_hub_status_message(),
+                        parse_mode="Markdown",
+                    )
+                elif hub_lower in {"/start", "/help", "ajuda", "help"} or not hub_text:
+                    send_message(
+                        chat_id,
+                        "🔔 *Meu Bot Planilha — alertas*\n\n"
+                        "Este grupo recebe avisos de queda de rede, erros e lembretes.\n\n"
+                        "• `/status` — saúde do robô\n"
+                        "• `/chatid` — ID do grupo para o `.env`",
+                        parse_mode="Markdown",
+                    )
                 continue
 
             if text and _try_handle_overdue_delivery_reply(
@@ -3206,8 +3530,7 @@ def run_polling() -> None:
 
                 # Relatório PDF
                 if _is_pdf_report_request(text):
-                    display_name = (msg.get("from") or {}).get("first_name") or ""
-                    _send_planilha_pdf(chat_id, display_name)
+                    _send_planilha_pdf(chat_id, user=msg.get("from"))
                     continue
 
                 # Menu rápido (Prévia/Resumo): feedback imediato + anti clique duplo
@@ -3606,6 +3929,12 @@ def run_polling() -> None:
 
                 reply = f"⚠️ Não consegui processar essa mensagem:\n{_spreadsheet_error_message(e)}"
                 send_message(chat_id, reply, reply_markup=MAIN_MENU_KEYBOARD)
+                _report_user_error_to_admin(
+                    e,
+                    chat_id=chat_id,
+                    user_name=_user_display_name(msg.get("from")),
+                    message_text=text,
+                )
                 print(f"[Telegram] Erro ao processar: {e}")
 
         if not updates:
@@ -3615,10 +3944,22 @@ def run_polling() -> None:
         if time.time() - last_reminder_check >= 60:
             last_reminder_check = time.time()
             try:
-                _process_scheduled_reminders(reminder_tracker)
-                _process_overdue_deliveries(reminder_tracker, pending_overdue_delivery)
+                _process_scheduled_reminders(reminder_tracker, user_names_by_chat)
+                _process_overdue_deliveries(
+                    reminder_tracker, pending_overdue_delivery, user_names_by_chat
+                )
             except Exception as e:
                 print(f"[Telegram] Erro nos lembretes: {e}")
+                try:
+                    bot_health.notify_event(
+                        _PROJECT_DIR,
+                        "Erro nos lembretes automáticos",
+                        str(e)[:300],
+                        key="reminder_error",
+                        cooldown_sec=600.0,
+                    )
+                except Exception:
+                    pass
 
 
 def _run_local_test(args: argparse.Namespace) -> None:

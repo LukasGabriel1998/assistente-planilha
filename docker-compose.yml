@@ -17,4 +17,6 @@ services:
       - ./credentials:/app/credentials
       # Modelo Whisper (~461 MB) — não precisa rebuildar a imagem
       - ./models:/app/models
+      # Alertas de saúde e fila offline do bot
+      - ./data:/app/data
     # Long polling do Telegram — não precisa expor porta na internet

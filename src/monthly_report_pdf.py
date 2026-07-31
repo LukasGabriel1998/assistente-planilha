@@ -115,7 +115,8 @@ def build_planilha_report_pdf(
         title=f"Situação da planilha — {month_label}",
     )
     when = (generated_at or date.today()).strftime("%d/%m/%Y")
-    name = (user_name or "").strip().split()[0] if user_name else "Usuário"
+    full_name = (user_name or "").strip()
+    name = full_name.split()[0] if full_name else "Usuário"
 
     pdf = FPDF()
     font = _configure_pdf_fonts(pdf)
@@ -124,7 +125,7 @@ def build_planilha_report_pdf(
     pdf.set_font(font, "B", 18)
     pdf.cell(0, 12, f"Relatório da planilha — {month_label}", ln=True)
     pdf.set_font(font, size=11)
-    pdf.cell(0, 8, f"Gerado em {when} para {name}", ln=True)
+    pdf.cell(0, 8, f"Gerado em {when} para {full_name or name}", ln=True)
     pdf.ln(4)
 
     pdf.set_font(font, "B", 12)
